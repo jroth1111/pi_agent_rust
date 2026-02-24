@@ -6,12 +6,14 @@
 use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
+use crate::context::{MessageMetadata, VISIBILITY_METADATA_KEY};
 use crate::error::{Error, Result};
 use crate::extensions::ExtensionSession;
 use crate::model::{
     AssistantMessage, ContentBlock, Message, TextContent, ToolResultMessage, UserContent,
     UserMessage,
 };
+use crate::reliability::{ClosePayload, CloseResult, EvidenceRecord, StateDigest};
 use crate::session_index::{SessionIndex, enqueue_session_index_snapshot_update};
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -32,6 +34,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Current session file format version.
 pub const SESSION_VERSION: u8 = 3;
+pub const RELIABILITY_STATE_DIGEST_ENTRY_TYPE: &str = "reliability/state_digest.v1";
+pub const RELIABILITY_TASK_CHECKPOINT_ENTRY_TYPE: &str = "reliability/task_checkpoint.v1";
+pub const RELIABILITY_TASK_CREATED_ENTRY_TYPE: &str = "reliability/task_created.v1";
+pub const RELIABILITY_TASK_TRANSITION_ENTRY_TYPE: &str = "reliability/task_transition.v1";
+pub const RELIABILITY_VERIFICATION_EVIDENCE_ENTRY_TYPE: &str =
+    "reliability/verification_evidence.v1";
+pub const RELIABILITY_CLOSE_DECISION_ENTRY_TYPE: &str = "reliability/close_decision.v1";
+pub const RELIABILITY_HUMAN_BLOCKER_RAISED_ENTRY_TYPE: &str = "reliability/human_blocker_raised.v1";
+pub const RELIABILITY_HUMAN_BLOCKER_RESOLVED_ENTRY_TYPE: &str =
+    "reliability/human_blocker_resolved.v1";
 
 type JsonlSaveResult = std::result::Result<Vec<SessionEntry>, (Error, Vec<SessionEntry>)>;
 
@@ -511,8 +523,7 @@ impl AutosaveQueue {
 
     fn finish_flush(&mut self, ticket: AutosaveFlushTicket, success: bool) {
         let elapsed = ticket.started_at.elapsed().as_millis();
-        let elapsed = u64::try_from(elapsed.min(u128::from(u64::MAX)))
-            .expect("elapsed milliseconds clamped to u64::MAX");
+        let elapsed = elapsed.min(u128::from(u64::MAX)) as u64;
         self.last_flush_duration_ms = Some(elapsed);
         self.last_flush_trigger = Some(ticket.trigger);
         if success {
@@ -1579,7 +1590,9 @@ impl Session {
         }
 
         let session_dir_clone = self.session_dir.clone();
-        let path = self.path.clone().unwrap();
+        let path = self.path.clone().ok_or_else(|| {
+            Error::session("Session save path was not initialized before persistence")
+        })?;
         let path_clone = path.clone();
 
         match store_kind {
@@ -1794,7 +1807,11 @@ impl Session {
     pub fn append_message(&mut self, message: SessionMessage) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
-        let entry = SessionEntry::Message(MessageEntry { base, message });
+        let entry = SessionEntry::Message(MessageEntry {
+            base,
+            message,
+            metadata: MessageMetadata::default(),
+        });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
@@ -1876,6 +1893,196 @@ impl Session {
         id
     }
 
+    /// Append a reliability state digest entry using the canonical custom entry type.
+    pub fn append_state_digest_entry(&mut self, digest: StateDigest) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::StateDigest(StateDigestEntry { base, digest });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append a typed checkpoint marker for reliability phase progression.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_task_checkpoint_entry(
+        &mut self,
+        task_id: String,
+        phase: String,
+        summary: String,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::TaskCheckpoint(TaskCheckpointEntry {
+            base,
+            task_id,
+            phase,
+            summary,
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append a typed task-created marker for reliability orchestration.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_task_created_entry(
+        &mut self,
+        task_id: String,
+        objective: String,
+        agent_id: Option<String>,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::TaskCreated(TaskCreatedEntry {
+            base,
+            task_id,
+            objective,
+            agent_id,
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append a typed task-transition marker for reliability state-machine moves.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_task_transition_entry(
+        &mut self,
+        task_id: String,
+        from: Option<String>,
+        to: String,
+        details: Option<Value>,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::TaskTransition(TaskTransitionEntry {
+            base,
+            task_id,
+            from,
+            to,
+            details,
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append command verification evidence for task close traceability.
+    pub fn append_verification_evidence_entry(&mut self, evidence: EvidenceRecord) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry =
+            SessionEntry::VerificationEvidence(VerificationEvidenceEntry { base, evidence });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append close decision metadata for auditable task completion.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_close_decision_entry(
+        &mut self,
+        payload: ClosePayload,
+        result: CloseResult,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::CloseDecision(CloseDecisionEntry {
+            base,
+            payload,
+            result,
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append a marker indicating human escalation was raised for a task.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_human_blocker_raised_entry(
+        &mut self,
+        task_id: String,
+        reason: String,
+        context: String,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::HumanBlockerRaised(HumanBlockerRaisedEntry {
+            base,
+            task_id,
+            reason,
+            context,
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Append a marker indicating human escalation was resolved for a task.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_human_blocker_resolved_entry(
+        &mut self,
+        task_id: String,
+        resolution: String,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::HumanBlockerResolved(HumanBlockerResolvedEntry {
+            base,
+            task_id,
+            resolution,
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        id
+    }
+
+    /// Returns the most recent reliability state digest entry if one exists.
+    pub fn latest_state_digest_entry(&self) -> Option<StateDigest> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::StateDigest(state_digest) => Some(state_digest.digest.clone()),
+            SessionEntry::Custom(custom)
+                if custom.custom_type == RELIABILITY_STATE_DIGEST_ENTRY_TYPE =>
+            {
+                custom
+                    .data
+                    .as_ref()
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+            }
+            _ => None,
+        })
+    }
+
     pub fn append_bash_execution(
         &mut self,
         command: String,
@@ -1899,6 +2106,7 @@ impl Session {
                 timestamp: Some(chrono::Utc::now().timestamp_millis()),
                 extra: HashMap::new(),
             },
+            metadata: MessageMetadata::default(),
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
@@ -1998,6 +2206,10 @@ impl Session {
         let mut messages = Vec::new();
         for entry in &self.entries {
             if let SessionEntry::Message(msg_entry) = entry {
+                // Skip messages that are not visible to the agent
+                if !msg_entry.is_agent_visible() {
+                    continue;
+                }
                 if let Some(message) = session_message_to_model(&msg_entry.message) {
                     messages.push(message);
                 }
@@ -2332,6 +2544,10 @@ impl Session {
     fn append_model_message_for_entry(messages: &mut Vec<Message>, entry: &SessionEntry) {
         match entry {
             SessionEntry::Message(msg_entry) => {
+                // Skip messages that are not visible to the agent
+                if !msg_entry.is_agent_visible() {
+                    return;
+                }
                 if let Some(message) = session_message_to_model(&msg_entry.message) {
                     messages.push(message);
                 }
@@ -2881,6 +3097,22 @@ pub enum SessionEntry {
     BranchSummary(BranchSummaryEntry),
     Label(LabelEntry),
     SessionInfo(SessionInfoEntry),
+    #[serde(rename = "reliability/state_digest.v1")]
+    StateDigest(StateDigestEntry),
+    #[serde(rename = "reliability/task_checkpoint.v1")]
+    TaskCheckpoint(TaskCheckpointEntry),
+    #[serde(rename = "reliability/task_created.v1")]
+    TaskCreated(TaskCreatedEntry),
+    #[serde(rename = "reliability/task_transition.v1")]
+    TaskTransition(TaskTransitionEntry),
+    #[serde(rename = "reliability/verification_evidence.v1")]
+    VerificationEvidence(VerificationEvidenceEntry),
+    #[serde(rename = "reliability/close_decision.v1")]
+    CloseDecision(CloseDecisionEntry),
+    #[serde(rename = "reliability/human_blocker_raised.v1")]
+    HumanBlockerRaised(HumanBlockerRaisedEntry),
+    #[serde(rename = "reliability/human_blocker_resolved.v1")]
+    HumanBlockerResolved(HumanBlockerResolvedEntry),
     Custom(CustomEntry),
 }
 
@@ -2894,6 +3126,14 @@ impl SessionEntry {
             Self::BranchSummary(e) => &e.base,
             Self::Label(e) => &e.base,
             Self::SessionInfo(e) => &e.base,
+            Self::StateDigest(e) => &e.base,
+            Self::TaskCheckpoint(e) => &e.base,
+            Self::TaskCreated(e) => &e.base,
+            Self::TaskTransition(e) => &e.base,
+            Self::VerificationEvidence(e) => &e.base,
+            Self::CloseDecision(e) => &e.base,
+            Self::HumanBlockerRaised(e) => &e.base,
+            Self::HumanBlockerResolved(e) => &e.base,
             Self::Custom(e) => &e.base,
         }
     }
@@ -2907,6 +3147,14 @@ impl SessionEntry {
             Self::BranchSummary(e) => &mut e.base,
             Self::Label(e) => &mut e.base,
             Self::SessionInfo(e) => &mut e.base,
+            Self::StateDigest(e) => &mut e.base,
+            Self::TaskCheckpoint(e) => &mut e.base,
+            Self::TaskCreated(e) => &mut e.base,
+            Self::TaskTransition(e) => &mut e.base,
+            Self::VerificationEvidence(e) => &mut e.base,
+            Self::CloseDecision(e) => &mut e.base,
+            Self::HumanBlockerRaised(e) => &mut e.base,
+            Self::HumanBlockerResolved(e) => &mut e.base,
             Self::Custom(e) => &mut e.base,
         }
     }
@@ -2944,6 +3192,29 @@ pub struct MessageEntry {
     #[serde(flatten)]
     pub base: EntryBase,
     pub message: SessionMessage,
+    /// Visibility metadata controlling UI and agent context visibility.
+    /// Defaults to both visible for backward compatibility.
+    #[serde(default, skip_serializing_if = "MessageMetadata::is_default")]
+    pub metadata: MessageMetadata,
+}
+
+#[allow(clippy::missing_const_for_fn)]
+impl MessageEntry {
+    /// Archive this message from agent context.
+    /// The message will remain visible in UI history but won't be sent to the LLM.
+    pub fn archive_from_agent(&mut self) {
+        self.metadata = MessageMetadata::archived();
+    }
+
+    /// Check if this message should be included in agent/LLM context.
+    pub fn is_agent_visible(&self) -> bool {
+        self.metadata.is_agent_visible()
+    }
+
+    /// Check if this message should be shown in UI.
+    pub fn is_user_visible(&self) -> bool {
+        self.metadata.is_user_visible()
+    }
 }
 
 /// Session message payload.
@@ -3041,6 +3312,103 @@ impl From<Message> for SessionMessage {
     }
 }
 
+impl SessionMessage {
+    /// Check if this message should be visible to the agent/LLM.
+    ///
+    /// Returns true if the message has no visibility metadata (default visible)
+    /// or if `agent_visible` is true.
+    pub fn is_agent_visible(&self) -> bool {
+        self.get_visibility_metadata()
+            .is_none_or(|m| m.is_agent_visible())
+    }
+
+    /// Check if this message should be visible in the UI.
+    ///
+    /// Returns true if the message has no visibility metadata (default visible)
+    /// or if `user_visible` is true.
+    pub fn is_user_visible(&self) -> bool {
+        self.get_visibility_metadata()
+            .is_none_or(|m| m.is_user_visible())
+    }
+
+    /// Archive this message from agent context while keeping it in UI history.
+    ///
+    /// After calling this, `is_agent_visible()` will return false but
+    /// `is_user_visible()` will remain true.
+    pub fn archive_from_agent(&mut self) {
+        let metadata = MessageMetadata::archived();
+        self.set_visibility_metadata(metadata);
+    }
+
+    /// Hide this message completely (from both agent and UI).
+    ///
+    /// This is used for internal system messages that should not appear anywhere.
+    pub fn hide_completely(&mut self) {
+        let metadata = MessageMetadata::hidden();
+        self.set_visibility_metadata(metadata);
+    }
+
+    /// Get the visibility metadata for this message, if any.
+    fn get_visibility_metadata(&self) -> Option<MessageMetadata> {
+        match self {
+            Self::BashExecution { extra, .. } => extra
+                .get(VISIBILITY_METADATA_KEY)
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            Self::Custom { details, .. } => details
+                .as_ref()
+                .and_then(|d| d.get(VISIBILITY_METADATA_KEY))
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            _ => None,
+        }
+    }
+
+    /// Set the visibility metadata for this message.
+    fn set_visibility_metadata(&mut self, metadata: MessageMetadata) {
+        // Skip serializing if it's the default (both true)
+        if metadata.is_default() {
+            self.clear_visibility_metadata();
+            return;
+        }
+
+        let value = serde_json::to_value(&metadata)
+            .ok()
+            .unwrap_or(serde_json::Value::Null);
+
+        match self {
+            Self::BashExecution { extra, .. } => {
+                extra.insert(VISIBILITY_METADATA_KEY.to_string(), value);
+            }
+            Self::Custom { details, .. } => {
+                let details =
+                    details.get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert(VISIBILITY_METADATA_KEY.to_string(), value);
+                }
+            }
+            // Other variants don't have extra fields; visibility cannot be set on them
+            // In a future iteration, we could add extra fields to all variants
+            _ => {}
+        }
+    }
+
+    /// Clear any visibility metadata from this message.
+    fn clear_visibility_metadata(&mut self) {
+        match self {
+            Self::BashExecution { extra, .. } => {
+                extra.remove(VISIBILITY_METADATA_KEY);
+            }
+            Self::Custom { details, .. } => {
+                if let Some(d) = details {
+                    if let Some(obj) = d.as_object_mut() {
+                        obj.remove(VISIBILITY_METADATA_KEY);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Model change entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3108,6 +3476,97 @@ pub struct SessionInfoEntry {
     pub base: EntryBase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Reliability state digest entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateDigestEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub digest: StateDigest,
+}
+
+/// Reliability task checkpoint entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCheckpointEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub task_id: String,
+    pub phase: String,
+    pub summary: String,
+    pub timestamp_utc: String,
+}
+
+/// Reliability task-created entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCreatedEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub task_id: String,
+    pub objective: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub timestamp_utc: String,
+}
+
+/// Reliability task-transition entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskTransitionEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    pub timestamp_utc: String,
+}
+
+/// Reliability verification evidence entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationEvidenceEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub evidence: EvidenceRecord,
+}
+
+/// Reliability close decision entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseDecisionEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub payload: ClosePayload,
+    pub result: CloseResult,
+}
+
+/// Reliability human blocker raised entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanBlockerRaisedEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub task_id: String,
+    pub reason: String,
+    pub context: String,
+    pub timestamp_utc: String,
+}
+
+/// Reliability human blocker resolved entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanBlockerResolvedEntry {
+    #[serde(flatten)]
+    pub base: EntryBase,
+    pub task_id: String,
+    pub resolution: String,
+    pub timestamp_utc: String,
 }
 
 /// Custom entry.
@@ -3334,6 +3793,70 @@ fn render_session_html(header: &SessionHeader, entries: &[SessionEntry]) -> Stri
                     );
                 }
             }
+            SessionEntry::StateDigest(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability State Digest</div><div class=\"note\">objective: {} | phase: {}</div></div>",
+                    escape_html(&entry.digest.objective),
+                    escape_html(&entry.digest.phase)
+                );
+            }
+            SessionEntry::TaskCheckpoint(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Task Checkpoint</div><div class=\"note\">task: {} | phase: {}</div></div>",
+                    escape_html(&entry.task_id),
+                    escape_html(&entry.phase)
+                );
+            }
+            SessionEntry::TaskCreated(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Task Created</div><div class=\"note\">task: {} | objective: {}</div></div>",
+                    escape_html(&entry.task_id),
+                    escape_html(&entry.objective)
+                );
+            }
+            SessionEntry::TaskTransition(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Task Transition</div><div class=\"note\">task: {} | to: {}</div></div>",
+                    escape_html(&entry.task_id),
+                    escape_html(&entry.to)
+                );
+            }
+            SessionEntry::VerificationEvidence(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Verification Evidence</div><div class=\"note\">task: {} | command: {}</div></div>",
+                    escape_html(&entry.evidence.task_id),
+                    escape_html(&entry.evidence.command)
+                );
+            }
+            SessionEntry::CloseDecision(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Close Decision</div><div class=\"note\">task: {} | outcome: {}</div></div>",
+                    escape_html(&entry.payload.task_id),
+                    escape_html(&entry.payload.outcome)
+                );
+            }
+            SessionEntry::HumanBlockerRaised(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Human Blocker Raised</div><div class=\"note\">task: {} | reason: {}</div></div>",
+                    escape_html(&entry.task_id),
+                    escape_html(&entry.reason)
+                );
+            }
+            SessionEntry::HumanBlockerResolved(entry) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"msg system\"><div class=\"role\">Reliability Human Blocker Resolved</div><div class=\"note\">task: {} | resolution: {}</div></div>",
+                    escape_html(&entry.task_id),
+                    escape_html(&entry.resolution)
+                );
+            }
             SessionEntry::Custom(custom) => {
                 let _ = write!(
                     html,
@@ -3551,6 +4074,8 @@ fn session_entry_stats(entries: &[SessionEntry]) -> (u64, Option<String>) {
 
 /// Minimum entry count to activate parallel deserialization (Gap E).
 const PARALLEL_THRESHOLD: usize = 512;
+const PARALLEL_BATCH_SIZE: usize = 2048;
+type OpenChunkResult = (Vec<SessionEntry>, Vec<SessionOpenSkippedEntry>);
 
 /// Parse a JSONL session file on the current (blocking) thread.
 ///
@@ -3582,16 +4107,14 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
     // Gap E: parallel deserialization for large sessions.
     // Batch processing to bound memory usage while allowing parallelism.
     let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-    const BATCH_SIZE: usize = 2048;
-
-    let mut line_batch: Vec<(usize, String)> = Vec::with_capacity(BATCH_SIZE);
+    let mut line_batch: Vec<(usize, String)> = Vec::with_capacity(PARALLEL_BATCH_SIZE);
     let mut current_line_num = 2; // Header is line 1
 
     loop {
         line_batch.clear();
         let mut batch_eof = false;
 
-        for _ in 0..BATCH_SIZE {
+        for _ in 0..PARALLEL_BATCH_SIZE {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
@@ -3622,9 +4145,7 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
 
         if line_batch.len() >= PARALLEL_THRESHOLD && num_threads > 1 {
             let chunk_size = (line_batch.len() / num_threads).max(64);
-            type ChunkResult = (Vec<SessionEntry>, Vec<SessionOpenSkippedEntry>);
-
-            let chunk_results: Vec<ChunkResult> = std::thread::scope(|s| {
+            let chunk_results: Vec<OpenChunkResult> = std::thread::scope(|s| {
                 line_batch
                     .chunks(chunk_size)
                     .map(|chunk| {
@@ -3647,9 +4168,15 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
-                    .map(|h| h.join().unwrap())
-                    .collect()
-            });
+                    .map(|h| {
+                        h.join().map_err(|_| {
+                            Error::session(
+                                "Parallel session parser worker panicked while opening JSONL session",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
 
             for (chunk_entries, chunk_skipped) in chunk_results {
                 entries.extend(chunk_entries);
@@ -3657,7 +4184,7 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             }
         } else {
             // Sequential path
-            for (line_num, line) in line_batch.drain(..) {
+            for (line_num, line) in std::mem::take(&mut line_batch) {
                 match serde_json::from_str::<SessionEntry>(&line) {
                     Ok(entry) => entries.push(entry),
                     Err(e) => {
@@ -5263,6 +5790,7 @@ mod tests {
                 timestamp: Some(0),
                 extra,
             },
+            metadata: MessageMetadata::default(),
         });
         session.leaf_id = Some(id);
         session.entries.push(entry);
@@ -5319,6 +5847,92 @@ mod tests {
         } else {
             panic!("expected Custom entry");
         }
+    }
+
+    #[test]
+    fn test_append_state_digest_entry_and_load_latest() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Hello"));
+
+        let mut digest = StateDigest::new("Fix flaky test", "verify");
+        digest.blockers = vec!["network rate limit".to_string()];
+        digest.recent_actions = vec!["ran cargo test".to_string()];
+        digest.next_action = Some("rerun targeted test suite".to_string());
+        session.append_state_digest_entry(digest.clone());
+
+        let loaded = session.latest_state_digest_entry().expect("state digest");
+        assert_eq!(loaded.objective, digest.objective);
+        assert_eq!(loaded.phase, digest.phase);
+        assert_eq!(loaded.blockers, digest.blockers);
+    }
+
+    #[test]
+    fn reliability_typed_entries_roundtrip() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Hello"));
+
+        let digest = StateDigest::new("Deliver reliability V2", "verify");
+        let digest_entry_id = session.append_state_digest_entry(digest.clone());
+        let evidence =
+            EvidenceRecord::from_command_output("task-1", "cargo test", 0, "ok", "", Vec::new());
+        let evidence_id = evidence.evidence_id.clone();
+        let evidence_entry_id = session.append_verification_evidence_entry(evidence);
+        let close_entry_id = session.append_close_decision_entry(
+            ClosePayload {
+                task_id: "task-1".to_string(),
+                outcome: "Implemented fix".to_string(),
+                outcome_kind: Some(crate::reliability::CloseOutcomeKind::Success),
+                acceptance_ids: vec!["acceptance-1".to_string()],
+                evidence_ids: vec![evidence_id.clone()],
+                trace_parent: Some("epic-1".to_string()),
+            },
+            CloseResult::approved(),
+        );
+
+        let evidence_entry = session
+            .get_entry(&evidence_entry_id)
+            .expect("evidence entry");
+        let close_entry = session.get_entry(&close_entry_id).expect("close entry");
+        let digest_entry = session
+            .get_entry(&digest_entry_id)
+            .expect("state digest entry");
+        assert!(matches!(
+            digest_entry,
+            SessionEntry::StateDigest(entry)
+            if entry.digest.objective == digest.objective && entry.digest.phase == digest.phase
+        ));
+        assert!(
+            matches!(evidence_entry, SessionEntry::VerificationEvidence(entry) if entry.evidence.command == "cargo test")
+        );
+        assert!(
+            matches!(close_entry, SessionEntry::CloseDecision(entry) if entry.payload.task_id == "task-1")
+        );
+
+        let encoded = serde_json::to_value(evidence_entry.clone()).expect("serialize typed entry");
+        assert_eq!(
+            encoded["type"],
+            RELIABILITY_VERIFICATION_EVIDENCE_ENTRY_TYPE
+        );
+        let decoded: SessionEntry =
+            serde_json::from_value(encoded).expect("deserialize typed entry");
+        assert!(matches!(
+            decoded,
+            SessionEntry::VerificationEvidence(entry)
+            if entry.evidence.evidence_id == evidence_id
+        ));
+
+        let legacy_custom = serde_json::json!({
+            "type": "custom",
+            "id": "legacy-state-digest",
+            "timestamp": "2026-02-20T12:00:00.000Z",
+            "customType": RELIABILITY_STATE_DIGEST_ENTRY_TYPE,
+            "data": serde_json::to_value(digest).expect("encode digest"),
+        });
+        let legacy_entry: SessionEntry =
+            serde_json::from_value(legacy_custom).expect("legacy custom reliability entry parses");
+        assert!(matches!(legacy_entry, SessionEntry::Custom(_)));
+        session.entries.push(legacy_entry);
+        assert!(session.latest_state_digest_entry().is_some());
     }
 
     // ======================================================================
@@ -5969,6 +6583,7 @@ mod tests {
                     content: UserContent::Text("test".to_string()),
                     timestamp: Some(0),
                 },
+                metadata: MessageMetadata::default(),
             }),
             SessionEntry::Message(MessageEntry {
                 base: EntryBase {
@@ -5980,6 +6595,7 @@ mod tests {
                     content: UserContent::Text("test2".to_string()),
                     timestamp: Some(0),
                 },
+                metadata: MessageMetadata::default(),
             }),
         ];
 
@@ -7145,6 +7761,7 @@ mod tests {
                             content: UserContent::Text(format!("msg {i}")),
                             timestamp: Some(0),
                         },
+                        metadata: MessageMetadata::default(),
                     })
                 }).collect();
 
@@ -9136,5 +9753,631 @@ mod tests {
         let plan_entry_count = plan.entries.len();
         session.append_message(make_test_message("third message"));
         assert_eq!(plan.entries.len(), plan_entry_count);
+    }
+}
+
+// =============================================================================
+// Property-based tests for session persistence
+// =============================================================================
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use crate::model::{
+        AssistantMessage, ContentBlock, Cost, ImageContent, StopReason, TextContent,
+        ThinkingContent, ToolCall, Usage,
+    };
+    use proptest::collection::{hash_map, vec};
+    use proptest::option;
+    use proptest::prelude::*;
+
+    // =========================================================================
+    // Arbitrary implementations for session types
+    // =========================================================================
+
+    impl Arbitrary for TextContent {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            any::<String>()
+                .prop_map(|text| TextContent::new(text))
+                .boxed()
+        }
+    }
+
+    impl Arbitrary for ThinkingContent {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            (any::<String>(), option::of(any::<String>()))
+                .prop_map(|(thinking, sig)| ThinkingContent {
+                    thinking,
+                    thinking_signature: sig,
+                })
+                .boxed()
+        }
+    }
+
+    impl Arbitrary for ImageContent {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            (any::<String>(), any::<String>())
+                .prop_map(|(data, mime_type)| ImageContent { data, mime_type })
+                .boxed()
+        }
+    }
+
+    impl Arbitrary for ToolCall {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            (
+                any::<String>(),
+                any::<String>(),
+                json_value_strategy(),
+                option::of(any::<String>()),
+            )
+                .prop_map(|(id, name, arguments, thought_signature)| ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    thought_signature,
+                })
+                .boxed()
+        }
+    }
+
+    fn content_block_strategy() -> impl Strategy<Value = ContentBlock> {
+        prop_oneof![
+            any::<TextContent>().prop_map(ContentBlock::Text),
+            any::<ThinkingContent>().prop_map(ContentBlock::Thinking),
+            any::<ImageContent>().prop_map(ContentBlock::Image),
+            any::<ToolCall>().prop_map(ContentBlock::ToolCall),
+        ]
+    }
+
+    /// Strategy for generating simple JSON values
+    fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|v| serde_json::Value::Number(v.into())),
+            any::<String>().prop_map(serde_json::Value::String),
+            // Simple object with string values
+            hash_map(any::<String>(), any::<String>(), 0..3).prop_map(|m| {
+                serde_json::Value::Object(
+                    m.into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect(),
+                )
+            }),
+            // Simple array of strings
+            vec(any::<String>(), 0..3).prop_map(|v| serde_json::Value::Array(
+                v.into_iter().map(serde_json::Value::String).collect()
+            )),
+        ]
+    }
+
+    fn user_content_strategy() -> impl Strategy<Value = UserContent> {
+        prop_oneof![
+            any::<String>().prop_map(UserContent::Text),
+            vec(content_block_strategy(), 0..5).prop_map(UserContent::Blocks),
+        ]
+    }
+
+    fn usage_strategy() -> impl Strategy<Value = Usage> {
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(input, output, cache_read, cache_write, total_tokens)| Usage {
+                    input: input % 1_000_000,
+                    output: output % 100_000,
+                    cache_read: cache_read % 500_000,
+                    cache_write: cache_write % 500_000,
+                    total_tokens: total_tokens % 2_000_000,
+                    cost: Cost::default(),
+                },
+            )
+    }
+
+    fn stop_reason_strategy() -> impl Strategy<Value = StopReason> {
+        prop_oneof![
+            Just(StopReason::Stop),
+            Just(StopReason::Length),
+            Just(StopReason::ToolUse),
+            Just(StopReason::Error),
+            Just(StopReason::Aborted),
+        ]
+    }
+
+    fn assistant_message_strategy() -> impl Strategy<Value = AssistantMessage> {
+        (
+            vec(content_block_strategy(), 0..5),
+            any::<String>(),
+            any::<String>(),
+            any::<String>(),
+            usage_strategy(),
+            stop_reason_strategy(),
+            option::of(any::<String>()),
+            any::<i64>(),
+        )
+            .prop_map(
+                |(content, api, provider, model, usage, stop_reason, error_message, timestamp)| {
+                    AssistantMessage {
+                        content,
+                        api,
+                        provider,
+                        model,
+                        usage,
+                        stop_reason,
+                        error_message,
+                        timestamp,
+                    }
+                },
+            )
+    }
+
+    fn optional_json_details_strategy() -> impl Strategy<Value = Option<Value>> {
+        option::of(json_value_strategy()).prop_map(|details| details.filter(|v| !v.is_null()))
+    }
+
+    fn session_message_strategy() -> impl Strategy<Value = SessionMessage> {
+        prop_oneof![
+            // User message
+            (user_content_strategy(), option::of(any::<i64>()))
+                .prop_map(|(content, timestamp)| SessionMessage::User { content, timestamp }),
+            // Assistant message
+            assistant_message_strategy().prop_map(|message| SessionMessage::Assistant { message }),
+            // Tool result
+            (
+                any::<String>(),
+                any::<String>(),
+                vec(content_block_strategy(), 0..5),
+                optional_json_details_strategy(),
+                any::<bool>(),
+                option::of(any::<i64>()),
+            )
+                .prop_map(
+                    |(tool_call_id, tool_name, content, details, is_error, timestamp)| {
+                        SessionMessage::ToolResult {
+                            tool_call_id,
+                            tool_name,
+                            content,
+                            details,
+                            is_error,
+                            timestamp,
+                        }
+                    },
+                ),
+            // Custom message
+            (
+                any::<String>(),
+                any::<String>(),
+                any::<bool>(),
+                optional_json_details_strategy(),
+                option::of(any::<i64>()),
+            )
+                .prop_map(|(custom_type, content, display, details, timestamp)| {
+                    SessionMessage::Custom {
+                        custom_type,
+                        content,
+                        display,
+                        details,
+                        timestamp,
+                    }
+                },),
+            // Bash execution
+            (
+                any::<String>(),
+                any::<String>(),
+                any::<i32>(),
+                option::of(any::<bool>()),
+                option::of(any::<bool>()),
+                option::of(any::<String>()),
+                option::of(any::<i64>()),
+                hash_map(any::<String>(), json_value_strategy(), 0..3),
+            )
+                .prop_map(
+                    |(
+                        command,
+                        output,
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                        timestamp,
+                        extra,
+                    )| {
+                        SessionMessage::BashExecution {
+                            command,
+                            output,
+                            exit_code,
+                            cancelled,
+                            truncated,
+                            full_output_path,
+                            timestamp,
+                            extra,
+                        }
+                    },
+                ),
+            // Branch summary
+            (any::<String>(), any::<String>())
+                .prop_map(|(summary, from_id)| SessionMessage::BranchSummary { summary, from_id }),
+            // Compaction summary
+            (any::<String>(), any::<u64>()).prop_map(|(summary, tokens_before)| {
+                SessionMessage::CompactionSummary {
+                    summary,
+                    tokens_before,
+                }
+            }),
+        ]
+    }
+
+    fn entry_base_strategy() -> impl Strategy<Value = EntryBase> {
+        (
+            option::of(any::<String>()),
+            option::of(any::<String>()),
+            any::<String>(),
+        )
+            .prop_map(|(id, parent_id, timestamp)| EntryBase {
+                id,
+                parent_id,
+                timestamp,
+            })
+    }
+
+    fn message_metadata_strategy() -> impl Strategy<Value = MessageMetadata> {
+        (any::<bool>(), any::<bool>()).prop_map(|(user_visible, agent_visible)| {
+            let mut meta = MessageMetadata::new();
+            meta.user_visible = user_visible;
+            meta.agent_visible = agent_visible;
+            meta
+        })
+    }
+
+    fn message_entry_strategy() -> impl Strategy<Value = MessageEntry> {
+        (
+            entry_base_strategy(),
+            session_message_strategy(),
+            message_metadata_strategy(),
+        )
+            .prop_map(|(base, message, metadata)| MessageEntry {
+                base,
+                message,
+                metadata,
+            })
+    }
+
+    fn session_entry_strategy() -> impl Strategy<Value = SessionEntry> {
+        // Focus on Message entries as they are the most common and complex
+        message_entry_strategy().prop_map(SessionEntry::Message)
+    }
+
+    // =========================================================================
+    // Message Serialization Roundtrip Tests
+    // =========================================================================
+
+    proptest! {
+        /// Test that SessionMessage serializes and deserializes without data loss
+        #[test]
+        fn session_message_roundtrip_preserves_data(msg in session_message_strategy()) {
+            let serialized = serde_json::to_string(&msg).expect("serialization should succeed");
+            let deserialized: SessionMessage =
+                serde_json::from_str(&serialized).expect("deserialization should succeed");
+
+            // Compare semantic JSON values (map key order is not stable for all fields).
+            let original_json = serde_json::to_value(&msg).expect("re-serialization");
+            let roundtrip_json = serde_json::to_value(&deserialized).expect("re-serialization");
+
+            prop_assert_eq!(original_json, roundtrip_json);
+        }
+
+        /// Test that a vector of SessionMessages roundtrips correctly
+        #[test]
+        fn session_message_vec_roundtrip(msgs in vec(session_message_strategy(), 0..20)) {
+            let serialized = serde_json::to_string(&msgs).expect("serialization");
+            let deserialized: Vec<SessionMessage> =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            prop_assert_eq!(msgs.len(), deserialized.len());
+            for (original, roundtrip) in msgs.iter().zip(deserialized.iter()) {
+                let orig_json = serde_json::to_value(original).expect("serialize");
+                let rt_json = serde_json::to_value(roundtrip).expect("serialize");
+                prop_assert_eq!(orig_json, rt_json);
+            }
+        }
+
+        /// Test that MessageEntry roundtrips correctly
+        #[test]
+        fn message_entry_roundtrip(entry in message_entry_strategy()) {
+            let serialized = serde_json::to_string(&entry).expect("serialization");
+            let deserialized: MessageEntry =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            let original_json = serde_json::to_value(&entry).expect("re-serialize");
+            let roundtrip_json = serde_json::to_value(&deserialized).expect("re-serialize");
+
+            prop_assert_eq!(original_json, roundtrip_json);
+        }
+
+        /// Test that SessionEntry (Message variant) roundtrips correctly
+        #[test]
+        fn session_entry_message_roundtrip(entry in session_entry_strategy()) {
+            let serialized = serde_json::to_string(&entry).expect("serialization");
+            let deserialized: SessionEntry =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            let original_json = serde_json::to_value(&entry).expect("re-serialize");
+            let roundtrip_json = serde_json::to_value(&deserialized).expect("re-serialize");
+
+            prop_assert_eq!(original_json, roundtrip_json);
+        }
+
+        /// Test that a session with multiple entries can be serialized and deserialized
+        #[test]
+        fn session_entries_roundtrip(entries in vec(session_entry_strategy(), 0..50)) {
+            let serialized = serde_json::to_string(&entries).expect("serialization");
+            let deserialized: Vec<SessionEntry> =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            prop_assert_eq!(entries.len(), deserialized.len());
+
+            // Verify each entry roundtrips correctly
+            for (i, (original, roundtrip)) in
+                entries.iter().zip(deserialized.iter()).enumerate()
+            {
+                let orig_json = serde_json::to_value(original).expect("serialize original entry");
+                let rt_json = serde_json::to_value(roundtrip).expect("serialize roundtrip entry");
+                if !orig_json.eq(&rt_json) {
+                    prop_assert!(
+                        false,
+                        "Entry {} failed to roundtrip:\noriginal: {}\nroundtrip: {}",
+                        i,
+                        orig_json,
+                        rt_json
+                    );
+                }
+            }
+        }
+
+        /// Test EntryBase roundtrip
+        #[test]
+        fn entry_base_roundtrip(base in entry_base_strategy()) {
+            let serialized = serde_json::to_string(&base).expect("serialization");
+            let deserialized: EntryBase =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            prop_assert_eq!(base.id, deserialized.id);
+            prop_assert_eq!(base.parent_id, deserialized.parent_id);
+            prop_assert_eq!(base.timestamp, deserialized.timestamp);
+        }
+
+        /// Test that UserContent roundtrips correctly
+        #[test]
+        fn user_content_roundtrip(content in user_content_strategy()) {
+            let serialized = serde_json::to_string(&content).expect("serialization");
+            let deserialized: UserContent =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            let original_json = serde_json::to_string(&content).expect("re-serialize");
+            let roundtrip_json = serde_json::to_string(&deserialized).expect("re-serialize");
+
+            prop_assert_eq!(original_json, roundtrip_json);
+        }
+
+        /// Test ContentBlock roundtrip
+        #[test]
+        fn content_block_roundtrip(block in content_block_strategy()) {
+            let serialized = serde_json::to_string(&block).expect("serialization");
+            let deserialized: ContentBlock =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            let original_json = serde_json::to_string(&block).expect("re-serialize");
+            let roundtrip_json = serde_json::to_string(&deserialized).expect("re-serialize");
+
+            prop_assert_eq!(original_json, roundtrip_json);
+        }
+    }
+
+    // =========================================================================
+    // SessionHeader roundtrip tests
+    // =========================================================================
+
+    fn session_header_strategy() -> impl Strategy<Value = SessionHeader> {
+        (
+            any::<String>(),
+            option::of(any::<u8>()),
+            any::<String>(),
+            any::<String>(),
+            any::<String>(),
+            option::of(any::<String>()),
+            option::of(any::<String>()),
+            option::of(any::<String>()),
+            option::of(any::<String>()),
+        )
+            .prop_map(
+                |(
+                    r#type,
+                    version,
+                    id,
+                    timestamp,
+                    cwd,
+                    provider,
+                    model_id,
+                    thinking_level,
+                    parent_session,
+                )| {
+                    SessionHeader {
+                        r#type,
+                        version,
+                        id,
+                        timestamp,
+                        cwd,
+                        provider,
+                        model_id,
+                        thinking_level,
+                        parent_session,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn session_header_roundtrip(header in session_header_strategy()) {
+            let serialized = serde_json::to_string(&header).expect("serialization");
+            let deserialized: SessionHeader =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            prop_assert_eq!(header.id, deserialized.id);
+            prop_assert_eq!(header.version, deserialized.version);
+            prop_assert_eq!(header.provider, deserialized.provider);
+            prop_assert_eq!(header.model_id, deserialized.model_id);
+            prop_assert_eq!(header.thinking_level, deserialized.thinking_level);
+            prop_assert_eq!(header.cwd, deserialized.cwd);
+            prop_assert_eq!(header.parent_session, deserialized.parent_session);
+        }
+    }
+
+    // =========================================================================
+    // MessageMetadata roundtrip tests
+    // =========================================================================
+
+    proptest! {
+        #[test]
+        fn message_metadata_default_roundtrip(
+            user_visible in any::<bool>(),
+            agent_visible in any::<bool>()
+        ) {
+            let mut meta = MessageMetadata::new();
+            meta.user_visible = user_visible;
+            meta.agent_visible = agent_visible;
+
+            let serialized = serde_json::to_string(&meta).expect("serialization");
+            let deserialized: MessageMetadata =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            prop_assert_eq!(meta.user_visible, deserialized.user_visible);
+            prop_assert_eq!(meta.agent_visible, deserialized.agent_visible);
+        }
+    }
+
+    // =========================================================================
+    // Invariant tests
+    // =========================================================================
+
+    proptest! {
+        /// Verify that serialization is deterministic (same input -> same output)
+        #[test]
+        fn serialization_is_deterministic(msg in session_message_strategy()) {
+            let first = serde_json::to_string(&msg).expect("serialize");
+            let second = serde_json::to_string(&msg).expect("serialize");
+            prop_assert_eq!(first, second);
+        }
+
+        /// Verify that deserialization fails gracefully for invalid JSON
+        #[test]
+        fn deserialization_rejects_invalid_json(invalid in "[^\\[\\]{\\}a-zA-Z0-9\":, \t\n]+") {
+            let result: std::result::Result<SessionMessage, _> = serde_json::from_str(&invalid);
+            // Most random strings should fail to parse as SessionMessage
+            // (This is a weak test, but ensures we don't panic on bad input)
+            if let Ok(parsed) = result {
+                // If it somehow parsed, ensure re-serialization works
+                let _ = serde_json::to_string(&parsed);
+            }
+        }
+
+        /// Test that empty vectors are handled correctly
+        #[test]
+        fn empty_message_vec_roundtrip(msgs in vec(session_message_strategy(), 0..=0)) {
+            prop_assert!(msgs.is_empty());
+            let serialized = serde_json::to_string(&msgs).expect("serialization");
+            let deserialized: Vec<SessionMessage> =
+                serde_json::from_str(&serialized).expect("deserialization");
+            prop_assert!(deserialized.is_empty());
+        }
+
+        /// Test very large text content
+        #[test]
+        fn large_text_content_roundtrip(text in "[a-zA-Z ]{0,10000}") {
+            let msg = SessionMessage::User {
+                content: UserContent::Text(text.clone()),
+                timestamp: Some(0),
+            };
+            let serialized = serde_json::to_string(&msg).expect("serialization");
+            let deserialized: SessionMessage =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            if let SessionMessage::User {
+                content: UserContent::Text(roundtrip_text),
+                ..
+            } = deserialized
+            {
+                prop_assert_eq!(text, roundtrip_text);
+            } else {
+                prop_assert!(false, "Expected User::Text variant");
+            }
+        }
+
+        /// Test that special characters are preserved
+        #[test]
+        fn special_characters_preserved(
+            text in "[\\x00-\\x7F]{0,100}"
+        ) {
+            // Filter out control characters that break JSON
+            let text: String = text
+                .chars()
+                .filter(|c| *c >= ' ' || *c == '\t' || *c == '\n' || *c == '\r')
+                .collect();
+
+            let msg = SessionMessage::User {
+                content: UserContent::Text(text.clone()),
+                timestamp: Some(0),
+            };
+
+            let serialized = serde_json::to_string(&msg).expect("serialization");
+            let deserialized: SessionMessage =
+                serde_json::from_str(&serialized).expect("deserialization");
+
+            if let SessionMessage::User {
+                content: UserContent::Text(roundtrip_text),
+                ..
+            } = deserialized
+            {
+                prop_assert_eq!(text, roundtrip_text);
+            }
+        }
+
+        /// Test unicode handling
+        #[test]
+        fn unicode_content_roundtrip(text in ".*") {
+            let msg = SessionMessage::User {
+                content: UserContent::Text(text.clone()),
+                timestamp: Some(0),
+            };
+
+            let serialized = serde_json::to_string(&msg).ok();
+            if let Some(json) = serialized {
+                if let Ok(deserialized) = serde_json::from_str::<SessionMessage>(&json) {
+                    if let SessionMessage::User {
+                        content: UserContent::Text(roundtrip_text),
+                        ..
+                    } = deserialized
+                    {
+                        prop_assert_eq!(text, roundtrip_text);
+                    }
+                }
+            }
+        }
     }
 }

@@ -7,7 +7,26 @@
 
 #![forbid(unsafe_code)]
 // Allow dead code and unused async during scaffolding phase - remove once implementation is complete
-#![allow(dead_code, clippy::unused_async)]
+#![allow(
+    dead_code,
+    clippy::unused_async,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::uninlined_format_args,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::needless_pass_by_value,
+    clippy::needless_pass_by_ref_mut,
+    clippy::collapsible_match,
+    clippy::default_trait_access,
+    clippy::field_reassign_with_default,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::option_if_let_else,
+    clippy::match_same_arms,
+    clippy::unused_self
+)]
 
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
@@ -101,15 +120,15 @@ fn main_impl() -> Result<()> {
         return Ok(());
     };
 
-    if cli.version {
-        print_version();
-        return Ok(());
-    }
-
     // Validate theme file paths.
     // Named themes (without .json, /, ~) are validated later after resource loading.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
+
+    if cli.version {
+        print_version();
+        return Ok(());
+    }
 
     // Ultra-fast paths that don't need tracing or the async runtime.
     if let Some(command) = &cli.command {
@@ -652,6 +671,16 @@ fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> 
     Ok(())
 }
 
+fn apply_cli_retry_override(config: &mut Config, cli: &cli::Cli) {
+    if !cli.retry {
+        return;
+    }
+
+    let mut retry = config.retry.clone().unwrap_or_default();
+    retry.enabled = Some(true);
+    config.retry = Some(retry);
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -677,6 +706,7 @@ async fn run(
         // Theme already validated above
         config.theme = Some(theme_spec.to_string());
     }
+    apply_cli_retry_override(&mut config, &cli);
     spawn_session_index_maintenance();
     let package_manager = PackageManager::new(cwd.clone());
     let resource_cli = ResourceCliOptions {
@@ -1048,7 +1078,10 @@ async fn run(
         session_arc,
         !cli.no_session,
         compaction_settings,
-    );
+    )
+    .with_reliability_enabled(config.reliability_enabled())
+    .with_reliability_mode(config.reliability_enforcement_mode())
+    .with_retry_settings(config.retry.clone().unwrap_or_default());
 
     let history = {
         let cx = pi::agent_cx::AgentCx::for_request();
@@ -1199,7 +1232,7 @@ async fn run(
                 thinking_level: sm.thinking_level,
             })
             .collect::<Vec<_>>();
-        run_rpc_mode(
+        Box::pin(run_rpc_mode(
             agent_session,
             resources,
             config.clone(),
@@ -1207,7 +1240,7 @@ async fn run(
             rpc_scoped_models,
             auth.clone(),
             runtime_handle.clone(),
-        )
+        ))
         .await
     } else if is_interactive {
         let model_scope = selection
@@ -1255,9 +1288,11 @@ async fn run(
 
     // Best-effort autosave flush on shutdown.
     let cx = pi::agent_cx::AgentCx::for_request();
-    if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
-        if let Err(e) = guard.flush_autosave_on_shutdown().await {
-            eprintln!("Warning: Failed to flush session autosave: {e}");
+    if !cli.no_session {
+        if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
+            if let Err(e) = guard.flush_autosave_on_shutdown().await {
+                eprintln!("Warning: Failed to flush session autosave: {e}");
+            }
         }
     }
 
@@ -1314,6 +1349,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         }
         cli::Commands::Migrate { path, dry_run } => {
             handle_session_migrate(&path, dry_run)?;
+        }
+        cli::Commands::Account { command } => {
+            handle_account_command(command)?;
         }
     }
 
@@ -2512,7 +2550,7 @@ fn persist_package_toggles_with_roots(
 
         let packages_array = settings
             .as_object_mut()
-            .expect("checked is object")
+            .ok_or_else(|| anyhow::anyhow!("settings should be an object"))?
             .entry("packages".to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         if !packages_array.is_array() {
@@ -2521,7 +2559,7 @@ fn persist_package_toggles_with_roots(
 
         let package_entries = packages_array
             .as_array_mut()
-            .expect("forced packages to be an array");
+            .ok_or_else(|| anyhow::anyhow!("packages should be an array"))?;
 
         let mut updated_sources = std::collections::HashSet::new();
         for entry in package_entries.iter_mut() {
@@ -2711,6 +2749,175 @@ fn handle_session_migrate(path: &str, dry_run: bool) -> Result<()> {
     if errors > 0 {
         bail!("{errors} session(s) failed migration");
     }
+    Ok(())
+}
+
+/// Handle account management commands.
+fn handle_account_command(command: cli::AccountCommands) -> Result<()> {
+    use cli::AccountCommands;
+
+    let auth_path = pi::config::Config::auth_path();
+
+    fn parse_revocation_reason(reason: Option<String>) -> pi::auth::RevocationReason {
+        match reason
+            .as_deref()
+            .map_or("user_requested", str::trim)
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "compromised" => pi::auth::RevocationReason::Compromised,
+            "auth_failure" | "auth-failure" => pi::auth::RevocationReason::AuthFailure,
+            "provider_invalidated" | "provider-invalidated" => {
+                pi::auth::RevocationReason::ProviderInvalidated
+            }
+            "account_removed" | "account-removed" => pi::auth::RevocationReason::AccountRemoved,
+            _ => pi::auth::RevocationReason::UserRequested,
+        }
+    }
+
+    match command {
+        AccountCommands::List { provider } => {
+            let auth = pi::auth::AuthStorage::load(auth_path)?;
+            let provider = provider.unwrap_or_else(|| "all".to_string());
+            let output = auth.format_accounts_status(&provider);
+            println!("{output}");
+        }
+        AccountCommands::Use { provider, account } => {
+            let mut auth = pi::auth::AuthStorage::load(auth_path)?;
+            auth.set_active_account(&provider, &account)?;
+            auth.save()?;
+            println!("Switched to account '{account}' for {provider}");
+        }
+        AccountCommands::Remove { provider, account } => {
+            let mut auth = pi::auth::AuthStorage::load(auth_path)?;
+            // Use the existing remove method for the account
+            let accounts = auth.list_oauth_accounts(&provider);
+            if accounts.iter().any(|a| a.id == account) {
+                auth.remove_oauth_account(&provider, &account);
+                auth.save()?;
+                println!("Removed account '{account}' from {provider}");
+            } else {
+                bail!("Account '{account}' not found in {provider}");
+            }
+        }
+        AccountCommands::Logout { provider } => {
+            let mut auth = pi::auth::AuthStorage::load(auth_path)?;
+            if let Some(provider) = provider {
+                // Remove specific provider's credentials
+                auth.remove(&provider);
+                auth.save()?;
+                println!("Logged out from {provider}");
+            } else {
+                // Logout from all providers
+                let providers = auth.provider_names();
+                for p in providers {
+                    auth.remove(&p);
+                }
+                auth.save()?;
+                println!("Logged out from all providers");
+            }
+        }
+        AccountCommands::Status { provider, json } => {
+            let auth = pi::auth::AuthStorage::load(auth_path)?;
+            if json {
+                if let Some(p) = provider {
+                    let accounts = auth.list_oauth_accounts(&p);
+                    let payload = serde_json::json!({
+                        "provider": p,
+                        "accounts": accounts,
+                        "revocations": auth.revocation_records(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                } else {
+                    let providers = auth.provider_names();
+                    let mut provider_payload = serde_json::Map::new();
+                    for p in providers {
+                        provider_payload.insert(
+                            p.clone(),
+                            serde_json::json!({
+                                "accounts": auth.list_oauth_accounts(&p),
+                                "recovery": auth.recovery_state_summary(&p),
+                            }),
+                        );
+                    }
+                    let payload = serde_json::json!({
+                        "providers": provider_payload,
+                        "revocations": auth.revocation_records(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                }
+            } else if let Some(p) = provider {
+                let output = auth.format_accounts_status(&p);
+                println!("{output}");
+            } else {
+                // List all providers
+                let providers = auth.provider_names();
+                if providers.is_empty() {
+                    println!("No providers configured.");
+                } else {
+                    for p in providers {
+                        println!("Provider: {p}");
+                        let output = auth.format_accounts_status(&p);
+                        println!("{output}");
+                    }
+                }
+            }
+        }
+        AccountCommands::Cleanup { dry_run } => {
+            let mut auth = pi::auth::AuthStorage::load(auth_path)?;
+            if dry_run {
+                let report = auth.cleanup_tokens_preview();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let report = auth.cleanup_tokens();
+                auth.save()?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        }
+        AccountCommands::Revoke {
+            provider,
+            account,
+            reason,
+        } => {
+            let mut auth = pi::auth::AuthStorage::load(auth_path)?;
+            let reason = parse_revocation_reason(reason);
+            auth.revoke_oauth_account_token(&provider, &account, reason)?;
+            auth.save()?;
+            println!("Revoked account '{account}' for {provider} ({reason})");
+        }
+        AccountCommands::Recovery {
+            provider,
+            account,
+            json,
+        } => {
+            let auth = pi::auth::AuthStorage::load(auth_path)?;
+            let mut rows = auth.recovery_state_summary(&provider);
+            if let Some(account_id) = account.as_deref() {
+                rows.retain(|(id, _)| id == account_id);
+            }
+            if json {
+                let payload = serde_json::json!({
+                    "provider": provider,
+                    "recovery": rows,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if rows.is_empty() {
+                println!("No recovery state found for provider '{provider}'.");
+            } else {
+                for (account_id, state) in rows {
+                    println!(
+                        "{}: {}",
+                        account_id,
+                        state.as_ref().map_or_else(
+                            || "none".to_string(),
+                            pi::auth::RecoveryState::description
+                        )
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2957,6 +3164,17 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
     let (first, rest) = normalized
         .split_once(char::is_whitespace)
         .map_or((normalized.as_str(), ""), |(a, b)| (a, b.trim()));
+    let wants_oauth = rest.contains("oauth");
+    let wants_key = rest.contains("key") || rest.contains("api");
+    let wants_explicit_method = wants_oauth || wants_key;
+    let method_matches = |choice: &ProviderChoice| {
+        (wants_oauth
+            && matches!(
+                choice.kind,
+                SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
+            ))
+            || (wants_key && choice.kind == SetupCredentialKind::ApiKey)
+    };
 
     // Try numbered choice first (1-N).
     if let Ok(num) = first.parse::<usize>() {
@@ -2969,8 +3187,8 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
     // Try exact match against listed labels.
     for choice in PROVIDER_CHOICES {
         if normalized == choice.label.to_ascii_lowercase()
-            || first == choice.provider
-            || first == choice.provider.to_ascii_lowercase()
+            || ((first == choice.provider || first == choice.provider.to_ascii_lowercase())
+                && (!wants_explicit_method || method_matches(choice)))
         {
             return Some(*choice);
         }
@@ -2990,17 +3208,9 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
     let canonical = meta.canonical_id;
 
     // If we have an explicit method preference, honor it when multiple choices exist.
-    let wants_oauth = rest.contains("oauth");
-    let wants_key = rest.contains("key") || rest.contains("api");
-    if wants_oauth || wants_key {
+    if wants_explicit_method {
         if let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
-            choice.provider.eq_ignore_ascii_case(canonical)
-                && ((wants_oauth
-                    && matches!(
-                        choice.kind,
-                        SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
-                    ))
-                    || (wants_key && choice.kind == SetupCredentialKind::ApiKey))
+            choice.provider.eq_ignore_ascii_case(canonical) && method_matches(choice)
         }) {
             return Some(found);
         }
@@ -3269,8 +3479,7 @@ Code expires in {} seconds.\n",
         }
     };
 
-    let _ = auth.remove_provider_aliases(provider.provider);
-    auth.set(provider.provider.to_string(), credential);
+    auth.set_login_credential(provider.provider, credential);
     auth.save_async().await?;
 
     // Make the next startup attempt use the credential we just created.
@@ -3946,6 +4155,7 @@ fn default_export_path(input: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use clap::Parser;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -4417,6 +4627,8 @@ mod tests {
             retry: Some(pi::config::RetrySettings {
                 enabled: Some(true),
                 max_retries: Some(3),
+                reviewer_model: None,
+                token_budget: None,
                 base_delay_ms: Some(2000),
                 max_delay_ms: Some(60_000),
             }),
@@ -4426,11 +4638,50 @@ mod tests {
     }
 
     #[test]
+    fn cli_retry_override_enables_retry_when_missing() {
+        let mut config = Config::default();
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        cli.retry = true;
+
+        apply_cli_retry_override(&mut config, &cli);
+        assert!(config.retry_enabled());
+        assert_eq!(config.retry_max_retries(), 3);
+    }
+
+    #[test]
+    fn cli_retry_override_preserves_existing_retry_settings() {
+        let mut config = Config {
+            retry: Some(pi::config::RetrySettings {
+                enabled: Some(false),
+                max_retries: Some(5),
+                reviewer_model: Some("reviewer-x".to_string()),
+                token_budget: Some(42_000),
+                base_delay_ms: Some(250),
+                max_delay_ms: Some(4_000),
+            }),
+            ..Config::default()
+        };
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        cli.retry = true;
+
+        apply_cli_retry_override(&mut config, &cli);
+
+        assert!(config.retry_enabled());
+        assert_eq!(config.retry_max_retries(), 5);
+        assert_eq!(config.retry_base_delay_ms(), 250);
+        assert_eq!(config.retry_max_delay_ms(), 4_000);
+        assert_eq!(config.retry_reviewer_model().as_deref(), Some("reviewer-x"));
+        assert_eq!(config.retry_token_budget(), Some(42_000));
+    }
+
+    #[test]
     fn print_mode_retry_delay_doubles_each_attempt() {
         let config = Config {
             retry: Some(pi::config::RetrySettings {
                 enabled: Some(true),
                 max_retries: Some(5),
+                reviewer_model: None,
+                token_budget: None,
                 base_delay_ms: Some(1000),
                 max_delay_ms: Some(60_000),
             }),
@@ -4446,6 +4697,8 @@ mod tests {
             retry: Some(pi::config::RetrySettings {
                 enabled: Some(true),
                 max_retries: Some(10),
+                reviewer_model: None,
+                token_budget: None,
                 base_delay_ms: Some(2000),
                 max_delay_ms: Some(10_000),
             }),

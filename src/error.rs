@@ -705,8 +705,17 @@ fn provider_hints(provider: &str, message: &str) -> ErrorHints {
 }
 
 fn provider_key_hint(provider: &str) -> String {
-    let canonical = canonical_provider_id(provider).unwrap_or(provider);
-    let env_keys = provider_auth_env_keys(provider);
+    let normalized = provider.replace('_', "-");
+    let canonical = canonical_provider_id(provider)
+        .or_else(|| canonical_provider_id(&normalized))
+        .unwrap_or(provider);
+    let env_keys = if !provider_auth_env_keys(canonical).is_empty() {
+        provider_auth_env_keys(canonical)
+    } else if !provider_auth_env_keys(provider).is_empty() {
+        provider_auth_env_keys(provider)
+    } else {
+        provider_auth_env_keys(&normalized)
+    };
     if !env_keys.is_empty() {
         let key_list = env_keys
             .iter()
