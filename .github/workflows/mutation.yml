@@ -1,0 +1,137 @@
+name: Mutation Pilot
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  mutation-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+
+      - name: Install system deps (fd, rg, xcb) [linux]
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep jq libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: "Phase 1: auth + tools (pilot)"
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          mkdir -p target/mutation/phase1
+          cargo mutants \
+            --file src/auth/mod.rs \
+            --file src/auth/cache.rs \
+            --file src/tools.rs \
+            --test-tool cargo \
+            --timeout 120 \
+            --output target/mutation/phase1 \
+            --json > target/mutation/phase1/mutation_report.json
+
+      - name: "Phase 2: policy + sandbox (security)"
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          mkdir -p target/mutation/phase2
+          cargo mutants \
+            --file src/policy/mod.rs \
+            --file src/policy/approval.rs \
+            --file src/policy/blocklist.rs \
+            --file src/policy/constraint.rs \
+            --file src/policy/exec_policy.rs \
+            --file src/policy/edit_validation.rs \
+            --file src/sandbox/mod.rs \
+            --file src/sandbox/verifier.rs \
+            --file src/sandbox/network.rs \
+            --test-tool cargo \
+            --timeout 120 \
+            --output target/mutation/phase2 \
+            --json > target/mutation/phase2/mutation_report.json
+
+      - name: "Phase 3: reliability + state"
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          mkdir -p target/mutation/phase3
+          cargo mutants \
+            --file src/reliability/mod.rs \
+            --file src/reliability/state_machine.rs \
+            --file src/reliability/close_guard.rs \
+            --file src/reliability/recovery.rs \
+            --file src/reliability/retry.rs \
+            --file src/state/mod.rs \
+            --file src/state/events.rs \
+            --file src/state/gates.rs \
+            --file src/state/ledger.rs \
+            --test-tool cargo \
+            --timeout 120 \
+            --output target/mutation/phase3 \
+            --json > target/mutation/phase3/mutation_report.json
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-pilot-${{ github.run_id }}
+          path: |
+            pi_agent_rust/target/mutation/
+          if-no-files-found: warn
+
+      - name: Summarize mutation results
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "## Mutation Testing Results" >> $GITHUB_STEP_SUMMARY
+          for phase in phase1 phase2 phase3; do
+            report="target/mutation/$phase/mutation_report.json"
+            case $phase in
+              phase1) label="auth + tools (pilot)" ;;
+              phase2) label="policy + sandbox (security)" ;;
+              phase3) label="reliability + state" ;;
+            esac
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### $label" >> $GITHUB_STEP_SUMMARY
+            if [ -f "$report" ]; then
+              killed=$(jq '[.[] | select(.outcome == "killed")] | length' "$report" 2>/dev/null || echo 0)
+              survived=$(jq '[.[] | select(.outcome == "survived")] | length' "$report" 2>/dev/null || echo 0)
+              total=$((killed + survived))
+              if [ "$total" -gt 0 ]; then
+                score=$(python3 -c "k=$killed; s=$survived; t=max(k+s,1); print(f'{(100.0*k/t):.2f}')")
+                echo "- Killed: $killed" >> $GITHUB_STEP_SUMMARY
+                echo "- Survived: $survived" >> $GITHUB_STEP_SUMMARY
+                echo "- Score: $score%" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- No mutants evaluated." >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "- Report missing (phase likely failed)." >> $GITHUB_STEP_SUMMARY
+            fi
+          done
