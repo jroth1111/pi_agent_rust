@@ -25,7 +25,10 @@ use std::pin::Pin;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const GOOGLE_GEMINI_CLI_BASE: &str = "https://cloudcode-pa.googleapis.com";
-const GOOGLE_ANTIGRAVITY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const GOOGLE_ANTIGRAVITY_DAILY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const GOOGLE_ANTIGRAVITY_AUTOPUSH_BASE: &str =
+    "https://autopush-cloudcode-pa.sandbox.googleapis.com";
+const GOOGLE_ANTIGRAVITY_PROD_BASE: &str = GOOGLE_GEMINI_CLI_BASE;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 // ============================================================================
@@ -101,27 +104,9 @@ impl GeminiProvider {
 
     /// Build the streaming URL.
     pub fn streaming_url(&self) -> String {
-        let base = {
-            let trimmed = self.base_url.trim();
-            if trimmed.is_empty() {
-                if self.google_cli_mode {
-                    if self.provider.eq_ignore_ascii_case("google-antigravity") {
-                        GOOGLE_ANTIGRAVITY_BASE
-                    } else {
-                        GOOGLE_GEMINI_CLI_BASE
-                    }
-                } else {
-                    GEMINI_API_BASE
-                }
-            } else {
-                trimmed
-            }
-        };
-        if self.google_cli_mode {
-            format!("{base}/v1internal:streamGenerateContent?alt=sse")
-        } else {
-            format!("{base}/models/{}:streamGenerateContent?alt=sse", self.model)
-        }
+        let is_antigravity = self.provider.eq_ignore_ascii_case("google-antigravity");
+        let base = self.resolved_base_url(is_antigravity);
+        self.streaming_url_for_model(&base, &self.model)
     }
 
     /// Build the request body for the Gemini API.
@@ -156,6 +141,7 @@ impl GeminiProvider {
             system_instruction,
             tools,
             tool_config,
+            thinking_config: gemini_thinking_config(options.thinking_level),
             generation_config: Some(GeminiGenerationConfig {
                 max_output_tokens: options.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
                 temperature: options.temperature,
@@ -174,6 +160,228 @@ impl GeminiProvider {
 
         contents
     }
+
+    fn resolved_base_url(&self, is_antigravity: bool) -> String {
+        let trimmed = self.base_url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+
+        if self.google_cli_mode {
+            if is_antigravity {
+                GOOGLE_ANTIGRAVITY_DAILY_BASE.to_string()
+            } else {
+                GOOGLE_GEMINI_CLI_BASE.to_string()
+            }
+        } else {
+            GEMINI_API_BASE.to_string()
+        }
+    }
+
+    fn streaming_url_for_model(&self, base: &str, model: &str) -> String {
+        if self.google_cli_mode {
+            format!("{base}/v1internal:streamGenerateContent?alt=sse")
+        } else {
+            format!(
+                "{base}/models/{}:streamGenerateContent?alt=sse",
+                model.trim()
+            )
+        }
+    }
+
+    fn cloud_code_endpoint_candidates(&self, is_antigravity: bool) -> Vec<String> {
+        let configured = self.base_url.trim();
+        if !is_antigravity {
+            return vec![if configured.is_empty() {
+                GOOGLE_GEMINI_CLI_BASE.to_string()
+            } else {
+                configured.to_string()
+            }];
+        }
+
+        let mut endpoints = Vec::new();
+        if configured.is_empty() {
+            endpoints.push(GOOGLE_ANTIGRAVITY_DAILY_BASE.to_string());
+        } else {
+            endpoints.push(configured.to_string());
+        }
+
+        for candidate in [
+            GOOGLE_ANTIGRAVITY_DAILY_BASE,
+            GOOGLE_ANTIGRAVITY_AUTOPUSH_BASE,
+            GOOGLE_ANTIGRAVITY_PROD_BASE,
+        ] {
+            if !endpoints
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(candidate))
+            {
+                endpoints.push(candidate.to_string());
+            }
+        }
+
+        endpoints
+    }
+
+    fn request_model_candidates(&self) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let primary = if self.google_cli_mode {
+            normalize_google_cli_model_id(&self.model)
+        } else {
+            self.model.trim().to_string()
+        };
+        if !primary.is_empty() {
+            candidates.push(primary.clone());
+        }
+
+        if let Some(fallback) = preview_fallback_model_id(&primary)
+            && !candidates
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&fallback))
+        {
+            candidates.push(fallback);
+        }
+
+        candidates
+    }
+}
+
+fn normalize_google_cli_model_id(model: &str) -> String {
+    let trimmed = model.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("gemini-3.1-pro")
+        && !lower.contains("preview")
+        && !has_explicit_thinking_tier(&lower)
+    {
+        return "gemini-3.1-pro-high".to_string();
+    }
+    trimmed.to_string()
+}
+
+fn has_explicit_thinking_tier(model: &str) -> bool {
+    model.ends_with("-low") || model.ends_with("-medium") || model.ends_with("-high")
+}
+
+fn preview_fallback_model_id(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("gemini-3.1-pro-preview") {
+        return Some("gemini-3.1-pro-high".to_string());
+    }
+
+    if lower.contains("preview") {
+        let fallback = lower
+            .replace("-preview", "")
+            .replace("_preview", "")
+            .replace("preview", "");
+        let fallback = fallback.trim_matches('-').trim_matches('_').to_string();
+        if !fallback.is_empty() && !fallback.eq_ignore_ascii_case(trimmed) {
+            return Some(fallback);
+        }
+    }
+
+    None
+}
+
+fn should_retry_preview_not_found(status: u16, body: &str, model: &str) -> bool {
+    if status != 404 || !model.to_ascii_lowercase().contains("preview") {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("requested entity was not found")
+        || lower.contains("\"status\":\"not_found\"")
+        || lower.contains("\"reason\":\"notfound\"")
+        || lower.contains("enable-preview-features")
+}
+
+fn should_retry_antigravity_endpoint(status: u16, body: &str) -> bool {
+    if matches!(status, 408 | 409 | 425 | 429 | 500..=599) {
+        return true;
+    }
+
+    if status == 404 {
+        let lower = body.to_ascii_lowercase();
+        return lower.contains("requested entity was not found")
+            || lower.contains("\"status\":\"not_found\"")
+            || lower.contains("\"reason\":\"notfound\"");
+    }
+
+    false
+}
+
+pub(crate) fn gemini_thinking_config(
+    level: Option<crate::model::ThinkingLevel>,
+) -> Option<GeminiThinkingConfig> {
+    let thinking_level = match level? {
+        crate::model::ThinkingLevel::Off => return None,
+        crate::model::ThinkingLevel::Minimal | crate::model::ThinkingLevel::Low => "low",
+        crate::model::ThinkingLevel::Medium => "medium",
+        crate::model::ThinkingLevel::High | crate::model::ThinkingLevel::XHigh => "high",
+    };
+    Some(GeminiThinkingConfig {
+        thinking_level: thinking_level.to_string(),
+        include_thoughts: None,
+    })
+}
+
+fn create_gemini_event_stream<S>(
+    event_source: SseStream<S>,
+    model: String,
+    api: String,
+    provider: String,
+    cloud_cli_mode: bool,
+) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin + Send + 'static,
+{
+    let stream = stream::unfold(
+        StreamState::new(event_source, model, api, provider),
+        move |mut state| async move {
+            if state.finished {
+                return None;
+            }
+            loop {
+                // Drain pending events before polling for more SSE data.
+                if let Some(event) = state.pending_events.pop_front() {
+                    return Some((Ok(event), state));
+                }
+
+                match state.event_source.next().await {
+                    Some(Ok(msg)) => {
+                        if msg.event == "ping" {
+                            continue;
+                        }
+
+                        let processing = if cloud_cli_mode {
+                            state.process_cloud_code_event(&msg.data)
+                        } else {
+                            state.process_event(&msg.data)
+                        };
+                        if let Err(e) = processing {
+                            state.finished = true;
+                            return Some((Err(e), state));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        state.finished = true;
+                        let err = Error::api(format!("SSE error: {e}"));
+                        return Some((Err(err), state));
+                    }
+                    None => {
+                        // Stream ended naturally.
+                        state.finished = true;
+                        let reason = state.partial.stop_reason;
+                        let message = std::mem::take(&mut state.partial);
+                        return Some((Ok(StreamEvent::Done { reason, message }), state));
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(stream)
 }
 
 #[derive(Debug, Serialize)]
@@ -261,11 +469,13 @@ impl Provider for GeminiProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let request_body = self.build_request(context, options);
-        let url = self.streaming_url();
-
-        // Build request (Content-Type set by .json() below)
-        let mut request = self.client.post(&url).header("Accept", "text/event-stream");
+        let model_candidates = self.request_model_candidates();
+        if model_candidates.is_empty() {
+            return Err(Error::provider(
+                self.name(),
+                "Gemini model ID is empty after normalization".to_string(),
+            ));
+        }
 
         if self.google_cli_mode {
             let api_payload = options.api_key.clone().ok_or_else(|| {
@@ -282,22 +492,117 @@ impl Provider for GeminiProvider {
                     )
                 })?;
             let is_antigravity = self.provider.eq_ignore_ascii_case("google-antigravity");
+            let endpoint_candidates = self.cloud_code_endpoint_candidates(is_antigravity);
 
-            request = request
-                .header("Authorization", format!("Bearer {access_token}"))
-                .header("Content-Type", "application/json")
-                .header("x-goog-api-client", "gl-node/22.17.0")
-                .header(
-                    "client-metadata",
-                    r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#,
-                );
+            for (model_index, model_id) in model_candidates.iter().enumerate() {
+                for (endpoint_index, endpoint) in endpoint_candidates.iter().enumerate() {
+                    let url = self.streaming_url_for_model(endpoint, model_id);
+                    let mut request = self.client.post(&url).header("Accept", "text/event-stream");
+                    request = request
+                        .header("Authorization", format!("Bearer {access_token}"))
+                        .header("Content-Type", "application/json")
+                        .header("x-goog-api-client", "gl-node/22.17.0")
+                        .header(
+                            "client-metadata",
+                            r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#,
+                        );
 
-            if is_antigravity {
-                request = request.header("User-Agent", "antigravity/1.15.8 darwin/arm64");
-            } else {
-                request =
-                    request.header("User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+                    if is_antigravity {
+                        request = request.header("User-Agent", "antigravity/1.15.8 darwin/arm64");
+                    } else {
+                        request = request
+                            .header("User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+                    }
+
+                    // Apply provider-specific custom headers from compat config.
+                    if let Some(compat) = &self.compat {
+                        if let Some(custom_headers) = &compat.custom_headers {
+                            for (key, value) in custom_headers {
+                                request = request.header(key, value);
+                            }
+                        }
+                    }
+
+                    // Per-request headers from StreamOptions (highest priority).
+                    for (key, value) in &options.headers {
+                        request = request.header(key, value);
+                    }
+
+                    let request_body = self.build_request(context, options);
+                    let cli_request = build_google_cli_request(
+                        model_id,
+                        &project_id,
+                        request_body,
+                        is_antigravity,
+                    )
+                    .map_err(|message| Error::provider(self.name(), message.to_string()))?;
+                    let request = request.json(&cli_request)?;
+                    let response = Box::pin(request.send()).await?;
+                    let status = response.status();
+                    if (200..300).contains(&status) {
+                        let event_source = SseStream::new(response.bytes_stream());
+                        return Ok(create_gemini_event_stream(
+                            event_source,
+                            model_id.clone(),
+                            self.api().to_string(),
+                            self.name().to_string(),
+                            true,
+                        ));
+                    }
+
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+
+                    if model_index + 1 < model_candidates.len()
+                        && should_retry_preview_not_found(status, &body, model_id)
+                    {
+                        break;
+                    }
+
+                    if is_antigravity
+                        && endpoint_index + 1 < endpoint_candidates.len()
+                        && should_retry_antigravity_endpoint(status, &body)
+                    {
+                        continue;
+                    }
+
+                    return Err(Error::provider(
+                        self.name(),
+                        format!(
+                            "Gemini CLI API error (HTTP {status}) for {model_id} via {endpoint}: {body}"
+                        ),
+                    ));
+                }
             }
+
+            return Err(Error::provider(
+                self.name(),
+                format!(
+                    "Gemini CLI could not stream a response for any candidate model derived from {}",
+                    self.model
+                ),
+            ));
+        }
+
+        let auth_value = options
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .ok_or_else(|| {
+                Error::provider(
+                    self.name(),
+                    "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
+                )
+            })?;
+
+        let base = self.resolved_base_url(false);
+        for (model_index, model_id) in model_candidates.iter().enumerate() {
+            let url = self.streaming_url_for_model(&base, model_id);
+            let mut request = self.client.post(&url).header("Accept", "text/event-stream");
+            request = request.header("x-goog-api-key", &auth_value);
 
             // Apply provider-specific custom headers from compat config.
             if let Some(compat) = &self.compat {
@@ -313,176 +618,46 @@ impl Provider for GeminiProvider {
                 request = request.header(key, value);
             }
 
-            let cli_request =
-                build_google_cli_request(&self.model, &project_id, request_body, is_antigravity)
-                    .map_err(|message| Error::provider(self.name(), message.to_string()))?;
-            let request = request.json(&cli_request)?;
+            let request_body = self.build_request(context, options);
+            let request = request.json(&request_body)?;
+
             let response = Box::pin(request.send()).await?;
             let status = response.status();
-            if !(200..300).contains(&status) {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-                return Err(Error::provider(
-                    self.name(),
-                    format!("Gemini CLI API error (HTTP {status}): {body}"),
+            if (200..300).contains(&status) {
+                let event_source = SseStream::new(response.bytes_stream());
+                return Ok(create_gemini_event_stream(
+                    event_source,
+                    model_id.clone(),
+                    self.api().to_string(),
+                    self.name().to_string(),
+                    false,
                 ));
             }
 
-            // Create SSE stream for streaming responses.
-            let event_source = SseStream::new(response.bytes_stream());
-            let model = self.model.clone();
-            let api = self.api().to_string();
-            let provider = self.name().to_string();
-            let cloud_cli_mode = self.google_cli_mode;
-
-            let stream = stream::unfold(
-                StreamState::new(event_source, model, api, provider),
-                move |mut state| async move {
-                    if state.finished {
-                        return None;
-                    }
-                    loop {
-                        // Drain pending events before polling for more SSE data
-                        if let Some(event) = state.pending_events.pop_front() {
-                            return Some((Ok(event), state));
-                        }
-
-                        match state.event_source.next().await {
-                            Some(Ok(msg)) => {
-                                if msg.event == "ping" {
-                                    continue;
-                                }
-
-                                let processing = if cloud_cli_mode {
-                                    state.process_cloud_code_event(&msg.data)
-                                } else {
-                                    state.process_event(&msg.data)
-                                };
-                                if let Err(e) = processing {
-                                    state.finished = true;
-                                    return Some((Err(e), state));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                state.finished = true;
-                                let err = Error::api(format!("SSE error: {e}"));
-                                return Some((Err(err), state));
-                            }
-                            None => {
-                                // Stream ended naturally
-                                state.finished = true;
-                                let reason = state.partial.stop_reason;
-                                let message = std::mem::take(&mut state.partial);
-                                return Some((Ok(StreamEvent::Done { reason, message }), state));
-                            }
-                        }
-                    }
-                },
-            );
-
-            return Ok(Box::pin(stream));
-        }
-
-        let auth_value = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
-            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-            .ok_or_else(|| {
-                Error::provider(
-                    self.name(),
-                    "Missing API key for Google/Gemini. Set GOOGLE_API_KEY or GEMINI_API_KEY.",
-                )
-            })?;
-
-        request = request.header("x-goog-api-key", &auth_value);
-
-        // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
-            }
-        }
-
-        // Per-request headers from StreamOptions (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
-
-        let request = request.json(&request_body)?;
-
-        let response = Box::pin(request.send()).await?;
-        let status = response.status();
-        if !(200..300).contains(&status) {
             let body = response
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+
+            if model_index + 1 < model_candidates.len()
+                && should_retry_preview_not_found(status, &body, model_id)
+            {
+                continue;
+            }
+
             return Err(Error::provider(
                 self.name(),
-                format!("Gemini API error (HTTP {status}): {body}"),
+                format!("Gemini API error (HTTP {status}) for {model_id}: {body}"),
             ));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-        let cloud_cli_mode = self.google_cli_mode;
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            move |mut state| async move {
-                if state.finished {
-                    return None;
-                }
-                loop {
-                    // Drain pending events before polling for more SSE data
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            if msg.event == "ping" {
-                                continue;
-                            }
-
-                            let processing = if cloud_cli_mode {
-                                state.process_cloud_code_event(&msg.data)
-                            } else {
-                                state.process_event(&msg.data)
-                            };
-                            if let Err(e) = processing {
-                                state.finished = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            state.finished = true;
-                            let err = Error::api(format!("SSE error: {e}"));
-                            return Some((Err(err), state));
-                        }
-                        None => {
-                            // Stream ended naturally
-                            state.finished = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
-                        }
-                    }
-                }
-            },
-        );
-
-        Ok(Box::pin(stream))
+        Err(Error::provider(
+            self.name(),
+            format!(
+                "Gemini could not stream a response for any candidate model derived from {}",
+                self.model
+            ),
+        ))
     }
 }
 
@@ -707,6 +882,8 @@ pub struct GeminiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_config: Option<GeminiToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_config: Option<GeminiThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) generation_config: Option<GeminiGenerationConfig>,
 }
 
@@ -793,6 +970,14 @@ pub(crate) struct GeminiGenerationConfig {
     pub(crate) temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) candidate_count: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiThinkingConfig {
+    pub(crate) thinking_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) include_thoughts: Option<bool>,
 }
 
 // ============================================================================
@@ -1013,6 +1198,47 @@ mod tests {
         assert!(url.contains("gemini-2.0-flash"));
         assert!(url.contains("streamGenerateContent"));
         assert!(!url.contains("key="));
+    }
+
+    #[test]
+    fn test_google_cli_gemini_31_defaults_to_high_model_variant() {
+        let provider = GeminiProvider::new("gemini-3.1-pro").with_google_cli_mode(true);
+        assert_eq!(
+            provider.request_model_candidates(),
+            vec!["gemini-3.1-pro-high".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_preview_model_adds_non_preview_fallback() {
+        let provider = GeminiProvider::new("gemini-3.1-pro-preview").with_google_cli_mode(true);
+        assert_eq!(
+            provider.request_model_candidates(),
+            vec![
+                "gemini-3.1-pro-preview".to_string(),
+                "gemini-3.1-pro-high".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_antigravity_default_endpoint_ladder() {
+        let provider = GeminiProvider::new("gemini-3.1-pro-high")
+            .with_provider_name("google-antigravity")
+            .with_google_cli_mode(true)
+            .with_base_url("");
+        let endpoints = provider.cloud_code_endpoint_candidates(true);
+        assert_eq!(endpoints[0], GOOGLE_ANTIGRAVITY_DAILY_BASE);
+        assert!(
+            endpoints
+                .iter()
+                .any(|ep| ep == GOOGLE_ANTIGRAVITY_AUTOPUSH_BASE)
+        );
+        assert!(
+            endpoints
+                .iter()
+                .any(|ep| ep == GOOGLE_ANTIGRAVITY_PROD_BASE)
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -1302,6 +1528,27 @@ mod tests {
             json["generationConfig"]["maxOutputTokens"],
             DEFAULT_MAX_TOKENS
         );
+    }
+
+    #[test]
+    fn test_build_request_maps_thinking_level_to_high() {
+        let provider = GeminiProvider::new("gemini-3.1-pro-high");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            vec![],
+        );
+        let options = crate::provider::StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(json["thinkingConfig"]["thinkingLevel"], "high");
     }
 
     // ─── API key as query parameter tests ───────────────────────────────

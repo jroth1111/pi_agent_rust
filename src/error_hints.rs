@@ -35,7 +35,7 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
         Error::Config(msg) => config_hints(msg),
         Error::SessionNotFound { .. } | Error::Session(_) => session_hints(error),
         Error::Auth(msg) => auth_hints(msg),
-        Error::Provider { message, .. } => provider_hints(message),
+        Error::Provider { provider, message } => provider_hints(provider, message),
         Error::Tool { tool, message } => tool_hints(tool, message),
         Error::Validation(msg) => validation_hints(msg),
         Error::Extension(msg) => extension_hints(msg),
@@ -161,8 +161,76 @@ fn auth_hints(msg: &str) -> ErrorHint {
     }
 }
 
-fn provider_hints(message: &str) -> ErrorHint {
-    if message.contains("429") || message.contains("rate limit") {
+fn parse_provider_http_status(message: &str) -> Option<u16> {
+    if message.contains("429") {
+        return Some(429);
+    }
+    if message.contains("404") {
+        return Some(404);
+    }
+    if message.contains("403") {
+        return Some(403);
+    }
+    if message.contains("401") {
+        return Some(401);
+    }
+    if message.contains("500") {
+        return Some(500);
+    }
+    None
+}
+
+fn provider_hints(provider: &str, message: &str) -> ErrorHint {
+    let provider = provider.trim().to_ascii_lowercase();
+    let message_lower = message.to_ascii_lowercase();
+    let status = parse_provider_http_status(message);
+
+    if matches!(
+        provider.as_str(),
+        "google" | "gemini" | "google-gemini-cli" | "google-antigravity"
+    ) {
+        if status == Some(403)
+            && (message_lower.contains("not eligible for gemini code assist")
+                || message_lower.contains("gemini code assist"))
+        {
+            return ErrorHint {
+                summary: "OAuth account is not eligible for Gemini Code Assist",
+                hints: &[
+                    "Run 'pi /login google-antigravity' with an eligible Google account",
+                    "Disable ineligible OAuth accounts so rotation uses working accounts",
+                ],
+                context_fields: &["provider", "status_code", "account_id"],
+            };
+        }
+        if status == Some(404)
+            || message_lower.contains("requested entity was not found")
+            || message_lower.contains("enable-preview-features")
+        {
+            return ErrorHint {
+                summary: "Gemini model is unavailable for this OAuth project",
+                hints: &[
+                    "Request preview access at https://goo.gle/enable-preview-features or switch to a non-preview model",
+                    "Set GOOGLE_CLOUD_PROJECT (or GOOGLE_CLOUD_PROJECT_ID) then run 'pi /login google-gemini-cli'",
+                ],
+                context_fields: &["provider", "model_id", "project_id"],
+            };
+        }
+        if status == Some(429)
+            || message_lower.contains("rate limit")
+            || message_lower.contains("quota")
+        {
+            return ErrorHint {
+                summary: "Gemini OAuth quota or rate limit exceeded",
+                hints: &[
+                    "Wait for quota reset or switch to another healthy OAuth account",
+                    "Run 'pi doctor --only auth' and re-login accounts marked for relogin",
+                ],
+                context_fields: &["provider", "retry_after", "account_id"],
+            };
+        }
+    }
+
+    if message.contains("429") || message_lower.contains("rate limit") {
         return ErrorHint {
             summary: "Rate limit exceeded",
             hints: &[
@@ -172,7 +240,7 @@ fn provider_hints(message: &str) -> ErrorHint {
             context_fields: &["provider", "retry_after"],
         };
     }
-    if message.contains("500") || message.contains("server error") {
+    if message.contains("500") || message_lower.contains("server error") {
         return ErrorHint {
             summary: "Provider server error",
             hints: &[
@@ -182,7 +250,7 @@ fn provider_hints(message: &str) -> ErrorHint {
             context_fields: &["provider", "status_code"],
         };
     }
-    if message.contains("connection") || message.contains("network") {
+    if message_lower.contains("connection") || message_lower.contains("network") {
         return ErrorHint {
             summary: "Network connection error",
             hints: &[
@@ -192,7 +260,7 @@ fn provider_hints(message: &str) -> ErrorHint {
             context_fields: &["provider", "url"],
         };
     }
-    if message.contains("timeout") {
+    if message_lower.contains("timeout") {
         return ErrorHint {
             summary: "Request timed out",
             hints: &[
@@ -202,7 +270,7 @@ fn provider_hints(message: &str) -> ErrorHint {
             context_fields: &["provider", "timeout_seconds"],
         };
     }
-    if message.contains("model") && message.contains("not found") {
+    if message_lower.contains("model") && message_lower.contains("not found") {
         return ErrorHint {
             summary: "Model not found or unavailable",
             hints: &[
@@ -536,6 +604,53 @@ mod tests {
         let hint = hints_for_error(&error);
         assert!(hint.summary.contains("Rate limit"));
         assert!(hint.hints.iter().any(|h| h.contains("Wait")));
+    }
+
+    #[test]
+    fn test_provider_gemini_preview_404_hints() {
+        let error = Error::provider(
+            "google-gemini-cli",
+            "Gemini API error (HTTP 404): Requested entity was not found. Request preview access at https://goo.gle/enable-preview-features before using this model.",
+        );
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("Gemini model is unavailable"));
+        assert!(
+            hint.hints
+                .iter()
+                .any(|h| h.contains("enable-preview-features"))
+        );
+        assert!(
+            hint.hints
+                .iter()
+                .any(|h| h.contains("GOOGLE_CLOUD_PROJECT"))
+        );
+    }
+
+    #[test]
+    fn test_provider_antigravity_403_code_assist_hints() {
+        let error = Error::provider(
+            "google-antigravity",
+            "HTTP 403: Your account is not eligible for Gemini Code Assist at this time.",
+        );
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("not eligible"));
+        assert!(
+            hint.hints
+                .iter()
+                .any(|h| h.contains("pi /login google-antigravity"))
+        );
+    }
+
+    #[test]
+    fn test_provider_gemini_429_quota_hints() {
+        let error = Error::provider("google-gemini-cli", "HTTP 429 quota exceeded");
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("quota") || hint.summary.contains("rate limit"));
+        assert!(
+            hint.hints
+                .iter()
+                .any(|h| h.contains("pi doctor --only auth"))
+        );
     }
 
     #[test]

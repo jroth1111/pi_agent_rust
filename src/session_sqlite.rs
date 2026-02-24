@@ -191,6 +191,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::context::MessageMetadata;
     use crate::model::UserContent;
     use crate::session::{EntryBase, MessageEntry, SessionInfoEntry, SessionMessage};
 
@@ -209,6 +210,7 @@ mod tests {
                 content: UserContent::Text("hello".to_string()),
                 timestamp: None,
             },
+            metadata: MessageMetadata::default(),
         })
     }
 

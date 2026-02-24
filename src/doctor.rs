@@ -4,7 +4,7 @@
 //! and sessions. When invoked with a path, runs extension preflight analysis.
 //! With `--fix`, automatically repairs safe issues (missing dirs, permissions).
 
-use crate::auth::{AuthStorage, CredentialStatus};
+use crate::auth::{AuthStorage, CredentialStatus, OAuthAccountRecord};
 use crate::config::Config;
 use crate::error::Result;
 use crate::provider_metadata::provider_auth_env_keys;
@@ -738,9 +738,151 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
                 }
             }
         }
+
+        check_google_oauth_diagnostics(auth, cat, findings);
     }
 
     check_auth_env_vars(cat, findings);
+}
+
+fn check_google_oauth_diagnostics(
+    auth: &AuthStorage,
+    cat: CheckCategory,
+    findings: &mut Vec<Finding>,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default();
+
+    for provider in ["google-gemini-cli", "google-antigravity"] {
+        let accounts = auth.list_oauth_accounts(provider);
+        if accounts.is_empty() {
+            continue;
+        }
+
+        findings.push(google_oauth_project_coverage_finding(
+            provider, &accounts, cat,
+        ));
+        findings.push(google_oauth_health_summary_finding(
+            provider, &accounts, cat, now_ms,
+        ));
+    }
+}
+
+fn google_oauth_project_coverage_finding(
+    provider: &str,
+    accounts: &[OAuthAccountRecord],
+    cat: CheckCategory,
+) -> Finding {
+    let mut discovered_projects: Vec<String> = accounts
+        .iter()
+        .filter_map(|account| account.provider_metadata.get("project_id"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect();
+    discovered_projects.sort();
+    discovered_projects.dedup();
+
+    let with_project = accounts
+        .iter()
+        .filter(|account| {
+            account
+                .provider_metadata
+                .get("project_id")
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        .count();
+    let missing = accounts.len().saturating_sub(with_project);
+    let projects_detail = if discovered_projects.is_empty() {
+        "none".to_string()
+    } else {
+        discovered_projects.join(", ")
+    };
+
+    if missing == 0 {
+        return Finding::pass(
+            cat,
+            format!("{provider}: OAuth project metadata available for all accounts"),
+        )
+        .with_detail(format!("projects: {projects_detail}"));
+    }
+
+    Finding::warn(
+        cat,
+        format!("{provider}: OAuth account missing project_id metadata"),
+    )
+    .with_detail(format!(
+        "{missing}/{} account(s) missing project_id; projects: {projects_detail}",
+        accounts.len()
+    ))
+    .with_remediation(format!(
+        "Set GOOGLE_CLOUD_PROJECT (or GOOGLE_CLOUD_PROJECT_ID) and run `pi /login {provider}`"
+    ))
+}
+
+fn google_oauth_health_summary_finding(
+    provider: &str,
+    accounts: &[OAuthAccountRecord],
+    cat: CheckCategory,
+    now_ms: i64,
+) -> Finding {
+    let relogin_required = accounts
+        .iter()
+        .filter(|account| account.health.requires_relogin)
+        .count();
+    let cooling_down = accounts
+        .iter()
+        .filter(|account| {
+            account
+                .health
+                .cooldown_until_ms
+                .is_some_and(|until| until > now_ms)
+        })
+        .count();
+    let with_failures = accounts
+        .iter()
+        .filter(|account| account.health.consecutive_failures > 0)
+        .count();
+
+    let mut last_errors: Vec<String> = accounts
+        .iter()
+        .filter_map(|account| {
+            account.health.last_error.as_ref().and_then(|err| {
+                (!err.trim().is_empty()).then(|| {
+                    format!(
+                        "{}={}",
+                        account.id,
+                        err.trim().chars().take(80).collect::<String>()
+                    )
+                })
+            })
+        })
+        .collect();
+    last_errors.sort();
+    last_errors.dedup();
+    let last_errors = last_errors.into_iter().take(2).collect::<Vec<_>>();
+
+    let mut detail = format!(
+        "accounts={}, relogin_required={relogin_required}, cooling_down={cooling_down}, with_failures={with_failures}",
+        accounts.len()
+    );
+    if !last_errors.is_empty() {
+        detail.push_str("; last_errors=");
+        detail.push_str(&last_errors.join(" | "));
+    }
+
+    if relogin_required > 0 || cooling_down > 0 {
+        return Finding::warn(cat, format!("{provider}: OAuth account health degraded"))
+            .with_detail(detail)
+            .with_remediation(format!(
+                "Run `pi /login {provider}` for relogin accounts and wait for cooldown before retrying"
+            ));
+    }
+
+    Finding::pass(cat, format!("{provider}: OAuth account health is ready")).with_detail(detail)
 }
 
 /// Check common auth-related environment variables.
@@ -1189,6 +1331,35 @@ fn check_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{AuthCredential, OAuthAccountHealth, OAuthAccountPolicy};
+    use std::collections::HashMap;
+
+    fn oauth_account(
+        id: &str,
+        access_token: &str,
+        project_id: Option<&str>,
+        health: OAuthAccountHealth,
+    ) -> OAuthAccountRecord {
+        let mut provider_metadata = HashMap::new();
+        if let Some(project_id) = project_id {
+            provider_metadata.insert("project_id".to_string(), project_id.to_string());
+        }
+
+        OAuthAccountRecord {
+            id: id.to_string(),
+            label: None,
+            credential: AuthCredential::OAuth {
+                access_token: access_token.to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: i64::MAX,
+                token_url: None,
+                client_id: None,
+            },
+            health,
+            policy: OAuthAccountPolicy::default(),
+            provider_metadata,
+        }
+    }
 
     #[test]
     fn severity_ordering() {
@@ -1366,6 +1537,101 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::Warn);
         assert_eq!(findings[0].fixability, Fixability::AutoFixable);
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn google_oauth_project_coverage_passes_when_project_ids_present() {
+        let accounts = vec![oauth_account(
+            "acct-1",
+            "token-1",
+            Some("project-alpha"),
+            OAuthAccountHealth::default(),
+        )];
+        let finding = google_oauth_project_coverage_finding(
+            "google-gemini-cli",
+            &accounts,
+            CheckCategory::Auth,
+        );
+        assert_eq!(finding.severity, Severity::Pass);
+        assert!(finding.title.contains("project metadata available"));
+        assert!(
+            finding
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("project-alpha"))
+        );
+    }
+
+    #[test]
+    fn google_oauth_project_coverage_warns_when_project_id_missing() {
+        let accounts = vec![oauth_account(
+            "acct-2",
+            "token-2",
+            None,
+            OAuthAccountHealth::default(),
+        )];
+        let finding = google_oauth_project_coverage_finding(
+            "google-gemini-cli",
+            &accounts,
+            CheckCategory::Auth,
+        );
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.title.contains("missing project_id"));
+        assert!(
+            finding
+                .remediation
+                .as_deref()
+                .is_some_and(|rem| rem.contains("GOOGLE_CLOUD_PROJECT"))
+        );
+    }
+
+    #[test]
+    fn google_oauth_health_summary_warns_when_accounts_degraded() {
+        let degraded_health = OAuthAccountHealth {
+            consecutive_failures: 2,
+            cooldown_until_ms: Some(5_000),
+            requires_relogin: true,
+            last_error: Some("403 not eligible for Gemini Code Assist".to_string()),
+            ..Default::default()
+        };
+        let accounts = vec![oauth_account(
+            "acct-3",
+            "token-3",
+            Some("project-bravo"),
+            degraded_health,
+        )];
+        let finding = google_oauth_health_summary_finding(
+            "google-antigravity",
+            &accounts,
+            CheckCategory::Auth,
+            1,
+        );
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(finding.title.contains("health degraded"));
+        assert!(
+            finding
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("relogin_required=1"))
+        );
+    }
+
+    #[test]
+    fn google_oauth_health_summary_passes_when_accounts_ready() {
+        let accounts = vec![oauth_account(
+            "acct-4",
+            "token-4",
+            Some("project-charlie"),
+            OAuthAccountHealth::default(),
+        )];
+        let finding = google_oauth_health_summary_finding(
+            "google-gemini-cli",
+            &accounts,
+            CheckCategory::Auth,
+            1,
+        );
+        assert_eq!(finding.severity, Severity::Pass);
+        assert!(finding.title.contains("health is ready"));
     }
 
     #[test]

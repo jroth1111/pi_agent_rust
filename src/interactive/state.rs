@@ -920,6 +920,173 @@ impl ToolProgress {
     }
 }
 
+/// Structured reliability status shown in the interactive panel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ReliabilityPanelState {
+    pub(super) phase: Option<String>,
+    pub(super) lease: Option<String>,
+    pub(super) blocker_or_retry: Option<String>,
+    pub(super) evidence: Option<String>,
+    pub(super) next_action: Option<String>,
+}
+
+impl ReliabilityPanelState {
+    pub(super) const fn is_empty(&self) -> bool {
+        self.phase.is_none()
+            && self.lease.is_none()
+            && self.blocker_or_retry.is_none()
+            && self.evidence.is_none()
+            && self.next_action.is_none()
+    }
+
+    pub(super) fn apply_update(&mut self, update: Self) {
+        if update.phase.is_some() {
+            self.phase = update.phase;
+        }
+        if update.lease.is_some() {
+            self.lease = update.lease;
+        }
+        if update.blocker_or_retry.is_some() {
+            self.blocker_or_retry = update.blocker_or_retry;
+        }
+        if update.evidence.is_some() {
+            self.evidence = update.evidence;
+        }
+        if update.next_action.is_some() {
+            self.next_action = update.next_action;
+        }
+    }
+
+    pub(super) fn parse_update(text: &str) -> Option<Self> {
+        const PREFIXES: [&str; 3] = [
+            "reliability.status:",
+            "reliability_status:",
+            "reliability/status:",
+        ];
+
+        let trimmed = text.trim();
+        let payload = PREFIXES
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+            .unwrap_or(trimmed)
+            .trim();
+        if payload.is_empty() {
+            return None;
+        }
+
+        let parsed: Value = serde_json::from_str(payload).ok()?;
+        Self::from_value(&parsed)
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        let payload = [
+            "reliability",
+            "reliabilityStatus",
+            "reliability_status",
+            "stateDigest",
+            "state_digest",
+        ]
+        .iter()
+        .find_map(|key| value.get(*key))
+        .unwrap_or(value);
+
+        let obj = payload.as_object()?;
+
+        let phase = Self::get_scalar(obj, &["phase", "state", "runtime_state"]);
+        let lease = Self::get_scalar(obj, &["lease", "leaseId", "lease_id"]);
+
+        let blockers = Self::array_summary(obj.get("blockers"));
+        let blocker = Self::get_scalar(
+            obj,
+            &[
+                "blocker",
+                "blocked_on",
+                "waitingOn",
+                "waiting_on",
+                "retryAfter",
+                "retry_after",
+            ],
+        );
+        let blocker_or_retry = blockers.or(blocker);
+
+        let evidence = Self::evidence_summary(obj);
+        let next_action = Self::get_scalar(obj, &["nextAction", "next_action"]);
+
+        let update = Self {
+            phase,
+            lease,
+            blocker_or_retry,
+            evidence,
+            next_action,
+        };
+
+        (!update.is_empty()).then_some(update)
+    }
+
+    fn evidence_summary(obj: &serde_json::Map<String, Value>) -> Option<String> {
+        if let Some(complete) = obj
+            .get("evidenceComplete")
+            .or_else(|| obj.get("evidence_complete"))
+            .and_then(Value::as_bool)
+        {
+            return Some(if complete {
+                "complete".to_string()
+            } else {
+                "incomplete".to_string()
+            });
+        }
+
+        let count = obj
+            .get("evidenceCount")
+            .or_else(|| obj.get("evidence_count"))
+            .and_then(Value::as_u64);
+        let required = obj
+            .get("requiredEvidence")
+            .or_else(|| obj.get("required_evidence"))
+            .and_then(Value::as_u64);
+        if let (Some(count), Some(required)) = (count, required) {
+            return Some(format!("{count}/{required} records"));
+        }
+
+        obj.get("evidenceIds")
+            .or_else(|| obj.get("evidence_ids"))
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .map(|items| format!("{} record(s)", items.len()))
+    }
+
+    fn array_summary(value: Option<&Value>) -> Option<String> {
+        let values = value
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(Self::value_to_string)
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.join(", "))
+        }
+    }
+
+    fn get_scalar(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+        keys.iter()
+            .find_map(|key| obj.get(*key))
+            .and_then(Self::value_to_string)
+    }
+
+    fn value_to_string(value: &Value) -> Option<String> {
+        match value {
+            Value::String(v) => {
+                let trimmed = v.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Value::Number(v) => Some(v.to_string()),
+            Value::Bool(v) => Some(v.to_string()),
+            _ => None,
+        }
+    }
+}
+
 /// Format a count with K/M suffix for compact display.
 #[allow(clippy::cast_precision_loss)]
 pub(super) fn format_count(n: usize) -> String {

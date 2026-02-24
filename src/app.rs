@@ -217,6 +217,9 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         ),
         ("find", "Find files by glob pattern (respects .gitignore)"),
         ("ls", "List directory contents"),
+        ("websearch", "Search the web for relevant URLs and snippets"),
+        ("webfetch", "Fetch and summarize content from a URL"),
+        ("lsp", "Symbol lookup and diagnostics for code navigation"),
     ];
 
     let mut tools = Vec::new();
@@ -240,6 +243,9 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let has_find = has_tool("find");
     let has_ls = has_tool("ls");
     let has_read = has_tool("read");
+    let has_websearch = has_tool("websearch");
+    let has_webfetch = has_tool("webfetch");
+    let has_lsp = has_tool("lsp");
 
     let mut guidelines_list = Vec::new();
     if has_bash && !has_grep && !has_find && !has_ls {
@@ -265,6 +271,14 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         guidelines_list.push(
             "When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did",
         );
+    }
+    if has_websearch && has_webfetch {
+        guidelines_list
+            .push("Use websearch to discover sources first, then webfetch to read specific URLs.");
+    }
+    if has_lsp {
+        guidelines_list
+            .push("Prefer lsp for symbol definitions/references before broad text search.");
     }
 
     guidelines_list.push("Be concise in your responses");
@@ -675,8 +689,8 @@ fn default_model_from_candidates(candidates: &[ModelEntry]) -> ModelEntry {
         ("anthropic", "claude-opus-4-5"),
         ("azure-openai-responses", "gpt-5.2"),
         ("google", "gemini-2.5-pro"),
-        ("google-gemini-cli", "gemini-2.5-pro"),
-        ("google-antigravity", "gemini-3-pro-high"),
+        ("google-gemini-cli", "gemini-3.1-pro-high"),
+        ("google-antigravity", "gemini-3.1-pro-high"),
         ("google-vertex", "gemini-3-pro-preview"),
         ("github-copilot", "gpt-4o"),
         ("openrouter", "openai/gpt-5.1-codex"),
@@ -739,7 +753,13 @@ pub fn resolve_api_key(
     entry: &ModelEntry,
 ) -> Result<Option<String>> {
     let key = normalize_api_key_opt(cli.api_key.clone())
-        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
+        .or_else(|| {
+            normalize_api_key_opt(auth.resolve_api_key_for_model(
+                &entry.model.provider,
+                Some(&entry.model.id),
+                None,
+            ))
+        })
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
 
     if model_requires_configured_credential(entry) && key.is_none() {

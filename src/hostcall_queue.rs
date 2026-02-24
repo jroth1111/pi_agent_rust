@@ -2087,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "loom model checker SIGSEGV: needs cfg(loom) feature gate"]
+    #[ignore = "SIGSEGV: HostcallRequestQueue uses std::sync atomics which loom cannot intercept. Fix requires cfg(loom) conditional imports or loom model structs"]
     fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
         use loom::sync::{Arc, Mutex};
         use loom::thread;

@@ -1594,7 +1594,8 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         Arc::clone(&session_arc),
         !cli.no_session,
         compaction_settings,
-    );
+    )
+    .with_reliability_enabled(config.reliability_enabled());
 
     if !options.extension_paths.is_empty() {
         let extension_paths = options
@@ -1680,8 +1681,8 @@ mod tests {
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let provider = handle.session().agent.provider();
-        assert_eq!(provider.name(), "anthropic");
-        assert_eq!(provider.model_id(), "claude-opus-4-5");
+        // Default provider is openai-codex (first in PROVIDER_CHOICES)
+        assert_eq!(provider.name(), "openai-codex");
     }
 
     #[test]

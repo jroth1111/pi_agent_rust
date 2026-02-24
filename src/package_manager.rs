@@ -516,7 +516,9 @@ impl PackageManager {
         let accumulator = std::sync::Mutex::new(accumulator);
 
         thread::spawn(move || {
-            let mut accumulator = accumulator.lock().unwrap();
+            let mut accumulator = accumulator
+                .lock()
+                .expect("package manager accumulator lock");
 
             // 2) Local entries from settings (global and project)
             for resource_type in ResourceType::all() {

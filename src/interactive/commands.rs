@@ -32,6 +32,10 @@ pub enum SlashCommand {
     Compact,
     Reload,
     Share,
+    /// List OAuth accounts for a provider with health status.
+    Accounts,
+    /// Switch active OAuth account for a provider.
+    UseAccount,
 }
 
 impl SlashCommand {
@@ -69,6 +73,8 @@ impl SlashCommand {
             "/compact" => Self::Compact,
             "/reload" => Self::Reload,
             "/share" => Self::Share,
+            "/accounts" | "/acc" => Self::Accounts,
+            "/use-account" | "/use" => Self::UseAccount,
             _ => return None,
         };
 
@@ -81,6 +87,8 @@ impl SlashCommand {
   /help, /h, /?      - Show this help message
   /login [provider]  - Login/setup credentials; without provider shows status table
   /logout [provider] - Remove stored credentials
+  /accounts, /acc [provider] - List OAuth accounts with health status
+  /use-account, /use <provider> <account> - Switch active OAuth account
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Open model selector or switch directly
   /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
@@ -195,11 +203,7 @@ pub(super) fn save_provider_credential(
 ) {
     let requested = provider.trim().to_ascii_lowercase();
     let canonical = normalize_auth_provider_input(&requested);
-    let _ = auth.remove_provider_aliases(&requested);
-    if requested != canonical {
-        let _ = auth.remove_provider_aliases(&canonical);
-    }
-    auth.set(canonical.clone(), credential);
+    auth.set_login_credential(&canonical, credential);
 }
 
 pub(super) fn remove_provider_credentials(
@@ -1567,6 +1571,8 @@ impl PiApp {
             SlashCommand::Compact => self.handle_slash_compact(args),
             SlashCommand::Reload => self.handle_slash_reload(),
             SlashCommand::Share => self.handle_slash_share(args),
+            SlashCommand::Accounts => self.handle_slash_accounts(args),
+            SlashCommand::UseAccount => self.handle_slash_use_account(args),
         }
     }
 
@@ -1784,6 +1790,74 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             Err(err) => {
                 self.status_message = Some(err.to_string());
+            }
+        }
+        None
+    }
+
+    /// Handle /accounts command - list OAuth accounts with health status.
+    pub(super) fn handle_slash_accounts(&mut self, args: &str) -> Option<Cmd> {
+        use crate::auth::AuthStorage;
+
+        let provider = if args.trim().is_empty() {
+            self.model_entry.model.provider.clone()
+        } else {
+            args.split_whitespace()
+                .next()
+                .unwrap_or(args)
+                .to_ascii_lowercase()
+        };
+
+        let auth_path = crate::config::Config::auth_path();
+        match AuthStorage::load(auth_path) {
+            Ok(auth) => {
+                let output = auth.format_accounts_status(&provider);
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: output,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_last_match("Accounts");
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Failed to load auth: {err}"));
+            }
+        }
+        None
+    }
+
+    /// Handle /use-account command - switch active OAuth account.
+    pub(super) fn handle_slash_use_account(&mut self, args: &str) -> Option<Cmd> {
+        use crate::auth::AuthStorage;
+
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() < 2 {
+            self.status_message = Some("Usage: /use-account <provider> <account-id>".to_string());
+            return None;
+        }
+
+        let provider = parts[0].to_ascii_lowercase();
+        let account_id = parts[1].to_string();
+
+        let auth_path = crate::config::Config::auth_path();
+        match AuthStorage::load(auth_path) {
+            Ok(mut auth) => match auth.set_active_account(&provider, &account_id) {
+                Ok(()) => {
+                    if let Err(err) = auth.save() {
+                        self.status_message = Some(format!("Failed to save: {err}"));
+                        return None;
+                    }
+                    self.status_message =
+                        Some(format!("Switched to account '{account_id}' for {provider}"));
+                    self.sync_active_provider_credentials(&provider);
+                }
+                Err(err) => {
+                    self.status_message = Some(format!("Failed to switch account: {err}"));
+                }
+            },
+            Err(err) => {
+                self.status_message = Some(format!("Failed to load auth: {err}"));
             }
         }
         None
@@ -2413,11 +2487,46 @@ mod tests {
             },
         );
 
-        assert!(auth.get("gemini").is_none());
+        match auth.get("gemini") {
+            Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "new-google-key"),
+            other => panic!("expected gemini alias to resolve google api key, got: {other:?}"),
+        }
         match auth.get("google") {
             Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "new-google-key"),
             other => panic!("expected google api key credential, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn save_provider_credential_appends_oauth_accounts_for_same_provider() {
+        let mut auth = empty_auth_storage();
+        let expires = chrono::Utc::now().timestamp_millis() + 60_000;
+
+        super::save_provider_credential(
+            &mut auth,
+            "openai-codex",
+            AuthCredential::OAuth {
+                access_token: "acct-a-token".to_string(),
+                refresh_token: "acct-a-refresh".to_string(),
+                expires,
+                token_url: Some("https://auth.openai.com/oauth/token".to_string()),
+                client_id: Some("app_test".to_string()),
+            },
+        );
+        super::save_provider_credential(
+            &mut auth,
+            "openai-codex",
+            AuthCredential::OAuth {
+                access_token: "acct-b-token".to_string(),
+                refresh_token: "acct-b-refresh".to_string(),
+                expires: expires + 1_000,
+                token_url: Some("https://auth.openai.com/oauth/token".to_string()),
+                client_id: Some("app_test".to_string()),
+            },
+        );
+
+        let accounts = auth.list_oauth_accounts("openai-codex");
+        assert_eq!(accounts.len(), 2, "expected two pooled OAuth accounts");
     }
 
     #[test]

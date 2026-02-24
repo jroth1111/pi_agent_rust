@@ -233,7 +233,8 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         session_arc,
         !cli.no_session,
         compaction_settings,
-    );
+    )
+    .with_reliability_enabled(config.reliability_enabled());
     step!("    Agent built");
 
     step!("12. Loading session history...");

@@ -37,6 +37,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "list",
     "config",
     "doctor",
+    "account",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -48,6 +49,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-migrations"
         | "print"
         | "verbose"
+        | "retry"
         | "no-tools"
         | "no-extensions"
         | "explain-extension-policy"
@@ -346,12 +348,17 @@ pub struct Cli {
     #[arg(long)]
     pub verbose: bool,
 
+    // === Retry ===
+    /// Enable retry mechanism (opt-in; disabled by default)
+    #[arg(long)]
+    pub retry: bool,
+
     // === Tools ===
     /// Disable all built-in tools
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls)
+    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,websearch,webfetch,lsp)
     #[arg(long, default_value = "read,bash,edit,write")]
     pub tools: String,
 
@@ -1605,6 +1612,82 @@ pub enum Commands {
         /// Dry-run: validate migration without persisting changes
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Manage OAuth accounts and API keys
+    Account {
+        #[command(subcommand)]
+        command: AccountCommands,
+    },
+}
+
+/// Account management subcommands
+#[derive(Subcommand, Debug)]
+pub enum AccountCommands {
+    /// List OAuth accounts with health status
+    List {
+        /// Provider to list accounts for (omit to list all)
+        provider: Option<String>,
+    },
+
+    /// Switch active OAuth account
+    Use {
+        /// Provider name (e.g., anthropic, openai-codex)
+        provider: String,
+        /// Account ID to switch to
+        account: String,
+    },
+
+    /// Remove a specific OAuth account
+    Remove {
+        /// Provider name
+        provider: String,
+        /// Account ID to remove
+        account: String,
+    },
+
+    /// Logout (remove all credentials for a provider)
+    Logout {
+        /// Provider to logout from (omit for current provider)
+        provider: Option<String>,
+    },
+
+    /// Show authentication status
+    Status {
+        /// Provider to show status for (omit for all)
+        provider: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Clean up stale/orphaned OAuth accounts.
+    Cleanup {
+        /// Show what would be removed without persisting changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Revoke a specific OAuth account token.
+    Revoke {
+        /// Provider name (e.g., anthropic, openai-codex)
+        provider: String,
+        /// Account ID to revoke
+        account: String,
+        /// Revocation reason
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Inspect OAuth recovery state for a provider/account.
+    Recovery {
+        /// Provider name
+        provider: String,
+        /// Optional account ID filter
+        account: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 

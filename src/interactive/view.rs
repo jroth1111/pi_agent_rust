@@ -223,6 +223,10 @@ impl PiApp {
             let _ = write!(output, "\n  {}\n", status_style.render(status));
         }
 
+        if let Some(panel) = self.render_reliability_panel() {
+            output.push_str(&panel);
+        }
+
         // Session picker overlay (if open)
         if let Some(ref picker) = self.session_picker {
             output.push_str(&self.render_session_picker(picker));
@@ -524,6 +528,53 @@ impl PiApp {
         let mut buf = String::new();
         self.render_footer_into(&mut buf);
         buf
+    }
+
+    pub(super) fn render_reliability_panel(&self) -> Option<String> {
+        let status = self.reliability_panel.as_ref()?;
+
+        let phase = status.phase.as_deref().unwrap_or("unknown");
+        let lease = status.lease.as_deref().unwrap_or("none");
+        let blocker_or_retry = status.blocker_or_retry.as_deref().unwrap_or("none");
+        let evidence = status.evidence.as_deref().unwrap_or("unknown");
+        let next_action = status.next_action.as_deref().unwrap_or("n/a");
+
+        let mut output = String::new();
+        let _ = writeln!(
+            output,
+            "\n  {}",
+            self.styles.warning_bold.render("Reliability")
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles.muted.render(&format!("phase: {phase}"))
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles.muted.render(&format!("lease: {lease}"))
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted
+                .render(&format!("blocker/retry: {blocker_or_retry}"))
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles.muted.render(&format!("evidence: {evidence}"))
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted
+                .render(&format!("next action: {next_action}"))
+        );
+        Some(output)
     }
 
     /// Render a single conversation message to a string (uncached path).

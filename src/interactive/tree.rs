@@ -617,6 +617,50 @@ fn build_tree_selector_rows(
                 ),
                 None,
             ),
+            SessionEntry::StateDigest(entry) => (
+                format!(
+                    "[reliability/state_digest: {} @ {}]",
+                    entry.digest.objective, entry.digest.phase
+                ),
+                None,
+            ),
+            SessionEntry::TaskCheckpoint(entry) => (
+                format!(
+                    "[reliability/task_checkpoint: {} @ {}]",
+                    entry.task_id, entry.phase
+                ),
+                None,
+            ),
+            SessionEntry::TaskCreated(entry) => (
+                format!("[reliability/task_created: {}]", entry.task_id),
+                None,
+            ),
+            SessionEntry::TaskTransition(entry) => (
+                format!(
+                    "[reliability/task_transition: {} -> {}]",
+                    entry.task_id, entry.to
+                ),
+                None,
+            ),
+            SessionEntry::VerificationEvidence(entry) => (
+                format!(
+                    "[reliability/verification_evidence: {}]",
+                    entry.evidence.task_id
+                ),
+                None,
+            ),
+            SessionEntry::CloseDecision(entry) => (
+                format!("[reliability/close_decision: {}]", entry.payload.task_id),
+                None,
+            ),
+            SessionEntry::HumanBlockerRaised(entry) => (
+                format!("[reliability/human_blocker_raised: {}]", entry.task_id),
+                None,
+            ),
+            SessionEntry::HumanBlockerResolved(entry) => (
+                format!("[reliability/human_blocker_resolved: {}]", entry.task_id),
+                None,
+            ),
             SessionEntry::Custom(entry) => (format!("[custom: {}]", entry.custom_type), None),
         }
     }

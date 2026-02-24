@@ -115,8 +115,9 @@ pub use self::state::{AgentState, InputMode, PendingInput};
 use self::state::{
     AutocompleteState, BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, HistoryList,
     InjectedMessageQueue, InteractiveMessageQueue, PendingLoginKind, PendingOAuth,
-    QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry, SettingsUiState,
-    TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
+    QueuedMessageKind, ReliabilityPanelState, SessionPickerOverlay, SettingsUiEntry,
+    SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
+    ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
 #[cfg(test)]
@@ -755,6 +756,11 @@ impl PiApp {
             chrome += 2;
         }
 
+        // Reliability panel: "\n  Reliability\n" + five summary rows.
+        if self.reliability_panel.is_some() {
+            chrome += 7;
+        }
+
         // Capability prompt overlay: ~8 lines (title, ext name, desc, blank, buttons, timer, help, blank).
         if self.capability_prompt.is_some() {
             chrome += 8;
@@ -1313,6 +1319,7 @@ pub struct PiApp {
 
     // Status message (for slash command feedback)
     status_message: Option<String>,
+    reliability_panel: Option<ReliabilityPanelState>,
 
     // Login flow state (awaiting sensitive credential input)
     pending_oauth: Option<PendingOAuth>,
@@ -1556,6 +1563,7 @@ impl PiApp {
             extension_ui_queue: VecDeque::new(),
             active_extension_ui: None,
             status_message: None,
+            reliability_panel: None,
             save_enabled,
             abort_handle: None,
             bash_running: false,
@@ -1626,6 +1634,13 @@ impl PiApp {
     /// Get the current status message (for testing).
     pub fn status_message(&self) -> Option<&str> {
         self.status_message.as_deref()
+    }
+
+    fn upsert_reliability_panel(&mut self, update: ReliabilityPanelState) {
+        match &mut self.reliability_panel {
+            Some(state) => state.apply_update(update),
+            None => self.reliability_panel = Some(update),
+        }
     }
 
     /// Snapshot the in-memory conversation buffer (integration test helper).

@@ -96,6 +96,14 @@ impl PiApp {
                 details,
                 ..
             } => {
+                if let Some(update) = details
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .and_then(|json| ReliabilityPanelState::parse_update(&json))
+                {
+                    self.upsert_reliability_panel(update);
+                }
+
                 // Update progress metrics from details if present.
                 if let Some(ref mut progress) = self.tool_progress {
                     progress.update_from_details(details.as_ref());
@@ -238,6 +246,9 @@ impl PiApp {
                 self.scroll_to_bottom();
             }
             PiMsg::System(message) => {
+                if let Some(update) = ReliabilityPanelState::parse_update(&message) {
+                    self.upsert_reliability_panel(update);
+                }
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: message,
@@ -256,6 +267,9 @@ impl PiApp {
                 }
             }
             PiMsg::SystemNote(message) => {
+                if let Some(update) = ReliabilityPanelState::parse_update(&message) {
+                    self.upsert_reliability_panel(update);
+                }
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: message,

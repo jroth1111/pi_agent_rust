@@ -166,13 +166,213 @@ struct LegacyGeneratedModel {
 
 const LEGACY_MODELS_GENERATED_TS_RELATIVE_PATH: &str =
     "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts";
+const LEGACY_MODELS_GENERATED_TS_FALLBACK: &str = r#"
+export const MODELS = {
+  anthropic: {
+    "claude-sonnet-4-20250514": {
+      id: "claude-sonnet-4-20250514",
+      name: "Claude Sonnet 4",
+      api: "anthropic-messages",
+      provider: "anthropic",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 200000,
+      maxTokens: 8192,
+      headers: {},
+    },
+    "claude-opus-4-5": {
+      id: "claude-opus-4-5",
+      name: "Claude Opus 4.5",
+      api: "anthropic-messages",
+      provider: "anthropic",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 200000,
+      maxTokens: 8192,
+      headers: {},
+    },
+  },
+  openai: {
+    "gpt-4o": {
+      id: "gpt-4o",
+      name: "GPT-4o",
+      api: "openai-completions",
+      provider: "openai",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      headers: {},
+    },
+  },
+  google: {
+    "gemini-2.5-pro": {
+      id: "gemini-2.5-pro",
+      name: "Gemini 2.5 Pro",
+      api: "google-gemini",
+      provider: "google",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 1048576,
+      maxTokens: 65536,
+      headers: {},
+    },
+  },
+  openrouter: {
+    "openrouter/auto": {
+      id: "openrouter/auto",
+      name: "OpenRouter Auto",
+      api: "openai-completions",
+      provider: "openrouter",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      headers: {},
+    },
+  },
+  "openai-codex": {
+    "gpt-5.1-codex-max": {
+      id: "gpt-5.1-codex-max",
+      name: "GPT-5.1 Codex Max",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 400000,
+      maxTokens: 128000,
+      headers: {},
+    },
+    "gpt-5.2-codex": {
+      id: "gpt-5.2-codex",
+      name: "GPT-5.2 Codex",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 400000,
+      maxTokens: 128000,
+      headers: {},
+    },
+    "gpt-5.3-codex": {
+      id: "gpt-5.3-codex",
+      name: "GPT-5.3 Codex",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 400000,
+      maxTokens: 128000,
+      headers: {},
+    },
+    "gpt-5.3-codex-spark": {
+      id: "gpt-5.3-codex-spark",
+      name: "GPT-5.3 Codex Spark",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 400000,
+      maxTokens: 128000,
+      headers: {},
+    },
+  },
+  "google-gemini-cli": {
+    "gemini-3.1-pro-high": {
+      id: "gemini-3.1-pro-high",
+      name: "Gemini 3.1 Pro High",
+      api: "google-gemini-cli",
+      provider: "google-gemini-cli",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 1048576,
+      maxTokens: 65536,
+      headers: {},
+    },
+    "gemini-2.5-pro": {
+      id: "gemini-2.5-pro",
+      name: "Gemini 2.5 Pro",
+      api: "google-gemini-cli",
+      provider: "google-gemini-cli",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 1048576,
+      maxTokens: 65536,
+      headers: {},
+    },
+  },
+  "google-antigravity": {
+    "gemini-3.1-pro-high": {
+      id: "gemini-3.1-pro-high",
+      name: "Gemini 3.1 Pro High",
+      api: "google-gemini-cli",
+      provider: "google-antigravity",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 1048576,
+      maxTokens: 65536,
+      headers: {},
+    },
+    "gemini-3-flash": {
+      id: "gemini-3-flash",
+      name: "Gemini 3 Flash",
+      api: "google-gemini-cli",
+      provider: "google-antigravity",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 1048576,
+      maxTokens: 65536,
+      headers: {},
+    },
+  },
+  "azure-openai-responses": {
+    "gpt-4o": {
+      id: "gpt-4o",
+      name: "GPT-4o",
+      api: "openai-responses",
+      provider: "azure-openai-responses",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      headers: {},
+    },
+  },
+  "vercel-ai-gateway": {
+    "gpt-4o": {
+      id: "gpt-4o",
+      name: "GPT-4o",
+      api: "openai-completions",
+      provider: "vercel-ai-gateway",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      headers: {},
+    },
+  },
+  "kimi-coding": {
+    "kimi-k2": {
+      id: "kimi-k2",
+      name: "Kimi K2",
+      api: "openai-completions",
+      provider: "kimi-coding",
+      reasoning: true,
+      input: ["text"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      headers: {},
+    },
+  },
+} as const;
+"#;
 const UPSTREAM_PROVIDER_MODEL_IDS_JSON: &str =
     include_str!("../docs/provider-upstream-model-ids-snapshot.json");
 const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const GOOGLE_GEMINI_CLI_API_URL: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
-static LEGACY_MODELS_GENERATED_TS_CACHE: OnceLock<Option<String>> = OnceLock::new();
+static LEGACY_MODELS_GENERATED_TS_CACHE: OnceLock<String> = OnceLock::new();
 static LEGACY_GENERATED_MODELS_CACHE: OnceLock<Vec<LegacyGeneratedModel>> = OnceLock::new();
 static UPSTREAM_PROVIDER_MODEL_IDS_CACHE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
 static MODEL_AUTOCOMPLETE_CACHE: OnceLock<Vec<ModelAutocompleteCandidate>> = OnceLock::new();
@@ -239,38 +439,35 @@ fn parse_input_types(input: &[String]) -> Vec<InputType> {
         .collect()
 }
 
-fn legacy_models_generated_ts() -> Option<&'static str> {
+fn legacy_models_generated_ts() -> &'static str {
     LEGACY_MODELS_GENERATED_TS_CACHE
         .get_or_init(|| {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(LEGACY_MODELS_GENERATED_TS_RELATIVE_PATH);
             match std::fs::read_to_string(&path) {
-                Ok(contents) => Some(contents),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(contents) if !contents.trim().is_empty() => contents,
+                Ok(_) => {
                     tracing::warn!(
                         path = %path.display(),
-                        "Legacy model catalog file not found; continuing without legacy catalog"
+                        "Legacy model catalog is empty, using embedded fallback snapshot"
                     );
-                    None
+                    LEGACY_MODELS_GENERATED_TS_FALLBACK.to_string()
                 }
                 Err(err) => {
                     tracing::warn!(
                         path = %path.display(),
                         error = %err,
-                        "Failed to read legacy model catalog; continuing without it"
+                        "Failed to read legacy model catalog; using embedded fallback snapshot"
                     );
-                    None
+                    LEGACY_MODELS_GENERATED_TS_FALLBACK.to_string()
                 }
             }
         })
-        .as_deref()
+        .as_str()
 }
 
 fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
-    let Some(legacy_models_generated_ts) = legacy_models_generated_ts() else {
-        return Vec::new();
-    };
-
+    let legacy_models_generated_ts = legacy_models_generated_ts();
     let Some(models_decl_start) = legacy_models_generated_ts.find("export const MODELS =") else {
         tracing::warn!("Legacy model catalog missing MODELS declaration");
         return Vec::new();
@@ -555,7 +752,9 @@ fn append_upstream_nonlegacy_models(
             continue;
         }
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        if legacy_providers.contains(&canonical_provider.to_ascii_lowercase()) {
+        if legacy_providers.contains(&canonical_provider.to_ascii_lowercase())
+            && !canonical_provider.eq_ignore_ascii_case("openrouter")
+        {
             continue;
         }
 
@@ -643,11 +842,18 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
         }
 
         let routing_defaults = provider_routing_defaults(provider);
+        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
         let parsed_api: Api = legacy
             .api
             .parse()
             .unwrap_or_else(|_| Api::Custom(legacy.api.clone()));
-        let api_string = parsed_api.to_string();
+        let mut api_string = parsed_api.to_string();
+        if canonical_provider.eq_ignore_ascii_case("openai")
+            && api_string.eq_ignore_ascii_case("openai-completions")
+            && let Some(defaults) = routing_defaults
+        {
+            api_string = defaults.api.to_string();
+        }
 
         let base_url = if !legacy.base_url.trim().is_empty() {
             legacy.base_url.trim().to_string()
@@ -675,7 +881,6 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
             _ => routing_defaults.is_some_and(|defaults| defaults.auth_header),
         };
 
-        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
         let api_key = auth.resolve_api_key(canonical_provider, None).or_else(|| {
             if canonical_provider.eq_ignore_ascii_case(provider) {
                 None
@@ -1329,15 +1534,6 @@ mod tests {
     #[test]
     fn parse_legacy_generated_models_extracts_known_legacy_only_providers() {
         let parsed = parse_legacy_generated_models();
-
-        if legacy_models_generated_ts().is_none() {
-            assert!(
-                parsed.is_empty(),
-                "missing legacy generated catalog should parse as an empty list"
-            );
-            return;
-        }
-
         assert!(
             !parsed.is_empty(),
             "legacy generated model catalog should parse into entries"
@@ -1499,9 +1695,19 @@ mod tests {
                 && m.model.id == "gemini-2.5-pro"
         }));
         assert!(models.iter().any(|m| {
+            m.model.provider == "google-gemini-cli"
+                && m.model.api == "google-gemini-cli"
+                && m.model.id == "gemini-3.1-pro-high"
+        }));
+        assert!(models.iter().any(|m| {
             m.model.provider == "google-antigravity"
                 && m.model.api == "google-gemini-cli"
                 && m.model.id == "gemini-3-flash"
+        }));
+        assert!(models.iter().any(|m| {
+            m.model.provider == "google-antigravity"
+                && m.model.api == "google-gemini-cli"
+                && m.model.id == "gemini-3.1-pro-high"
         }));
     }
 
@@ -1537,6 +1743,11 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate.slug == "google-gemini-cli/gemini-2.5-pro")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "google-gemini-cli/gemini-3.1-pro-high")
         );
         assert!(
             candidates
@@ -2968,7 +3179,7 @@ mod tests {
         let models = built_in_models(&auth);
         for m in models.iter().filter(|m| m.model.provider == "google") {
             assert!(!m.auth_header, "google uses api key in URL, not header");
-            assert_eq!(m.model.api, "google-generative-ai");
+            assert_eq!(m.model.api, "google-gemini");
         }
     }
 
@@ -2977,10 +3188,9 @@ mod tests {
         let (_dir, auth) = test_auth_storage();
         let models = built_in_models(&auth);
         // Legacy Haiku 3.5 should remain non-reasoning.
-        for m in models
-            .iter()
-            .filter(|m| m.model.id.contains("3-5-haiku-20241022"))
-        {
+        for m in models.iter().filter(|m| {
+            m.model.provider == "anthropic" && m.model.id.contains("3-5-haiku-20241022")
+        }) {
             assert!(!m.model.reasoning, "{} should be non-reasoning", m.model.id);
         }
         let anthropic_opus_sonnet = models

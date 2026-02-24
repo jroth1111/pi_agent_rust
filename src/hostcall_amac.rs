@@ -968,7 +968,8 @@ mod tests {
         ];
         let plan = executor.plan_batch(requests);
         assert_eq!(plan.total_requests, 5);
-        assert_eq!(plan.groups.len(), 3); // SessionRead, Tool, Http
+        // Grouping is by contiguous runs to preserve global ordering.
+        assert_eq!(plan.groups.len(), 5);
     }
 
     #[test]
@@ -1194,21 +1195,26 @@ mod tests {
         let plan = executor.plan_batch(requests);
         assert_eq!(plan.total_requests, 8);
 
-        // Should have groups for: SessionRead(2), SessionWrite(1), EventRead(1),
-        // Tool(2), Http(1), Log(1)
-        assert_eq!(plan.groups.len(), 6);
+        // Contiguous-run grouping preserves global ordering, so this mixed batch
+        // remains split across all eight requests (with the log request sunk last).
+        assert_eq!(plan.groups.len(), 8);
 
-        // Verify group sizes.
-        let session_read_group = plan
+        // Verify split groups preserve key identity per contiguous run.
+        let session_read_groups: Vec<&AmacBatchGroup> = plan
             .groups
             .iter()
-            .find(|g| g.key == AmacGroupKey::SessionRead);
-        assert!(session_read_group.is_some());
-        assert_eq!(session_read_group.unwrap().len(), 2);
+            .filter(|g| g.key == AmacGroupKey::SessionRead)
+            .collect();
+        assert_eq!(session_read_groups.len(), 2);
+        assert!(session_read_groups.iter().all(|g| g.len() == 1));
 
-        let tool_group = plan.groups.iter().find(|g| g.key == AmacGroupKey::Tool);
-        assert!(tool_group.is_some());
-        assert_eq!(tool_group.unwrap().len(), 2);
+        let tool_groups: Vec<&AmacBatchGroup> = plan
+            .groups
+            .iter()
+            .filter(|g| g.key == AmacGroupKey::Tool)
+            .collect();
+        assert_eq!(tool_groups.len(), 2);
+        assert!(tool_groups.iter().all(|g| g.len() == 1));
     }
 
     #[test]

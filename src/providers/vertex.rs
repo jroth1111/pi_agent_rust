@@ -214,6 +214,7 @@ impl VertexProvider {
             system_instruction,
             tools,
             tool_config,
+            thinking_config: gemini::gemini_thinking_config(options.thinking_level),
             generation_config: Some(GeminiGenerationConfig {
                 max_output_tokens: options.max_tokens.or(Some(gemini::DEFAULT_MAX_TOKENS)),
                 temperature: options.temperature,

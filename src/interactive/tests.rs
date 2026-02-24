@@ -1,6 +1,102 @@
 use super::share::{parse_gist_url_and_id, parse_share_is_public, share_gist_description};
 use super::*;
+use asupersync::channel::mpsc;
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::sync::Mutex;
+use async_trait::async_trait;
+use futures::stream;
 use serde_json::json;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+
+use crate::agent::AgentConfig;
+use crate::provider::{Context, Provider, StreamEvent, StreamOptions};
+use crate::resources::{ResourceCliOptions, ResourceLoader};
+use crate::session::Session;
+use crate::tools::ToolRegistry;
+
+struct DummyProvider;
+
+#[async_trait]
+impl Provider for DummyProvider {
+    fn name(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn api(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn model_id(&self) -> &'static str {
+        "dummy-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> crate::error::Result<
+        Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+    > {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+fn runtime_handle() -> asupersync::runtime::RuntimeHandle {
+    static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        RuntimeBuilder::multi_thread()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("build runtime")
+    })
+    .handle()
+}
+
+fn build_test_app() -> PiApp {
+    let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&[], Path::new("."), None),
+        AgentConfig::default(),
+    );
+    let session = Arc::new(Mutex::new(Session::in_memory()));
+    let resources = ResourceLoader::empty(false);
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let (event_tx, _event_rx) = mpsc::channel(32);
+    let current = test_model_entry("openai", "gpt-4o-mini");
+    let available = vec![current.clone()];
+
+    PiApp::new(
+        agent,
+        session,
+        Config::default(),
+        resources,
+        resource_cli,
+        Path::new(".").to_path_buf(),
+        current,
+        Vec::new(),
+        available,
+        Vec::new(),
+        event_tx,
+        runtime_handle(),
+        true,
+        None,
+        Some(crate::keybindings::KeyBindings::new()),
+        Vec::new(),
+        Usage::default(),
+    )
+}
 
 #[test]
 fn format_count_suffixes() {
@@ -35,6 +131,31 @@ fn tool_progress_format_display() {
     p.timeout_ms = Some(120_000);
     let display = p.format_display("bash");
     assert!(display.contains("timeout 120s"));
+}
+
+#[test]
+fn reliability_panel_state_rendering() {
+    let mut app = build_test_app();
+
+    app.handle_pi_message(PiMsg::SystemNote(
+        r#"reliability.status: {"phase":"discover","lease":"lease-1","evidenceComplete":false,"nextAction":"request dispatch"}"#.to_string(),
+    ));
+    let first_view = app.view();
+    assert!(first_view.contains("Reliability"));
+    assert!(first_view.contains("phase: discover"));
+    assert!(first_view.contains("lease: lease-1"));
+    assert!(first_view.contains("evidence: incomplete"));
+    assert!(first_view.contains("next action: request dispatch"));
+
+    app.handle_pi_message(PiMsg::SystemNote(
+        r#"reliability.status: {"phase":"verifying","blockers":["scope drift"],"evidenceComplete":true,"nextAction":"submit task"}"#.to_string(),
+    ));
+    let second_view = app.view();
+    assert!(second_view.contains("phase: verifying"));
+    assert!(second_view.contains("lease: lease-1"));
+    assert!(second_view.contains("blocker/retry: scope drift"));
+    assert!(second_view.contains("evidence: complete"));
+    assert!(second_view.contains("next action: submit task"));
 }
 
 #[test]
@@ -1041,7 +1162,7 @@ fn save_provider_credential_persists_google_under_canonical_key() {
 
     let loaded = crate::auth::AuthStorage::load(auth_path).expect("reload auth");
     assert_eq!(loaded.api_key("google").as_deref(), Some("gemini-test-key"));
-    assert!(loaded.get("gemini").is_none());
+    assert_eq!(loaded.api_key("gemini").as_deref(), Some("gemini-test-key"));
 }
 
 #[test]

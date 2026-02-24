@@ -56,42 +56,8 @@ pub struct ResourceDiagnostic {
 // Skills
 // ============================================================================
 
-const MAX_SKILL_NAME_LEN: usize = 64;
-const MAX_SKILL_DESC_LEN: usize = 1024;
-
-const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
-    "name",
-    "description",
-    "license",
-    "compatibility",
-    "metadata",
-    "allowed-tools",
-    "disable-model-invocation",
-];
-
-#[derive(Debug, Clone)]
-pub struct Skill {
-    pub name: String,
-    pub description: String,
-    pub file_path: PathBuf,
-    pub base_dir: PathBuf,
-    pub source: String,
-    pub disable_model_invocation: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadSkillsResult {
-    pub skills: Vec<Skill>,
-    pub diagnostics: Vec<ResourceDiagnostic>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadSkillsOptions {
-    pub cwd: PathBuf,
-    pub agent_dir: PathBuf,
-    pub skill_paths: Vec<PathBuf>,
-    pub include_defaults: bool,
-}
+pub use crate::skills::loader::{LoadSkillsOptions, LoadSkillsResult};
+pub use crate::skills::schema::{MAX_SKILL_DESC_LEN, MAX_SKILL_NAME_LEN, Skill};
 
 // ============================================================================
 // Prompt templates
@@ -603,145 +569,7 @@ fn extract_string_list(value: &Value) -> Vec<String> {
 
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]
 pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
-    let mut skill_map: HashMap<String, Skill> = HashMap::new();
-    let mut real_paths: HashSet<PathBuf> = HashSet::new();
-    let mut diagnostics = Vec::new();
-    let mut collisions = Vec::new();
-
-    // Helper to merge skills into the map, tracking collisions
-    fn merge_skills(
-        result: LoadSkillsResult,
-        skill_map: &mut HashMap<String, Skill>,
-        real_paths: &mut HashSet<PathBuf>,
-        diagnostics: &mut Vec<ResourceDiagnostic>,
-        collisions: &mut Vec<ResourceDiagnostic>,
-    ) {
-        diagnostics.extend(result.diagnostics);
-        for skill in result.skills {
-            let real_path =
-                fs::canonicalize(&skill.file_path).unwrap_or_else(|_| skill.file_path.clone());
-            if real_paths.contains(&real_path) {
-                continue;
-            }
-
-            if let Some(existing) = skill_map.get(&skill.name) {
-                collisions.push(ResourceDiagnostic {
-                    kind: DiagnosticKind::Collision,
-                    message: format!("name \"{}\" collision", skill.name),
-                    path: skill.file_path.clone(),
-                    collision: Some(CollisionInfo {
-                        resource_type: "skill".to_string(),
-                        name: skill.name.clone(),
-                        winner_path: existing.file_path.clone(),
-                        loser_path: skill.file_path.clone(),
-                    }),
-                });
-            } else {
-                real_paths.insert(real_path);
-                skill_map.insert(skill.name.clone(), skill);
-            }
-        }
-    }
-
-    if options.include_defaults {
-        merge_skills(
-            load_skills_from_dir(options.agent_dir.join("skills"), "user".to_string(), true),
-            &mut skill_map,
-            &mut real_paths,
-            &mut diagnostics,
-            &mut collisions,
-        );
-        merge_skills(
-            load_skills_from_dir(
-                options.cwd.join(Config::project_dir()).join("skills"),
-                "project".to_string(),
-                true,
-            ),
-            &mut skill_map,
-            &mut real_paths,
-            &mut diagnostics,
-            &mut collisions,
-        );
-    }
-
-    for path in options.skill_paths {
-        let resolved = path.clone();
-        if !resolved.exists() {
-            diagnostics.push(ResourceDiagnostic {
-                kind: DiagnosticKind::Warning,
-                message: "skill path does not exist".to_string(),
-                path: resolved,
-                collision: None,
-            });
-            continue;
-        }
-
-        let source = if options.include_defaults {
-            "path".to_string()
-        } else if is_under_path(&resolved, &options.agent_dir.join("skills")) {
-            "user".to_string()
-        } else if is_under_path(
-            &resolved,
-            &options.cwd.join(Config::project_dir()).join("skills"),
-        ) {
-            "project".to_string()
-        } else {
-            "path".to_string()
-        };
-
-        match fs::metadata(&resolved) {
-            Ok(meta) if meta.is_dir() => {
-                merge_skills(
-                    load_skills_from_dir(resolved, source, true),
-                    &mut skill_map,
-                    &mut real_paths,
-                    &mut diagnostics,
-                    &mut collisions,
-                );
-            }
-            Ok(meta) if meta.is_file() && resolved.extension().is_some_and(|ext| ext == "md") => {
-                let result = load_skill_from_file(&resolved, source);
-                if let Some(skill) = result.skill {
-                    merge_skills(
-                        LoadSkillsResult {
-                            skills: vec![skill],
-                            diagnostics: result.diagnostics,
-                        },
-                        &mut skill_map,
-                        &mut real_paths,
-                        &mut diagnostics,
-                        &mut collisions,
-                    );
-                } else {
-                    diagnostics.extend(result.diagnostics);
-                }
-            }
-            Ok(_) => {
-                diagnostics.push(ResourceDiagnostic {
-                    kind: DiagnosticKind::Warning,
-                    message: "skill path is not a markdown file".to_string(),
-                    path: resolved,
-                    collision: None,
-                });
-            }
-            Err(err) => diagnostics.push(ResourceDiagnostic {
-                kind: DiagnosticKind::Warning,
-                message: format!("failed to read skill path: {err}"),
-                path: resolved,
-                collision: None,
-            }),
-        }
-    }
-
-    diagnostics.extend(collisions);
-
-    let mut skills: Vec<Skill> = skill_map.into_values().collect();
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-
-    LoadSkillsResult {
-        skills,
-        diagnostics,
-    }
+    crate::skills::load_skills(options)
 }
 
 fn load_skills_from_dir(
@@ -749,275 +577,32 @@ fn load_skills_from_dir(
     source: String,
     include_root_files: bool,
 ) -> LoadSkillsResult {
-    let mut skills = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut visited_dirs = HashSet::new();
-    let mut stack = vec![(dir, source, include_root_files)];
-
-    while let Some((current_dir, current_source, current_include_root)) = stack.pop() {
-        if !current_dir.exists() {
-            continue;
-        }
-
-        // Prevent unbounded recursion for symlink cycles.
-        let canonical_dir = fs::canonicalize(&current_dir).unwrap_or_else(|_| current_dir.clone());
-        if !visited_dirs.insert(canonical_dir) {
-            continue;
-        }
-
-        let Ok(entries) = fs::read_dir(&current_dir) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-
-            if file_name.starts_with('.') || file_name == "node_modules" {
-                continue;
-            }
-
-            let full_path = entry.path();
-            let file_type = entry.file_type();
-
-            let (is_dir, is_file) = match file_type {
-                Ok(ft) if ft.is_symlink() => match fs::metadata(&full_path) {
-                    Ok(meta) => (meta.is_dir(), meta.is_file()),
-                    Err(_) => continue,
-                },
-                Ok(ft) => (ft.is_dir(), ft.is_file()),
-                Err(_) => continue,
-            };
-
-            if is_dir {
-                stack.push((full_path, current_source.clone(), false));
-                continue;
-            }
-
-            if !is_file {
-                continue;
-            }
-
-            let is_root_md = current_include_root && file_name.ends_with(".md");
-            let is_skill_md = !current_include_root && file_name == "SKILL.md";
-            if !is_root_md && !is_skill_md {
-                continue;
-            }
-
-            let result = load_skill_from_file(&full_path, current_source.clone());
-            if let Some(skill) = result.skill {
-                skills.push(skill);
-            }
-            diagnostics.extend(result.diagnostics);
-        }
-    }
-
-    LoadSkillsResult {
-        skills,
-        diagnostics,
-    }
+    crate::skills::loader::load_skills_from_dir(dir, source, include_root_files)
 }
 
-struct LoadSkillFileResult {
-    skill: Option<Skill>,
-    diagnostics: Vec<ResourceDiagnostic>,
-}
+type LoadSkillFileResult = crate::skills::loader::LoadSkillFileResult;
 
 fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
-    let mut diagnostics = Vec::new();
-
-    let Ok(raw) = fs::read_to_string(path) else {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: "failed to parse skill file".to_string(),
-            path: path.to_path_buf(),
-            collision: None,
-        });
-        return LoadSkillFileResult {
-            skill: None,
-            diagnostics,
-        };
-    };
-
-    let parsed = parse_frontmatter(&raw);
-    let frontmatter = &parsed.frontmatter;
-
-    let field_errors = validate_frontmatter_fields(frontmatter.keys());
-    for error in field_errors {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: error,
-            path: path.to_path_buf(),
-            collision: None,
-        });
-    }
-
-    let description = frontmatter.get("description").cloned().unwrap_or_default();
-    let desc_errors = validate_description(&description);
-    for error in desc_errors {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: error,
-            path: path.to_path_buf(),
-            collision: None,
-        });
-    }
-
-    if description.trim().is_empty() {
-        return LoadSkillFileResult {
-            skill: None,
-            diagnostics,
-        };
-    }
-
-    let base_dir = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let parent_dir = base_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    let name = frontmatter
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| parent_dir.clone());
-
-    let name_errors = validate_name(&name, &parent_dir);
-    for error in name_errors {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: error,
-            path: path.to_path_buf(),
-            collision: None,
-        });
-    }
-
-    let disable_model_invocation = frontmatter
-        .get("disable-model-invocation")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-    LoadSkillFileResult {
-        skill: Some(Skill {
-            name,
-            description,
-            file_path: path.to_path_buf(),
-            base_dir,
-            source,
-            disable_model_invocation,
-        }),
-        diagnostics,
-    }
+    crate::skills::loader::load_skill_from_file(path, source)
 }
 
 fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
-    let mut errors = Vec::new();
-
-    if name != parent_dir {
-        errors.push(format!(
-            "name \"{name}\" does not match parent directory \"{parent_dir}\""
-        ));
-    }
-
-    if name.len() > MAX_SKILL_NAME_LEN {
-        errors.push(format!(
-            "name exceeds {MAX_SKILL_NAME_LEN} characters ({})",
-            name.len()
-        ));
-    }
-
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        errors.push(
-            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)"
-                .to_string(),
-        );
-    }
-
-    if name.starts_with('-') || name.ends_with('-') {
-        errors.push("name must not start or end with a hyphen".to_string());
-    }
-
-    if name.contains("--") {
-        errors.push("name must not contain consecutive hyphens".to_string());
-    }
-
-    errors
+    crate::skills::validate_name(name, parent_dir)
 }
 
 fn validate_description(description: &str) -> Vec<String> {
-    let mut errors = Vec::new();
-    if description.trim().is_empty() {
-        errors.push("description is required".to_string());
-    } else if description.len() > MAX_SKILL_DESC_LEN {
-        errors.push(format!(
-            "description exceeds {MAX_SKILL_DESC_LEN} characters ({})",
-            description.len()
-        ));
-    }
-    errors
+    crate::skills::validate_description(description)
 }
 
 fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a String>,
 {
-    let allowed: HashSet<&str> = ALLOWED_SKILL_FRONTMATTER.into_iter().collect();
-    let mut errors = Vec::new();
-    for key in keys {
-        if !allowed.contains(key.as_str()) {
-            errors.push(format!("unknown frontmatter field \"{key}\""));
-        }
-    }
-    errors
+    crate::skills::validate_frontmatter_fields(keys)
 }
 
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
-    let visible: Vec<&Skill> = skills
-        .iter()
-        .filter(|s| !s.disable_model_invocation)
-        .collect();
-    if visible.is_empty() {
-        return String::new();
-    }
-
-    let mut lines = vec![
-        "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
-        "Use the read tool to load a skill's file when the task matches its description."
-            .to_string(),
-        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
-        String::new(),
-        "<available_skills>".to_string(),
-    ];
-
-    for skill in visible {
-        lines.push("  <skill>".to_string());
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
-        ));
-        lines.push(format!(
-            "    <location>{}</location>",
-            escape_xml(&skill.file_path.display().to_string())
-        ));
-        lines.push("  </skill>".to_string());
-    }
-
-    lines.push("</available_skills>".to_string());
-    lines.join("\n")
-}
-
-fn escape_xml(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    crate::skills::format_skills_for_prompt(skills)
 }
 
 // ============================================================================
@@ -1488,119 +1073,21 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
 }
 
 fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
-    if !text.starts_with("/skill:") {
-        return text.to_string();
-    }
-
-    let space_index = text.find(' ');
-    let name = space_index.map_or(&text[7..], |idx| &text[7..idx]);
-    let args = space_index.map_or("", |idx| text[idx + 1..].trim());
-
-    let Some(skill) = skills.iter().find(|s| s.name == name) else {
-        return text.to_string();
-    };
-
-    match fs::read_to_string(&skill.file_path) {
-        Ok(content) => {
-            let body = strip_frontmatter(&content).trim().to_string();
-            let block = format!(
-                "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-                skill.name,
-                skill.file_path.display(),
-                skill.base_dir.display(),
-                body
-            );
-            if args.is_empty() {
-                block
-            } else {
-                format!("{block}\n\n{args}")
-            }
-        }
-        Err(err) => {
-            eprintln!(
-                "Warning: Failed to read skill {}: {err}",
-                skill.file_path.display()
-            );
-            text.to_string()
-        }
-    }
+    crate::skills::expand_skill_command(text, skills)
 }
 
 // ============================================================================
 // Frontmatter parsing helpers
 // ============================================================================
 
-struct ParsedFrontmatter {
-    frontmatter: HashMap<String, String>,
-    body: String,
-}
+type ParsedFrontmatter = crate::skills::schema::ParsedFrontmatter;
 
 fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
-    let mut lines = raw.lines();
-    let Some(first) = lines.next() else {
-        return ParsedFrontmatter {
-            frontmatter: HashMap::new(),
-            body: String::new(),
-        };
-    };
-
-    if first.trim() != "---" {
-        return ParsedFrontmatter {
-            frontmatter: HashMap::new(),
-            body: raw.to_string(),
-        };
-    }
-
-    let mut front_lines = Vec::new();
-    let mut body_lines = Vec::new();
-    let mut in_frontmatter = true;
-    for line in lines {
-        if in_frontmatter {
-            if line.trim() == "---" {
-                in_frontmatter = false;
-                continue;
-            }
-            front_lines.push(line);
-        } else {
-            body_lines.push(line);
-        }
-    }
-
-    if in_frontmatter {
-        return ParsedFrontmatter {
-            frontmatter: HashMap::new(),
-            body: raw.to_string(),
-        };
-    }
-
-    ParsedFrontmatter {
-        frontmatter: parse_frontmatter_lines(&front_lines),
-        body: body_lines.join("\n"),
-    }
-}
-
-fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        map.insert(key.to_string(), value.to_string());
-    }
-    map
+    crate::skills::parse_frontmatter(raw)
 }
 
 fn strip_frontmatter(raw: &str) -> String {
-    parse_frontmatter(raw).body
+    crate::skills::strip_frontmatter(raw)
 }
 
 // ============================================================================
@@ -1671,6 +1158,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::schema::escape_xml;
     use asupersync::runtime::RuntimeBuilder;
     use std::fs;
     use std::future::Future;
