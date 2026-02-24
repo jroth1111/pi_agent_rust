@@ -15,15 +15,19 @@
 use crate::auth::AuthStorage;
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
+use crate::config::{Config, ReliabilityEnforcementMode, RetrySettings};
 use crate::error::{Error, Result};
+use crate::events::Action;
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
-    ExtensionLoadSpec, ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle,
-    ExtensionSendMessage, ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
-    NativeRustExtensionLoadSpec, NativeRustExtensionRuntimeHandle, RepairPolicyMode,
-    resolve_extension_load_spec,
+    EXTENSION_EVENT_TIMEOUT_MS, ExecMediationLedgerEntry, ExtensionDeliverAs, ExtensionEventName,
+    ExtensionHostActions, ExtensionLoadSpec, ExtensionManager, ExtensionPolicy, ExtensionRegion,
+    ExtensionRuntimeHandle, ExtensionSendMessage, ExtensionSendUserMessage, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle, NativeRustExtensionLoadSpec, NativeRustExtensionRuntimeHandle,
+    RepairPolicyMode, SECURITY_ALERT_SCHEMA_VERSION, SecurityAlert, SecurityAlertAction,
+    SecurityAlertCategory, SecurityAlertSeverity, resolve_extension_load_spec,
+    sha256_hex_standalone,
 };
 #[cfg(feature = "wasm-host")]
 use crate::extensions::{WasmExtensionHost, WasmExtensionLoadSpec};
@@ -35,8 +39,19 @@ use crate::model::{
 };
 use crate::models::{ModelEntry, ModelRegistry};
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+#[allow(unused_imports)]
+use crate::reliability::{
+    ArtifactStore, Attempt, AttemptStats, CloseOutcomeKind, ClosePayload, CloseResult,
+    EvidenceRecord, FsArtifactStore, LeaseManager, RetryAgent, RetryConfig, ReviewSubmission,
+    ReviewerScorer, StateDigest, StuckDetector, TokenUsage, VerificationOutcome,
+};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
+use crate::state::{
+    CompletionGate as StateCompletionGate, DiscoveryPriority, DiscoveryTracker, Evidence,
+    EvidenceGate, TaskEventKind, TaskEventLog, TaskResult,
+};
 use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
+use crate::verification::{EvidenceCollector, TestQualityGate};
 use asupersync::sync::{Mutex, Notify};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -47,12 +62,14 @@ use futures::stream;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 const MAX_CONCURRENT_TOOLS: usize = 8;
+const RELIABILITY_OBJECTIVE_MAX_CHARS: usize = 160;
 
 // ============================================================================
 // Agent Configuration
@@ -405,6 +422,9 @@ pub struct Agent {
 
     /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
     cached_tool_defs: Option<Vec<ToolDef>>,
+
+    /// Optional per-turn scope objective used by the scope boundary guard.
+    scope_objective: Option<String>,
 }
 
 impl Agent {
@@ -420,6 +440,7 @@ impl Agent {
             follow_up_fetchers: Vec::new(),
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
+            scope_objective: None,
         }
     }
 
@@ -442,6 +463,18 @@ impl Agent {
     /// Replace the message history.
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+    }
+
+    /// Set the scope objective for the current execution turn.
+    pub fn set_scope_objective(&mut self, objective: Option<String>) {
+        self.scope_objective = objective
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    /// Clear any active scope objective.
+    pub fn clear_scope_objective(&mut self) {
+        self.scope_objective = None;
     }
 
     /// Replace the provider implementation (used for model/provider switching).
@@ -1494,6 +1527,11 @@ impl Agent {
                 break;
             }
 
+            if self.should_block_tool_call_for_scope(tool_call) {
+                tool_outputs[index] = Some((self.scope_blocked_tool_output(tool_call), true));
+                continue;
+            }
+
             let is_read_only =
                 matches!(self.tools.get(&tool_call.name), Some(tool) if tool.is_read_only());
 
@@ -1667,6 +1705,74 @@ impl Agent {
         })
     }
 
+    fn should_block_tool_call_for_scope(&self, tool_call: &ToolCall) -> bool {
+        let Some(objective) = self.scope_objective.as_deref() else {
+            return false;
+        };
+
+        // Only hard-block when the user objective carries explicit scope anchors
+        // (paths/modules). Broad natural-language objectives should not be gated.
+        if !Self::objective_has_explicit_scope_anchor(objective) {
+            return false;
+        }
+
+        if !ReliabilityTraceCapture::is_mutating_action(&tool_call.name, &tool_call.arguments) {
+            return false;
+        }
+
+        let Some(target) =
+            ReliabilityTraceCapture::scope_target(&tool_call.name, &tool_call.arguments)
+        else {
+            return false;
+        };
+
+        !ReliabilityTraceCapture::target_matches_objective(objective, &target)
+    }
+
+    fn objective_has_explicit_scope_anchor(objective: &str) -> bool {
+        objective.split_whitespace().any(|token| {
+            let trimmed = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    ',' | '.' | ';' | ':' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            });
+            let known_extension = std::path::Path::new(trimmed)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("rs")
+                        || ext.eq_ignore_ascii_case("toml")
+                        || ext.eq_ignore_ascii_case("md")
+                });
+            trimmed.contains('/') || known_extension
+        })
+    }
+
+    fn scope_blocked_tool_output(&self, tool_call: &ToolCall) -> ToolOutput {
+        let target = ReliabilityTraceCapture::scope_target(&tool_call.name, &tool_call.arguments)
+            .unwrap_or_else(|| "requested target".to_string());
+        let objective = self
+            .scope_objective
+            .as_deref()
+            .unwrap_or("current objective");
+        let message = format!(
+            "Scope guard blocked out-of-scope '{}' action for target '{}'; objective='{}'. Logged as discovery for follow-up.",
+            tool_call.name, target, objective
+        );
+
+        ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(message))],
+            details: Some(json!({
+                "scopeBlocked": true,
+                "toolName": tool_call.name,
+                "target": target,
+                "objective": objective,
+            })),
+            is_error: true,
+        }
+    }
+
     async fn execute_tool(
         &self,
         tool_call: ToolCall,
@@ -1688,6 +1794,7 @@ impl Agent {
         };
 
         if let Some(extensions) = &extensions {
+            Self::record_builtin_bash_mediation(extensions, &tool_call, &output);
             Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
         }
 
@@ -1819,6 +1926,134 @@ impl Agent {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn record_builtin_bash_mediation(
+        extensions: &ExtensionManager,
+        tool_call: &ToolCall,
+        output: &ToolOutput,
+    ) {
+        if tool_call.name != "bash" {
+            return;
+        }
+        let Some(details) = output.details.as_ref() else {
+            return;
+        };
+        let Some(exec_mediation) = details.get("execMediation").and_then(Value::as_object) else {
+            return;
+        };
+
+        let decision = exec_mediation
+            .get("decision")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|decision| !decision.is_empty())
+            .unwrap_or("allow");
+        let command_hash = exec_mediation
+            .get("commandHash")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                tool_call
+                    .arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(sha256_hex_standalone)
+            })
+            .unwrap_or_default();
+        if command_hash.is_empty() {
+            return;
+        }
+
+        let command_class = exec_mediation
+            .get("commandClass")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let risk_tier = exec_mediation
+            .get("riskTier")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let reason = exec_mediation
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let policy_source = exec_mediation
+            .get("policySource")
+            .and_then(Value::as_str)
+            .unwrap_or("builtin_bash_exec_mediation")
+            .to_string();
+        let ts_ms = Utc::now().timestamp_millis();
+
+        extensions.record_exec_mediation(ExecMediationLedgerEntry {
+            ts_ms,
+            extension_id: Some("builtin:bash".to_string()),
+            command_hash: command_hash.clone(),
+            command_class: command_class.clone(),
+            risk_tier,
+            decision: decision.to_string(),
+            reason: reason.clone(),
+        });
+
+        let (severity, action, summary) = match decision {
+            "deny" => (
+                SecurityAlertSeverity::Error,
+                SecurityAlertAction::Deny,
+                format!(
+                    "Builtin bash denied by exec mediation: {}",
+                    if reason.is_empty() {
+                        "policy decision"
+                    } else {
+                        reason.as_str()
+                    }
+                ),
+            ),
+            "allow_with_audit" => (
+                SecurityAlertSeverity::Info,
+                SecurityAlertAction::Harden,
+                format!(
+                    "Builtin bash allowed with audit: {}",
+                    if reason.is_empty() {
+                        "classified command"
+                    } else {
+                        reason.as_str()
+                    }
+                ),
+            ),
+            _ => return,
+        };
+        let mut reason_codes = Vec::new();
+        if let Some(class) = command_class {
+            reason_codes.push(class);
+        } else if !reason.is_empty() {
+            reason_codes.push(reason);
+        }
+
+        extensions.record_security_alert(SecurityAlert {
+            schema: SECURITY_ALERT_SCHEMA_VERSION.to_string(),
+            ts_ms,
+            sequence_id: 0,
+            extension_id: "builtin:bash".to_string(),
+            category: SecurityAlertCategory::ExecMediation,
+            severity,
+            capability: "exec".to_string(),
+            method: "bash".to_string(),
+            reason_codes,
+            summary,
+            policy_source,
+            action,
+            remediation: if decision == "deny" {
+                "Review the command and adjust exec mediation policy if intended.".to_string()
+            } else {
+                String::new()
+            },
+            risk_score: 0.0,
+            risk_state: None,
+            context_hash: command_hash,
+        });
+    }
+
     fn skip_tool_call(
         &mut self,
         tool_call: &ToolCall,
@@ -1879,6 +2114,24 @@ struct ToolExecutionOutcome {
     steering_messages: Option<Vec<Message>>,
 }
 
+#[derive(Clone)]
+struct RetryExecutionSnapshot {
+    session: Session,
+    agent_messages: Vec<Message>,
+}
+
+struct RetryExecutionOutcome {
+    attempt_id: String,
+    snapshot: RetryExecutionSnapshot,
+    result: Result<AssistantMessage>,
+}
+
+#[derive(Clone)]
+enum RetryInput {
+    Text(String),
+    Content(Vec<ContentBlock>),
+}
+
 /// Pre-created extension runtime state for overlapping startup I/O.
 ///
 /// By spawning runtime boot as a background task *before* session creation and
@@ -1896,6 +2149,9 @@ pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
+    retry_settings: RetrySettings,
+    reliability_enabled: bool,
+    reliability_enforcement_mode: ReliabilityEnforcementMode,
     /// Extension lifecycle region — ensures the JS runtime thread is shut
     /// down when the session ends.
     pub extensions: Option<ExtensionRegion>,
@@ -2004,6 +2260,460 @@ impl ExtensionHostActions for AgentSessionHostActions {
 
         // Non-streaming, best-effort: persist to session. Interactive mode triggers turns via UI.
         self.append_to_session(user_message).await
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReliabilityTraceSnapshot {
+    task_id: String,
+    objective: String,
+    saw_execute: bool,
+    evidence: Vec<EvidenceRecord>,
+    phase_violations: Vec<String>,
+    stuck_patterns: Vec<crate::reliability::StuckPattern>,
+    discoveries: Vec<crate::state::Discovery>,
+    discovery_summary: Option<crate::state::DiscoverySummary>,
+    task_events: TaskEventLog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReliabilityPhase {
+    Discover,
+    Plan,
+    Execute,
+    Verify,
+    Close,
+}
+
+#[derive(Debug)]
+struct ReliabilityTraceCapture {
+    snapshot: ReliabilityTraceSnapshot,
+    bash_commands_by_call: HashMap<String, String>,
+    env_id: Option<String>,
+    artifact_store: Option<Arc<FsArtifactStore>>,
+    phase: ReliabilityPhase,
+    lease_manager: LeaseManager,
+    lease_id: String,
+    fence_token: u64,
+    stuck_detector: StuckDetector,
+    discovery_tracker: DiscoveryTracker,
+    last_stuck_pattern: Option<String>,
+    discovery_fingerprints: std::collections::HashSet<String>,
+}
+
+impl ReliabilityTraceCapture {
+    fn new(
+        task_id: String,
+        objective: String,
+        env_id: Option<String>,
+        artifact_store: Option<Arc<FsArtifactStore>>,
+    ) -> Self {
+        let mut task_events = TaskEventLog::new();
+        task_events.append(TaskEventKind::Created, Some("agent".to_string()));
+
+        let mut lease_manager = LeaseManager::default();
+        let (lease_id, fence_token) = match lease_manager.issue_lease(&task_id, "agent", 3600) {
+            Ok(grant) => (grant.lease_id, grant.fence_token),
+            Err(err) => {
+                tracing::warn!("failed to issue reliability lease: {err}");
+                (String::new(), 0)
+            }
+        };
+        Self {
+            snapshot: ReliabilityTraceSnapshot {
+                task_id,
+                objective,
+                saw_execute: false,
+                evidence: Vec::new(),
+                phase_violations: Vec::new(),
+                stuck_patterns: Vec::new(),
+                discoveries: Vec::new(),
+                discovery_summary: None,
+                task_events,
+            },
+            bash_commands_by_call: HashMap::new(),
+            env_id,
+            artifact_store,
+            phase: ReliabilityPhase::Discover,
+            lease_manager,
+            lease_id,
+            fence_token,
+            stuck_detector: StuckDetector::new(),
+            discovery_tracker: DiscoveryTracker::new(),
+            last_stuck_pattern: None,
+            discovery_fingerprints: std::collections::HashSet::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn observe_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                let action = Self::action_from_tool(tool_name, args);
+                self.stuck_detector.record_action(&action);
+                self.stuck_detector.record_tool_round();
+                self.maybe_track_discovery(tool_name, args);
+
+                if Self::is_mutating_action(tool_name, args) {
+                    self.on_mutating_action(tool_name);
+                }
+                if tool_name == "bash" {
+                    if let Some(command) = Self::maybe_extract_bash_command(args) {
+                        self.bash_commands_by_call
+                            .insert(tool_call_id.clone(), command);
+                    }
+                }
+            }
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => {
+                self.snapshot.saw_execute = true;
+                self.snapshot.task_events.append(
+                    TaskEventKind::AttemptRecorded {
+                        action: tool_name.clone(),
+                        success: !*is_error,
+                    },
+                    Some("agent".to_string()),
+                );
+
+                if *is_error {
+                    let output = Self::extract_verify_output(result);
+                    if output.trim().is_empty() {
+                        self.stuck_detector
+                            .record_error(&format!("{tool_name} returned an error"));
+                    } else {
+                        self.stuck_detector.record_error(&output);
+                    }
+                }
+
+                if tool_name != "bash" {
+                    self.check_stuck_pattern();
+                    self.refresh_discovery_snapshot();
+                    return;
+                }
+                let Some(command) = self.bash_commands_by_call.remove(tool_call_id) else {
+                    self.check_stuck_pattern();
+                    self.refresh_discovery_snapshot();
+                    return;
+                };
+                if !Self::is_verify_command(&command) {
+                    self.check_stuck_pattern();
+                    self.refresh_discovery_snapshot();
+                    return;
+                }
+                if self.phase != ReliabilityPhase::Execute {
+                    self.snapshot.phase_violations.push(format!(
+                        "verify command executed from invalid phase {:?}",
+                        self.phase
+                    ));
+                }
+                self.phase = ReliabilityPhase::Verify;
+                if let Err(err) = self.validate_submit_fence(&self.lease_id, self.fence_token) {
+                    self.snapshot
+                        .phase_violations
+                        .push(format!("stale lease/fence submission rejected: {err}"));
+                }
+
+                let exit_code = Self::parse_exit_code(result, *is_error);
+                let stdout = Self::extract_verify_output(result);
+                let mut artifact_ids = Vec::new();
+                if !stdout.is_empty() {
+                    if let Some(store) = &self.artifact_store {
+                        match store.put_text(&self.snapshot.task_id, "stdout", &stdout) {
+                            Ok(id) => artifact_ids.push(id),
+                            Err(err) => {
+                                tracing::warn!(
+                                    "failed to persist reliability stdout artifact: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if artifact_ids.is_empty() {
+                    let fallback_artifact_id = result
+                        .details
+                        .as_ref()
+                        .and_then(|value| value.get("fullOutputPath"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    if let Some(artifact_id) = fallback_artifact_id {
+                        artifact_ids.push(artifact_id);
+                    }
+                }
+                let evidence = EvidenceRecord::from_command_output_with_env(
+                    self.snapshot.task_id.clone(),
+                    command,
+                    exit_code,
+                    &stdout,
+                    "",
+                    artifact_ids,
+                    self.env_id.clone(),
+                );
+                self.snapshot.evidence.push(evidence);
+            }
+            AgentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => {
+                if matches!(
+                    assistant_message_event.as_ref(),
+                    AssistantMessageEvent::TextDelta { .. }
+                ) {
+                    self.stuck_detector.record_text_round();
+                }
+            }
+            _ => {}
+        }
+
+        self.check_stuck_pattern();
+        self.refresh_discovery_snapshot();
+    }
+
+    fn snapshot(&self) -> ReliabilityTraceSnapshot {
+        self.snapshot.clone()
+    }
+
+    fn on_mutating_action(&mut self, tool_name: &str) {
+        if self.phase == ReliabilityPhase::Discover {
+            self.phase = ReliabilityPhase::Plan;
+        }
+        match self.phase {
+            ReliabilityPhase::Plan | ReliabilityPhase::Execute => {
+                self.phase = ReliabilityPhase::Execute;
+            }
+            ReliabilityPhase::Verify | ReliabilityPhase::Close => {
+                self.snapshot.phase_violations.push(format!(
+                    "mutating action '{tool_name}' executed after verification phase"
+                ));
+            }
+            ReliabilityPhase::Discover => {}
+        }
+    }
+
+    fn is_mutating_action(tool_name: &str, args: &Value) -> bool {
+        if tool_name == "bash" {
+            return Self::maybe_extract_bash_command(args)
+                .as_deref()
+                .is_none_or(|command| !Self::is_verify_command(command));
+        }
+        !matches!(tool_name, "read" | "grep" | "find" | "ls" | "websearch")
+    }
+
+    fn action_from_tool(tool_name: &str, args: &Value) -> Action {
+        fn arg<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
+            keys.iter()
+                .find_map(|key| args.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        }
+
+        match tool_name {
+            "read" => Action::read(arg(args, &["file_path", "path"]).unwrap_or("<unknown>")),
+            "write" => Action::write(
+                arg(args, &["file_path", "path"]).unwrap_or("<unknown>"),
+                arg(args, &["content"]).unwrap_or(""),
+            ),
+            "edit" => Action::edit(
+                arg(args, &["file_path", "path"]).unwrap_or("<unknown>"),
+                arg(args, &["old_string", "old"]).unwrap_or(""),
+                arg(args, &["new_string", "new"]).unwrap_or(""),
+            ),
+            "bash" => Action::bash(arg(args, &["command"]).unwrap_or("")),
+            "grep" => Action::grep(arg(args, &["pattern"]).unwrap_or("")),
+            "find" => Action::glob(arg(args, &["pattern", "glob"]).unwrap_or("")),
+            "ls" => Action::ls(),
+            "websearch" => Action::web_search(arg(args, &["query"]).unwrap_or("")),
+            "webfetch" => Action::web_fetch(arg(args, &["url"]).unwrap_or("")),
+            _ => Action::Custom {
+                name: tool_name.to_string(),
+                arguments: args.clone(),
+            },
+        }
+    }
+
+    fn maybe_track_discovery(&mut self, tool_name: &str, args: &Value) {
+        if !Self::is_mutating_action(tool_name, args) {
+            return;
+        }
+
+        let Some(target) = Self::scope_target(tool_name, args) else {
+            return;
+        };
+
+        if Self::target_matches_objective(&self.snapshot.objective, &target) {
+            return;
+        }
+
+        let fingerprint = format!("{tool_name}:{target}");
+        if self.discovery_fingerprints.contains(&fingerprint) {
+            return;
+        }
+        self.discovery_fingerprints.insert(fingerprint);
+
+        let description = format!(
+            "Potential out-of-scope action for objective '{}': {}",
+            self.snapshot.objective, target
+        );
+
+        if let Ok(discovery) = self.discovery_tracker.discover(
+            &description,
+            &self.snapshot.task_id,
+            DiscoveryPriority::ShouldAddress,
+        ) {
+            let related_to = self.snapshot.task_events.last().map_or(0, |event| event.id);
+            self.snapshot.task_events.append(
+                TaskEventKind::DiscoveryMade {
+                    description: discovery.description.clone(),
+                    related_to,
+                    priority: discovery.priority,
+                },
+                Some("agent".to_string()),
+            );
+        }
+    }
+
+    fn scope_target(tool_name: &str, args: &Value) -> Option<String> {
+        let key_candidates: &[&str] = match tool_name {
+            "bash" => &["command"],
+            "write" | "edit" | "read" => &["file_path", "path"],
+            "grep" => &["pattern", "path"],
+            "find" => &["pattern", "glob", "path"],
+            _ => &["path", "file_path", "query", "url"],
+        };
+
+        key_candidates
+            .iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn target_matches_objective(objective: &str, target: &str) -> bool {
+        let objective_tokens = objective
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|token| token.len() >= 4)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if objective_tokens.is_empty() {
+            return true;
+        }
+
+        let target_lower = target.to_ascii_lowercase();
+        objective_tokens
+            .iter()
+            .any(|token| target_lower.contains(token))
+    }
+
+    fn check_stuck_pattern(&mut self) {
+        let Some(pattern) = self.stuck_detector.check() else {
+            self.last_stuck_pattern = None;
+            return;
+        };
+
+        let fingerprint = pattern.description();
+        if self.last_stuck_pattern.as_deref() == Some(fingerprint.as_str()) {
+            return;
+        }
+        self.last_stuck_pattern = Some(fingerprint.clone());
+
+        self.snapshot.stuck_patterns.push(pattern.clone());
+        self.snapshot
+            .phase_violations
+            .push(format!("stuck pattern detected: {fingerprint}"));
+        self.snapshot.task_events.append(
+            TaskEventKind::StuckDetected { pattern },
+            Some("agent".to_string()),
+        );
+    }
+
+    fn refresh_discovery_snapshot(&mut self) {
+        self.snapshot.discoveries = self.discovery_tracker.all().to_vec();
+        self.snapshot.discovery_summary = Some(self.discovery_tracker.summary());
+    }
+
+    fn validate_submit_fence(
+        &self,
+        lease_id: &str,
+        fence_token: u64,
+    ) -> std::result::Result<(), String> {
+        if lease_id.trim().is_empty() {
+            return Err("lease id missing".to_string());
+        }
+        self.lease_manager
+            .validate_fence(lease_id, fence_token)
+            .map_err(|err| err.to_string())
+    }
+
+    fn extract_verify_output(result: &ToolOutput) -> String {
+        let full_output_path = result
+            .details
+            .as_ref()
+            .and_then(|value| value.get("fullOutputPath"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if let Some(path) = full_output_path {
+            match std::fs::read(&path) {
+                Ok(bytes) => return String::from_utf8_lossy(&bytes).into_owned(),
+                Err(err) => tracing::warn!("failed reading fullOutputPath '{path}': {err}"),
+            }
+        }
+        Self::flatten_text_content(&result.content)
+    }
+
+    fn maybe_extract_bash_command(args: &Value) -> Option<String> {
+        args.get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn parse_exit_code(result: &ToolOutput, is_error: bool) -> i32 {
+        result
+            .details
+            .as_ref()
+            .and_then(|value| value.get("exitCode"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+            .unwrap_or_else(|| i32::from(is_error))
+    }
+
+    fn flatten_text_content(content: &[ContentBlock]) -> String {
+        let mut out = String::new();
+        for block in content {
+            if let ContentBlock::Text(text) = block {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&text.text);
+            }
+        }
+        out
+    }
+
+    fn is_verify_command(command: &str) -> bool {
+        const PREFIXES: &[&str] = &[
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "cargo nextest",
+            "pytest",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "go test",
+        ];
+        let normalized = command.trim().to_ascii_lowercase();
+        PREFIXES.iter().any(|prefix| normalized.starts_with(prefix))
     }
 }
 
@@ -2116,7 +2826,9 @@ mod message_queue_tests {
 mod extensions_integration_tests {
     use super::*;
 
+    use crate::extensions::{ExecMediationPolicy, SecurityAlertCategory, SecurityAlertSeverity};
     use crate::session::Session;
+    use crate::tools::BashTool;
     use asupersync::runtime::RuntimeBuilder;
     use async_trait::async_trait;
     use futures::Stream;
@@ -2623,11 +3335,8 @@ mod extensions_integration_tests {
                 .await
                 .expect("run_text");
 
-            // With parallel tool execution, all tool functions run concurrently,
-            // so both tools execute (calls == 2). The steering message causes
-            // the second tool's result to be replaced with a "Skipped" placeholder
-            // in the conversation, preserving the steering interrupt semantics.
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            // Steering interrupts outstanding tool execution for this turn.
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -2960,6 +3669,142 @@ mod extensions_integration_tests {
             if let [ContentBlock::Text(text)] = output.content.as_slice() {
                 assert_eq!(text.text, "Tool execution blocked: blocked bash in test");
             }
+        });
+    }
+
+    #[test]
+    fn built_in_bash_denials_are_persisted_to_exec_mediation_and_alert_ledgers() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::from_tools(vec![Box::new(BashTool::with_shell_and_policy(
+                temp_dir.path(),
+                None,
+                None,
+                ExecMediationPolicy::default(),
+                true,
+                ReliabilityEnforcementMode::Hard,
+            ))]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({ "command": "rm -rf /" }),
+                thought_signature: None,
+            };
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session.agent.execute_tool(tool_call, on_event).await;
+            assert!(is_error);
+            assert!(output.is_error);
+
+            let manager = agent_session
+                .agent
+                .extensions
+                .clone()
+                .expect("extensions manager");
+            let exec_artifact = manager.exec_mediation_artifact();
+            assert_eq!(exec_artifact.entry_count, 1);
+            let exec_entry = exec_artifact.entries.last().expect("exec mediation entry");
+            assert_eq!(exec_entry.extension_id.as_deref(), Some("builtin:bash"));
+            assert_eq!(exec_entry.decision, "deny");
+            assert!(
+                matches!(
+                    exec_entry.command_class.as_deref(),
+                    Some("blocklisted" | "recursive_delete")
+                ),
+                "expected destructive command class, got {:?}",
+                exec_entry.command_class
+            );
+
+            let alerts = manager.security_alert_artifact();
+            let deny_alert = alerts
+                .alerts
+                .iter()
+                .find(|alert| {
+                    alert.extension_id == "builtin:bash"
+                        && alert.category == SecurityAlertCategory::ExecMediation
+                })
+                .expect("deny alert");
+            assert_eq!(deny_alert.severity, SecurityAlertSeverity::Error);
+            assert_eq!(deny_alert.policy_source, "builtin_bash_exec_mediation");
+        });
+    }
+
+    #[test]
+    fn built_in_bash_audits_are_persisted_to_exec_mediation_and_alert_ledgers() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::from_tools(vec![Box::new(BashTool::with_shell_and_policy(
+                temp_dir.path(),
+                None,
+                None,
+                ExecMediationPolicy::default(),
+                true,
+                ReliabilityEnforcementMode::Observe,
+            ))]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({ "command": "chmod 777 ./__pi_missing_target__" }),
+                thought_signature: None,
+            };
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (_output, _is_error) = agent_session.agent.execute_tool(tool_call, on_event).await;
+
+            let manager = agent_session
+                .agent
+                .extensions
+                .clone()
+                .expect("extensions manager");
+            let exec_artifact = manager.exec_mediation_artifact();
+            assert_eq!(exec_artifact.entry_count, 1);
+            let exec_entry = exec_artifact.entries.last().expect("exec mediation entry");
+            assert_eq!(exec_entry.extension_id.as_deref(), Some("builtin:bash"));
+            assert_eq!(exec_entry.decision, "allow_with_audit");
+            assert_eq!(
+                exec_entry.command_class.as_deref(),
+                Some("permission_escalation")
+            );
+
+            let alerts = manager.security_alert_artifact();
+            let audit_alert = alerts
+                .alerts
+                .iter()
+                .find(|alert| {
+                    alert.extension_id == "builtin:bash"
+                        && alert.category == SecurityAlertCategory::ExecMediation
+                })
+                .expect("audit alert");
+            assert_eq!(audit_alert.severity, SecurityAlertSeverity::Info);
+            assert_eq!(audit_alert.policy_source, "builtin_bash_exec_mediation");
         });
     }
 
@@ -4318,6 +5163,9 @@ impl AgentSession {
             agent,
             session,
             save_enabled,
+            retry_settings: RetrySettings::default(),
+            reliability_enabled: false,
+            reliability_enforcement_mode: ReliabilityEnforcementMode::Observe,
             extensions: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
             compaction_settings,
@@ -4325,6 +5173,56 @@ impl AgentSession {
             model_registry: None,
             auth_storage: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_reliability_enabled(mut self, enabled: bool) -> Self {
+        self.reliability_enabled = enabled;
+        self
+    }
+
+    pub const fn set_reliability_enabled(&mut self, enabled: bool) {
+        self.reliability_enabled = enabled;
+    }
+
+    pub const fn reliability_enabled(&self) -> bool {
+        self.reliability_enabled
+    }
+
+    #[must_use]
+    pub const fn with_reliability_mode(mut self, mode: ReliabilityEnforcementMode) -> Self {
+        self.reliability_enforcement_mode = mode;
+        self
+    }
+
+    pub const fn set_reliability_mode(&mut self, mode: ReliabilityEnforcementMode) {
+        self.reliability_enforcement_mode = mode;
+    }
+
+    pub const fn reliability_mode(&self) -> ReliabilityEnforcementMode {
+        self.reliability_enforcement_mode
+    }
+
+    pub const fn save_enabled(&self) -> bool {
+        self.save_enabled
+    }
+
+    #[must_use]
+    pub fn with_retry_settings(mut self, retry_settings: RetrySettings) -> Self {
+        self.retry_settings = retry_settings;
+        self
+    }
+
+    pub fn set_retry_settings(&mut self, retry_settings: RetrySettings) {
+        self.retry_settings = retry_settings;
+    }
+
+    pub const fn retry_settings(&self) -> &RetrySettings {
+        &self.retry_settings
+    }
+
+    pub const fn compaction_settings(&self) -> &ResolvedCompactionSettings {
+        &self.compaction_settings
     }
 
     #[must_use]
@@ -4383,17 +5281,17 @@ impl AgentSession {
 
         self.auth_storage
             .as_ref()
-            .and_then(|auth| normalize(auth.resolve_api_key(&entry.model.provider, None)))
+            .and_then(|auth| {
+                normalize(auth.resolve_api_key_for_model(
+                    &entry.model.provider,
+                    Some(&entry.model.id),
+                    None,
+                ))
+            })
             .or_else(|| normalize(entry.api_key.clone()))
     }
 
     fn apply_session_model_selection(&mut self, provider_id: &str, model_id: &str) {
-        if self.agent.provider().name() == provider_id
-            && self.agent.provider().model_id() == model_id
-        {
-            return;
-        }
-
         let Some(registry) = &self.model_registry else {
             return;
         };
@@ -4403,33 +5301,476 @@ impl AgentSession {
             return;
         };
 
-        match crate::providers::create_provider(
-            &entry,
-            self.extensions.as_ref().map(ExtensionRegion::manager),
-        ) {
-            Ok(provider) => {
-                tracing::info!("Updating agent provider to {provider_id}/{model_id}");
-                self.agent.set_provider(provider);
+        let provider_already_selected = self.agent.provider().name() == provider_id
+            && self.agent.provider().model_id() == model_id;
 
-                let resolved_key = self.resolve_stream_api_key_for_model(&entry);
-                if resolved_key.is_none() {
-                    tracing::warn!(
-                        "No API key resolved for session model {provider_id}/{model_id}; clearing stream API key"
-                    );
+        if !provider_already_selected {
+            match crate::providers::create_provider(
+                &entry,
+                self.extensions.as_ref().map(ExtensionRegion::manager),
+            ) {
+                Ok(provider) => {
+                    tracing::info!("Updating agent provider to {provider_id}/{model_id}");
+                    self.agent.set_provider(provider);
                 }
-
-                let stream_options = self.agent.stream_options_mut();
-                stream_options.api_key = resolved_key;
-                stream_options.headers.clone_from(&entry.headers);
+                Err(e) => {
+                    tracing::warn!("Failed to create provider for session model: {e}");
+                    return;
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to create provider for session model: {e}");
+        }
+
+        let resolved_key = self.resolve_stream_api_key_for_model(&entry);
+        if resolved_key.is_none() {
+            tracing::warn!(
+                "No API key resolved for session model {provider_id}/{model_id}; clearing stream API key"
+            );
+        }
+
+        let stream_options = self.agent.stream_options_mut();
+        stream_options.api_key = resolved_key;
+        stream_options.headers.clone_from(&entry.headers);
+    }
+
+    fn oauth_runtime_context(&self) -> Option<(String, String)> {
+        let provider = self.agent.provider().name().trim().to_string();
+        if provider.is_empty() {
+            return None;
+        }
+        let api_key = self
+            .agent
+            .stream_options()
+            .api_key
+            .as_ref()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())?;
+        Some((provider, api_key))
+    }
+
+    async fn record_oauth_runtime_outcome(
+        &mut self,
+        context: Option<(String, String)>,
+        result: &Result<AssistantMessage>,
+    ) {
+        let Some((provider, api_key)) = context else {
+            return;
+        };
+        let Some(auth) = self.auth_storage.as_mut() else {
+            return;
+        };
+
+        match result {
+            Ok(message)
+                if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) =>
+            {
+                auth.record_oauth_runtime_outcome(
+                    provider.as_str(),
+                    Some(api_key.as_str()),
+                    crate::auth::OAuthRuntimeOutcome::Success,
+                    None,
+                );
+            }
+            Ok(message) => {
+                let failure_reason =
+                    message
+                        .error_message
+                        .as_deref()
+                        .unwrap_or(match message.stop_reason {
+                            StopReason::Error => "assistant returned stop_reason=error",
+                            StopReason::Aborted => "assistant returned stop_reason=aborted",
+                            _ => "assistant request failed",
+                        });
+                auth.record_oauth_runtime_outcome(
+                    provider.as_str(),
+                    Some(api_key.as_str()),
+                    crate::auth::OAuthRuntimeOutcome::Failure,
+                    Some(failure_reason),
+                );
+            }
+            Err(error) => {
+                auth.record_oauth_runtime_outcome(
+                    provider.as_str(),
+                    Some(api_key.as_str()),
+                    crate::auth::OAuthRuntimeOutcome::Failure,
+                    Some(&error.to_string()),
+                );
+            }
+        }
+
+        if let Err(error) = auth.save_async().await {
+            tracing::warn!("Failed to persist OAuth runtime health state: {error}");
+        }
+    }
+
+    fn reliability_task_id() -> String {
+        format!("agent-turn-{}", Utc::now().timestamp_millis())
+    }
+
+    fn reliability_objective(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return "Agent turn".to_string();
+        }
+
+        let mut out = String::new();
+        for ch in trimmed.chars().take(RELIABILITY_OBJECTIVE_MAX_CHARS) {
+            out.push(ch);
+        }
+        if trimmed.chars().count() > RELIABILITY_OBJECTIVE_MAX_CHARS {
+            out.push_str("...");
+        }
+        out
+    }
+
+    fn reliability_artifact_store() -> Option<Arc<FsArtifactStore>> {
+        let artifacts_root = Config::global_dir().join("reliability").join("artifacts");
+        match FsArtifactStore::new(artifacts_root) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to initialize reliability artifact store for agent trace capture: {err}"
+                );
+                None
             }
         }
     }
 
-    pub const fn save_enabled(&self) -> bool {
-        self.save_enabled
+    fn collect_changed_test_paths() -> Vec<std::path::PathBuf> {
+        let output = std::process::Command::new("git")
+            .args(["diff", "--name-only", "--diff-filter=ACMR"])
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "rs")
+                    && (path.to_string_lossy().contains("test") || path.starts_with("tests"))
+            })
+            .collect()
+    }
+
+    fn collect_completion_evidence(snapshot: &ReliabilityTraceSnapshot) -> Vec<Evidence> {
+        let mut collector = EvidenceCollector::with_auto_collect(false);
+
+        for record in &snapshot.evidence {
+            let summary = format!(
+                "command='{}' exit={} stdout_hash={:?} stderr_hash={:?}",
+                record.command, record.exit_code, record.stdout_hash, record.stderr_hash
+            );
+            let test_evidence = Evidence::TestOutput {
+                passed: usize::from(record.exit_code == 0),
+                failed: usize::from(record.exit_code != 0),
+                output: summary,
+            };
+            collector.add(test_evidence);
+        }
+
+        if let Ok(git_evidence) = collector.collect_git_evidence() {
+            collector.add(git_evidence);
+        }
+
+        collector.into_evidence()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn append_reliability_trace_entries(
+        &self,
+        snapshot: ReliabilityTraceSnapshot,
+        result: &Result<AssistantMessage>,
+    ) -> Result<()> {
+        if !self.reliability_enabled {
+            return Ok(());
+        }
+
+        let (outcome, outcome_kind) = match result {
+            Ok(message) => match message.stop_reason {
+                StopReason::Stop => (
+                    "Completed assistant stop".to_string(),
+                    CloseOutcomeKind::Success,
+                ),
+                StopReason::Length => (
+                    "Completed assistant length-capped response".to_string(),
+                    CloseOutcomeKind::Success,
+                ),
+                StopReason::ToolUse => (
+                    "Completed assistant tool request dispatch".to_string(),
+                    CloseOutcomeKind::Success,
+                ),
+                StopReason::Error => (
+                    "failed: assistant returned error stop reason".to_string(),
+                    CloseOutcomeKind::Failure,
+                ),
+                StopReason::Aborted => (
+                    "failed: assistant run was aborted".to_string(),
+                    CloseOutcomeKind::Failure,
+                ),
+            },
+            Err(err) => (
+                format!("failed: agent run returned error: {err}"),
+                CloseOutcomeKind::Failure,
+            ),
+        };
+
+        let completion_evidence = Self::collect_completion_evidence(&snapshot);
+        let mut task_events = snapshot.task_events.clone();
+        if !snapshot.evidence.is_empty() {
+            task_events.append(
+                TaskEventKind::VerificationStarted,
+                Some("agent".to_string()),
+            );
+        }
+
+        let evidence_ids = snapshot
+            .evidence
+            .iter()
+            .map(|record| record.evidence_id.clone())
+            .collect::<Vec<_>>();
+
+        let close_payload = ClosePayload {
+            task_id: snapshot.task_id.clone(),
+            outcome: outcome.clone(),
+            outcome_kind: Some(outcome_kind),
+            acceptance_ids: vec!["agent:turn_complete".to_string()],
+            evidence_ids,
+            trace_parent: Some(
+                self.agent
+                    .stream_options()
+                    .session_id
+                    .clone()
+                    .filter(|session_id| !session_id.trim().is_empty())
+                    .unwrap_or_else(|| format!("session:{}", snapshot.task_id)),
+            ),
+        };
+        let phase_violations = snapshot.phase_violations.clone();
+        let mut close_result = match CloseResult::evaluate(&close_payload, &snapshot.evidence, true)
+        {
+            Ok(result) => result,
+            Err(err) => CloseResult {
+                approved: false,
+                violations: vec![err.to_string()],
+            },
+        };
+        if !phase_violations.is_empty() {
+            close_result.approved = false;
+            close_result.violations.extend(phase_violations.clone());
+        }
+
+        if matches!(outcome_kind, CloseOutcomeKind::Success) {
+            let evidence_gate = EvidenceGate::required();
+            let evidence_result = evidence_gate.check_evidence(&completion_evidence);
+            if evidence_result.is_fail() {
+                close_result.approved = false;
+                close_result
+                    .violations
+                    .push(evidence_result.message().to_string());
+            }
+        }
+
+        let changed_test_paths = Self::collect_changed_test_paths();
+        if !changed_test_paths.is_empty() {
+            let test_quality_gate = TestQualityGate::new(changed_test_paths);
+            match StateCompletionGate::check(&test_quality_gate) {
+                Ok(gate_result) if gate_result.is_fail() => {
+                    close_result.approved = false;
+                    close_result
+                        .violations
+                        .push(gate_result.message().to_string());
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    close_result.approved = false;
+                    close_result
+                        .violations
+                        .push(format!("test quality gate error: {err}"));
+                }
+            }
+        }
+
+        let mut digest = StateDigest::new(
+            snapshot.objective.clone(),
+            if close_result.approved {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+        digest.recent_actions.push(format!(
+            "execute_seen={}",
+            if snapshot.saw_execute {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+        digest
+            .recent_actions
+            .push(format!("evidence_count={}", snapshot.evidence.len()));
+        digest
+            .recent_actions
+            .push(format!("phase_violation_count={}", phase_violations.len()));
+        digest.recent_actions.push(format!(
+            "stuck_pattern_count={}",
+            snapshot.stuck_patterns.len()
+        ));
+        if let Some(summary) = &snapshot.discovery_summary {
+            digest
+                .recent_actions
+                .push(format!("discovery_total={}", summary.total));
+            digest
+                .recent_actions
+                .push(format!("discovery_unaddressed={}", summary.unaddressed));
+            if summary.has_blocking() {
+                close_result.approved = false;
+                close_result.violations.push(format!(
+                    "blocking discoveries present: {}",
+                    summary.must_address_unaddressed
+                ));
+            }
+        }
+        if close_result.approved {
+            digest.next_action = Some("Proceed to next task".to_string());
+        } else {
+            digest.blockers = close_result.violations.clone();
+            digest.next_action = Some("Collect verification evidence and retry".to_string());
+        }
+
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+
+        session.append_task_created_entry(
+            snapshot.task_id.clone(),
+            snapshot.objective,
+            Some("agent".to_string()),
+        );
+
+        session.append_task_transition_entry(
+            snapshot.task_id.clone(),
+            None,
+            "discover".to_string(),
+            None,
+        );
+        session.append_task_transition_entry(
+            snapshot.task_id.clone(),
+            Some("discover".to_string()),
+            "plan".to_string(),
+            None,
+        );
+
+        let mut previous = "plan".to_string();
+        if snapshot.saw_execute {
+            session.append_task_transition_entry(
+                snapshot.task_id.clone(),
+                Some(previous.clone()),
+                "execute".to_string(),
+                None,
+            );
+            previous = "execute".to_string();
+        }
+        if !snapshot.evidence.is_empty() {
+            session.append_task_transition_entry(
+                snapshot.task_id.clone(),
+                Some(previous.clone()),
+                "verify".to_string(),
+                Some(json!({
+                    "evidenceCount": snapshot.evidence.len(),
+                    "phaseViolationCount": phase_violations.len(),
+                })),
+            );
+            previous = "verify".to_string();
+        }
+
+        if !snapshot.discoveries.is_empty() {
+            session.append_custom_entry(
+                "reliability_discoveries".to_string(),
+                Some(json!({
+                    "taskId": snapshot.task_id.clone(),
+                    "discoveries": snapshot.discoveries.clone(),
+                    "summary": snapshot.discovery_summary.clone(),
+                })),
+            );
+        }
+
+        for evidence in snapshot.evidence {
+            session.append_verification_evidence_entry(evidence);
+        }
+
+        let completion_task_result = if close_result.approved {
+            TaskResult::Success
+        } else {
+            TaskResult::Failed {
+                reason: close_result.violations.join("; "),
+            }
+        };
+        task_events.append(
+            TaskEventKind::Completed {
+                result: completion_task_result,
+                reason: outcome.clone(),
+                evidence: completion_evidence,
+            },
+            Some("agent".to_string()),
+        );
+        session.append_custom_entry(
+            "task_event_log".to_string(),
+            Some(json!({
+                "taskId": snapshot.task_id.clone(),
+                "events": task_events,
+            })),
+        );
+
+        session.append_close_decision_entry(close_payload, close_result.clone());
+        session.append_task_transition_entry(
+            snapshot.task_id.clone(),
+            Some(previous),
+            "close".to_string(),
+            Some(json!({
+                "approved": close_result.approved,
+                "violations": close_result.violations,
+                "outcome": outcome,
+                "phaseViolations": phase_violations,
+            })),
+        );
+        session.append_state_digest_entry(digest);
+
+        if self.save_enabled {
+            session
+                .flush_autosave(AutosaveFlushTrigger::Periodic)
+                .await?;
+        }
+
+        if matches!(
+            self.reliability_enforcement_mode,
+            ReliabilityEnforcementMode::Hard
+        ) {
+            if !snapshot.phase_violations.is_empty() {
+                return Err(Error::validation(format!(
+                    "reliability phase gates failed: {}",
+                    snapshot.phase_violations.join("; ")
+                )));
+            }
+            if !close_result.approved {
+                return Err(Error::validation(format!(
+                    "reliability completion gates failed: {}",
+                    close_result.violations.join("; ")
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Force-run compaction synchronously (used by `/compact` slash command).
@@ -4930,12 +6271,15 @@ impl AgentSession {
         };
 
         self.dispatch_before_agent_start().await;
+        let on_event: AgentEventHandler = Arc::new(on_event);
 
         if images.is_empty() {
-            self.run_agent_with_text(text, abort, on_event).await
+            self.run_with_retry(RetryInput::Text(text), abort, on_event)
+                .await
         } else {
             let content = Self::build_content_blocks_for_input(&text, &images);
-            self.run_agent_with_content(content, abort, on_event).await
+            self.run_with_retry(RetryInput::Content(content), abort, on_event)
+                .await
         }
     }
 
@@ -4965,10 +6309,257 @@ impl AgentSession {
         };
 
         self.dispatch_before_agent_start().await;
+        let on_event: AgentEventHandler = Arc::new(on_event);
 
         let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
-        self.run_agent_with_content(content_for_agent, abort, on_event)
+        self.run_with_retry(RetryInput::Content(content_for_agent), abort, on_event)
             .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_with_retry(
+        &mut self,
+        input: RetryInput,
+        abort: Option<AbortSignal>,
+        on_event: AgentEventHandler,
+    ) -> Result<AssistantMessage> {
+        let max_attempts = self.retry_settings.max_retries.unwrap_or(3).max(1) as usize;
+        let retry_enabled = self.retry_settings.is_enabled() && max_attempts > 1;
+        if !retry_enabled {
+            return self.run_single_attempt(input, abort, on_event).await;
+        }
+
+        let mut retry_agent = RetryAgent::new(RetryConfig {
+            max_attempts,
+            score_threshold: 0.7,
+            best_of_n: true,
+        });
+        if let Some(token_budget) = self.retry_settings.token_budget {
+            retry_agent = retry_agent.with_token_budget(token_budget);
+        }
+
+        let mut reviewer = ReviewerScorer::new();
+        if let Some(model) = self.retry_settings.reviewer_model.clone() {
+            reviewer = reviewer.with_model(model);
+        }
+        if let Some(token_budget) = self.retry_settings.token_budget {
+            reviewer = reviewer.with_token_budget(token_budget);
+        }
+
+        let baseline = self.capture_retry_snapshot().await?;
+        let original_save_enabled = self.save_enabled;
+        self.save_enabled = false;
+
+        let mut outcomes: Vec<RetryExecutionOutcome> = Vec::new();
+        let mut attempt_index = 0usize;
+
+        while attempt_index < max_attempts && retry_agent.check_token_budget() {
+            if let Some(abort) = &abort {
+                if abort.is_aborted() {
+                    break;
+                }
+            }
+
+            attempt_index += 1;
+            self.restore_retry_snapshot(&baseline).await?;
+
+            if attempt_index > 1 {
+                on_event(AgentEvent::AutoRetryStart {
+                    attempt: u32::try_from(attempt_index.saturating_sub(1)).unwrap_or(u32::MAX),
+                    max_attempts: u32::try_from(max_attempts).unwrap_or(u32::MAX),
+                    delay_ms: 0,
+                    error_message: "running additional attempt for best-of-N selection".to_string(),
+                });
+            }
+
+            let started = Instant::now();
+            let result = self
+                .run_single_attempt(input.clone(), abort.clone(), Arc::clone(&on_event))
+                .await;
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let snapshot = self.capture_retry_snapshot().await?;
+
+            let verification = if Self::result_is_success(&result) {
+                VerificationOutcome::Passed
+            } else {
+                VerificationOutcome::Failed
+            };
+            let token_usage = result
+                .as_ref()
+                .ok()
+                .map(|message| TokenUsage::new(message.usage.input, message.usage.output));
+
+            let mut attempt = Attempt::from_patch(Self::attempt_patch(&result))
+                .with_verification(verification)
+                .with_stats(0, 0, 0)
+                .with_notes(format!("attempt {attempt_index}/{max_attempts}"));
+            if let Some(tokens) = token_usage.clone() {
+                attempt = attempt.with_token_usage(tokens);
+            }
+            if let Some(err) = Self::result_error(&result) {
+                attempt = attempt.with_error(err);
+            }
+
+            let submission = ReviewSubmission {
+                attempt_id: attempt.id.clone(),
+                trajectory: vec![
+                    format!("attempt_index={attempt_index}"),
+                    format!(
+                        "result={}",
+                        if Self::result_is_success(&result) {
+                            "success"
+                        } else {
+                            "failure"
+                        }
+                    ),
+                ],
+                stats: AttemptStats {
+                    files_changed: 0,
+                    lines_added: 0,
+                    lines_removed: 0,
+                    tests_passed: usize::from(verification == VerificationOutcome::Passed),
+                    tests_failed: usize::from(verification == VerificationOutcome::Failed),
+                    duration_ms,
+                },
+                token_usage,
+            };
+            let review_score = reviewer.score(&submission) / 100.0;
+            attempt = attempt.with_score(review_score.clamp(0.0, 1.0));
+            let attempt_id = attempt.id.clone();
+            retry_agent.record_attempt(attempt);
+
+            outcomes.push(RetryExecutionOutcome {
+                attempt_id,
+                snapshot,
+                result,
+            });
+
+            if !retry_agent.can_retry() {
+                break;
+            }
+        }
+
+        if outcomes.is_empty() {
+            self.save_enabled = original_save_enabled;
+            return Err(Error::validation(
+                "retry enabled but no attempts were executed",
+            ));
+        }
+
+        let selected_id = retry_agent.final_result().map(|attempt| attempt.id.clone());
+        let selected_index = selected_id
+            .as_ref()
+            .and_then(|attempt_id| {
+                outcomes
+                    .iter()
+                    .position(|candidate| &candidate.attempt_id == attempt_id)
+            })
+            .unwrap_or(outcomes.len() - 1);
+
+        let selected = outcomes.swap_remove(selected_index);
+        let success = Self::result_is_success(&selected.result);
+        let final_error = if success {
+            None
+        } else {
+            Self::result_error(&selected.result)
+        };
+
+        self.restore_retry_snapshot(&selected.snapshot).await?;
+        self.save_enabled = original_save_enabled;
+        if self.save_enabled {
+            self.persist_session().await?;
+        }
+
+        if attempt_index > 1 {
+            on_event(AgentEvent::AutoRetryEnd {
+                success,
+                attempt: u32::try_from(attempt_index.saturating_sub(1)).unwrap_or(u32::MAX),
+                final_error,
+            });
+        }
+
+        selected.result
+    }
+
+    async fn run_single_attempt(
+        &mut self,
+        input: RetryInput,
+        abort: Option<AbortSignal>,
+        on_event: AgentEventHandler,
+    ) -> Result<AssistantMessage> {
+        match input {
+            RetryInput::Text(text) => {
+                let handler = Arc::clone(&on_event);
+                self.run_agent_with_text(text, abort, move |event| handler(event))
+                    .await
+            }
+            RetryInput::Content(content) => {
+                let handler = Arc::clone(&on_event);
+                self.run_agent_with_content(content, abort, move |event| handler(event))
+                    .await
+            }
+        }
+    }
+
+    async fn capture_retry_snapshot(&self) -> Result<RetryExecutionSnapshot> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(RetryExecutionSnapshot {
+            session: session.clone(),
+            agent_messages: self.agent.messages().to_vec(),
+        })
+    }
+
+    async fn restore_retry_snapshot(&mut self, snapshot: &RetryExecutionSnapshot) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        *session = snapshot.session.clone();
+        self.agent.replace_messages(snapshot.agent_messages.clone());
+        Ok(())
+    }
+
+    fn result_is_success(result: &Result<AssistantMessage>) -> bool {
+        result.as_ref().is_ok_and(|message| {
+            !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        })
+    }
+
+    fn result_error(result: &Result<AssistantMessage>) -> Option<String> {
+        match result {
+            Ok(message)
+                if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) =>
+            {
+                message
+                    .error_message
+                    .clone()
+                    .or_else(|| Some("assistant returned an error stop reason".to_string()))
+            }
+            Ok(_) => None,
+            Err(err) => Some(err.to_string()),
+        }
+    }
+
+    fn attempt_patch(result: &Result<AssistantMessage>) -> String {
+        match result {
+            Ok(message) => message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(err) => format!("attempt failed: {err}"),
+        }
     }
 
     async fn dispatch_input_event(
@@ -5042,6 +6633,7 @@ impl AgentSession {
         content
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run_agent_with_text(
         &mut self,
         input: String,
@@ -5065,6 +6657,7 @@ impl AgentSession {
         if let (Some(provider_id), Some(model_id)) = session_model {
             self.apply_session_model_selection(provider_id.as_str(), model_id.as_str());
         }
+        let oauth_context = self.oauth_runtime_context();
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
         let history = {
@@ -5079,6 +6672,17 @@ impl AgentSession {
         self.agent.replace_messages(history);
 
         let start_len = self.agent.messages().len();
+        let reliability_objective = Self::reliability_objective(&input);
+        let reliability_artifact_store = self
+            .reliability_enabled
+            .then(Self::reliability_artifact_store)
+            .flatten();
+        if self.reliability_enabled {
+            self.agent
+                .set_scope_objective(Some(reliability_objective.clone()));
+        } else {
+            self.agent.clear_scope_objective();
+        }
 
         // Create and persist user message immediately to avoid data loss on API errors
         let user_message = Message::User(UserMessage {
@@ -5099,21 +6703,61 @@ impl AgentSession {
             }
         }
 
+        let reliability_capture = self.reliability_enabled.then(|| {
+            Arc::new(StdMutex::new(ReliabilityTraceCapture::new(
+                Self::reliability_task_id(),
+                reliability_objective,
+                Some(format!(
+                    "{}/{}",
+                    self.agent.provider().name(),
+                    self.agent.provider().model_id()
+                )),
+                reliability_artifact_store.clone(),
+            )))
+        });
+
         self.extensions_is_streaming.store(true, Ordering::SeqCst);
         let on_event_for_run = Arc::clone(&on_event);
+        let capture_for_run = reliability_capture.clone();
         let result = self
             .agent
             .run_with_message_with_abort(user_message, abort, move |event| {
+                if let Some(capture) = &capture_for_run {
+                    if let Ok(mut guard) = capture.lock() {
+                        guard.observe_event(&event);
+                    }
+                }
                 on_event_for_run(event);
             })
             .await;
+        self.agent.clear_scope_objective();
         self.extensions_is_streaming.store(false, Ordering::SeqCst);
+        self.record_oauth_runtime_outcome(oauth_context, &result)
+            .await;
+        if let Some(capture) = reliability_capture {
+            let snapshot = capture.lock().ok().map(|guard| guard.snapshot());
+            if let Some(snapshot) = snapshot {
+                if let Err(err) = self
+                    .append_reliability_trace_entries(snapshot, &result)
+                    .await
+                {
+                    if matches!(
+                        self.reliability_enforcement_mode,
+                        ReliabilityEnforcementMode::Hard
+                    ) {
+                        return Err(err);
+                    }
+                    tracing::warn!("Failed to append reliability trace entries: {err}");
+                }
+            }
+        }
         let result = result?;
         // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
         self.persist_new_messages(start_len + 1).await?;
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run_agent_with_content(
         &mut self,
         content: Vec<ContentBlock>,
@@ -5137,6 +6781,7 @@ impl AgentSession {
         if let (Some(provider_id), Some(model_id)) = session_model {
             self.apply_session_model_selection(provider_id.as_str(), model_id.as_str());
         }
+        let oauth_context = self.oauth_runtime_context();
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
         let history = {
@@ -5151,6 +6796,18 @@ impl AgentSession {
         self.agent.replace_messages(history);
 
         let start_len = self.agent.messages().len();
+        let (objective_text, _) = Self::split_content_blocks_for_input(&content);
+        let reliability_objective = Self::reliability_objective(&objective_text);
+        let reliability_artifact_store = self
+            .reliability_enabled
+            .then(Self::reliability_artifact_store)
+            .flatten();
+        if self.reliability_enabled {
+            self.agent
+                .set_scope_objective(Some(reliability_objective.clone()));
+        } else {
+            self.agent.clear_scope_objective();
+        }
 
         // Create and persist user message immediately to avoid data loss on API errors
         let user_message = Message::User(UserMessage {
@@ -5171,15 +6828,54 @@ impl AgentSession {
             }
         }
 
+        let reliability_capture = self.reliability_enabled.then(|| {
+            Arc::new(StdMutex::new(ReliabilityTraceCapture::new(
+                Self::reliability_task_id(),
+                reliability_objective,
+                Some(format!(
+                    "{}/{}",
+                    self.agent.provider().name(),
+                    self.agent.provider().model_id()
+                )),
+                reliability_artifact_store.clone(),
+            )))
+        });
+
         self.extensions_is_streaming.store(true, Ordering::SeqCst);
         let on_event_for_run = Arc::clone(&on_event);
+        let capture_for_run = reliability_capture.clone();
         let result = self
             .agent
             .run_with_message_with_abort(user_message, abort, move |event| {
+                if let Some(capture) = &capture_for_run {
+                    if let Ok(mut guard) = capture.lock() {
+                        guard.observe_event(&event);
+                    }
+                }
                 on_event_for_run(event);
             })
             .await;
+        self.agent.clear_scope_objective();
         self.extensions_is_streaming.store(false, Ordering::SeqCst);
+        self.record_oauth_runtime_outcome(oauth_context, &result)
+            .await;
+        if let Some(capture) = reliability_capture {
+            let snapshot = capture.lock().ok().map(|guard| guard.snapshot());
+            if let Some(snapshot) = snapshot {
+                if let Err(err) = self
+                    .append_reliability_trace_entries(snapshot, &result)
+                    .await
+                {
+                    if matches!(
+                        self.reliability_enforcement_mode,
+                        ReliabilityEnforcementMode::Hard
+                    ) {
+                        return Err(err);
+                    }
+                    tracing::warn!("Failed to append reliability trace entries: {err}");
+                }
+            }
+        }
         let result = result?;
         // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
         self.persist_new_messages(start_len + 1).await?;
@@ -5357,6 +7053,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthCredential;
     use crate::provider::{InputType, Model, ModelCost};
+    use crate::reliability::{ArtifactQuery, ArtifactStore, FsArtifactStore};
     use async_trait::async_trait;
     use futures::Stream;
     use std::collections::HashMap;
@@ -5479,6 +7176,61 @@ mod tests {
         assert_eq!(config.max_tool_iterations, 50);
         assert!(config.system_prompt.is_none());
         assert!(!config.block_images);
+    }
+
+    #[test]
+    fn scope_guard_blocks_out_of_scope_mutation_for_explicit_objective() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&["write"], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.set_scope_objective(Some("Update src/agent.rs retry handling".to_string()));
+
+        let out_of_scope_call = ToolCall {
+            id: "tc-scope-1".to_string(),
+            name: "write".to_string(),
+            arguments: serde_json::json!({
+                "file_path": "src/main.rs",
+                "content": "fn main() {}",
+            }),
+            thought_signature: None,
+        };
+
+        assert!(agent.should_block_tool_call_for_scope(&out_of_scope_call));
+
+        let output = agent.scope_blocked_tool_output(&out_of_scope_call);
+        assert!(output.is_error);
+        assert_eq!(
+            output
+                .details
+                .as_ref()
+                .and_then(|details| details.get("scopeBlocked"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn scope_guard_does_not_block_broad_objective() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&["write"], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.set_scope_objective(Some("Implement the plan".to_string()));
+
+        let call = ToolCall {
+            id: "tc-scope-2".to_string(),
+            name: "write".to_string(),
+            arguments: serde_json::json!({
+                "file_path": "src/main.rs",
+                "content": "fn main() {}",
+            }),
+            thought_signature: None,
+        };
+
+        assert!(!agent.should_block_tool_call_for_scope(&call));
     }
 
     #[test]
@@ -5769,7 +7521,7 @@ mod tests {
     fn build_switch_test_session(auth: &AuthStorage) -> AgentSession {
         let registry = ModelRegistry::load(auth, None);
         let current_entry = registry
-            .find("anthropic", "claude-sonnet-4-5")
+            .find("anthropic", "claude-sonnet-4-6")
             .expect("anthropic model in registry");
         let provider = crate::providers::create_provider(&current_entry, None)
             .expect("create anthropic provider");
@@ -5805,6 +7557,180 @@ mod tests {
         agent_session.set_model_registry(registry);
         agent_session.set_auth_storage(auth.clone());
         agent_session
+    }
+
+    #[test]
+    fn oauth_pool_outcome() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        runtime.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let expiry = chrono::Utc::now().timestamp_millis() + 60_000;
+
+            let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+            auth.set_login_credential(
+                "openai",
+                AuthCredential::OAuth {
+                    access_token: "pool-token-a".to_string(),
+                    refresh_token: "pool-refresh-a".to_string(),
+                    expires: expiry,
+                    token_url: None,
+                    client_id: None,
+                },
+            );
+            auth.set_login_credential(
+                "openai",
+                AuthCredential::OAuth {
+                    access_token: "pool-token-b".to_string(),
+                    refresh_token: "pool-refresh-b".to_string(),
+                    expires: expiry,
+                    token_url: None,
+                    client_id: None,
+                },
+            );
+            auth.save().expect("save auth");
+
+            let registry = ModelRegistry::load(&auth, None);
+            let openai_entry = registry
+                .find("openai", "gpt-4o")
+                .expect("openai model in registry");
+            let provider =
+                crate::providers::create_provider(&openai_entry, None).expect("create provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    system_prompt: None,
+                    max_tool_iterations: 50,
+                    stream_options: StreamOptions::default(),
+                    block_images: false,
+                },
+            );
+            let mut session = Session::in_memory();
+            session.header.provider = Some("openai".to_string());
+            session.header.model_id = Some("gpt-4o".to_string());
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(session)),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            agent_session.set_model_registry(registry);
+            agent_session.set_auth_storage(auth.clone());
+            agent_session.apply_session_model_selection("openai", "gpt-4o");
+            let selected_token = agent_session
+                .agent
+                .stream_options()
+                .api_key
+                .clone()
+                .expect("selected oauth token");
+
+            let failure_result: Result<AssistantMessage> = Ok(AssistantMessage {
+                content: vec![],
+                api: "test-api".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("rate limit exceeded".to_string()),
+                timestamp: 0,
+            });
+            let failure_context = agent_session.oauth_runtime_context();
+            agent_session
+                .record_oauth_runtime_outcome(failure_context, &failure_result)
+                .await;
+
+            let fallback_token = agent_session
+                .auth_storage
+                .as_ref()
+                .expect("auth storage")
+                .resolve_api_key("openai", None)
+                .expect("resolver fallback token");
+            assert_ne!(
+                fallback_token, selected_token,
+                "resolver should avoid account under cooldown"
+            );
+
+            let persisted = std::fs::read_to_string(&auth_path).expect("read auth");
+            let persisted_json: serde_json::Value =
+                serde_json::from_str(&persisted).expect("parse auth json");
+            let openai_accounts = persisted_json
+                .get("oauth_pools")
+                .and_then(|pools| pools.get("openai"))
+                .and_then(|pool| pool.get("accounts"))
+                .and_then(serde_json::Value::as_object)
+                .expect("openai accounts");
+            let failed_record = openai_accounts
+                .values()
+                .find(|record| {
+                    record
+                        .get("credential")
+                        .and_then(|credential| credential.get("access_token"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(selected_token.as_str())
+                })
+                .expect("failed account record");
+            assert!(
+                failed_record
+                    .get("health")
+                    .and_then(|health| health.get("cooldown_until_ms"))
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "failed account should receive a cooldown marker"
+            );
+
+            agent_session.agent.stream_options_mut().api_key = Some(fallback_token.clone());
+            let success_result: Result<AssistantMessage> = Ok(AssistantMessage {
+                content: vec![],
+                api: "test-api".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            });
+            let success_context = agent_session.oauth_runtime_context();
+            agent_session
+                .record_oauth_runtime_outcome(success_context, &success_result)
+                .await;
+
+            let persisted_after_success =
+                std::fs::read_to_string(&auth_path).expect("read auth after success");
+            let persisted_success_json: serde_json::Value =
+                serde_json::from_str(&persisted_after_success).expect("parse auth json");
+            let success_record = persisted_success_json
+                .get("oauth_pools")
+                .and_then(|pools| pools.get("openai"))
+                .and_then(|pool| pool.get("accounts"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|accounts| {
+                    accounts.values().find(|record| {
+                        record
+                            .get("credential")
+                            .and_then(|credential| credential.get("access_token"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(fallback_token.as_str())
+                    })
+                })
+                .expect("success account record");
+            assert!(
+                success_record
+                    .get("health")
+                    .and_then(|health| health.get("last_success_ms"))
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "success account should record last_success_ms"
+            );
+            assert_eq!(
+                success_record
+                    .get("health")
+                    .and_then(|health| health.get("requires_relogin"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(false),
+            );
+        });
     }
 
     #[test]
@@ -5909,6 +7835,43 @@ mod tests {
     }
 
     #[test]
+    fn apply_session_model_selection_refreshes_key_when_model_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("load auth");
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "anthropic-key-1".to_string(),
+            },
+        );
+
+        let mut agent_session = build_switch_test_session(&auth);
+        agent_session.apply_session_model_selection("anthropic", "claude-sonnet-4-6");
+        assert_eq!(
+            agent_session.agent.stream_options().api_key.as_deref(),
+            Some("anthropic-key-1"),
+            "initial refresh should replace stale stream key even without provider/model change"
+        );
+
+        let mut updated_auth = auth.clone();
+        updated_auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "anthropic-key-2".to_string(),
+            },
+        );
+        agent_session.set_auth_storage(updated_auth);
+        agent_session.apply_session_model_selection("anthropic", "claude-sonnet-4-6");
+
+        assert_eq!(
+            agent_session.agent.stream_options().api_key.as_deref(),
+            Some("anthropic-key-2"),
+            "stream key should refresh on repeated selection when auth changes"
+        );
+    }
+
+    #[test]
     fn auto_compaction_start_serializes_to_pi_mono_format() {
         let event = AgentEvent::AutoCompactionStart {
             reason: "threshold".to_string(),
@@ -5995,5 +7958,152 @@ mod tests {
         assert_eq!(json["success"], false);
         assert_eq!(json["attempt"], 3);
         assert_eq!(json["finalError"], "max retries exceeded");
+    }
+
+    #[test]
+    fn reliability_evidence_artifact_capture() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let artifact_store =
+            Arc::new(FsArtifactStore::new(temp_dir.path()).expect("artifact store"));
+        let mut capture = ReliabilityTraceCapture::new(
+            "task-artifacts".to_string(),
+            "capture verification evidence".to_string(),
+            Some("provider/model".to_string()),
+            Some(artifact_store.clone()),
+        );
+
+        capture.observe_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: json!({
+                "command": "cargo test --lib session::tests::reliability_typed_entries_roundtrip -- --nocapture"
+            }),
+        });
+        capture.observe_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            result: ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("verification ok"))],
+                details: Some(json!({ "exitCode": 0 })),
+                is_error: false,
+            },
+            is_error: false,
+        });
+
+        let snapshot = capture.snapshot();
+        assert_eq!(snapshot.evidence.len(), 1);
+        let evidence = &snapshot.evidence[0];
+        assert_eq!(evidence.task_id, "task-artifacts");
+        assert_eq!(
+            evidence.command,
+            "cargo test --lib session::tests::reliability_typed_entries_roundtrip -- --nocapture"
+        );
+        assert_eq!(evidence.env_id.as_deref(), Some("provider/model"));
+        assert_eq!(evidence.exit_code, 0);
+        assert_eq!(evidence.status, crate::reliability::EvidenceStatus::Passed);
+        assert_eq!(evidence.artifact_ids.len(), 1);
+
+        let mut query = ArtifactQuery::new("task-artifacts");
+        query.kind = Some("stdout".to_string());
+        query.limit = 10;
+        let ids = artifact_store.list(&query).expect("list artifacts");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], evidence.artifact_ids[0]);
+
+        let bytes = artifact_store.load(&ids[0]).expect("load artifact");
+        assert_eq!(String::from_utf8_lossy(&bytes), "verification ok");
+    }
+
+    #[test]
+    fn reliability_phase_gates_enforced() {
+        let mut capture = ReliabilityTraceCapture::new(
+            "task-phase-gates".to_string(),
+            "enforce phase gates".to_string(),
+            Some("provider/model".to_string()),
+            None,
+        );
+
+        capture.observe_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-verify".to_string(),
+            tool_name: "bash".to_string(),
+            args: json!({ "command": "cargo test --lib agent::tests::reliability_phase_gates_enforced -- --nocapture" }),
+        });
+        capture.observe_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-verify".to_string(),
+            tool_name: "bash".to_string(),
+            result: ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("verify output"))],
+                details: Some(json!({ "exitCode": 0 })),
+                is_error: false,
+            },
+            is_error: false,
+        });
+        let snapshot = capture.snapshot();
+        assert!(
+            snapshot
+                .phase_violations
+                .iter()
+                .any(|msg| msg.contains("invalid phase")),
+            "verify without execute must raise phase violation"
+        );
+
+        let stale_submit =
+            capture.validate_submit_fence(&capture.lease_id, capture.fence_token + 1);
+        assert!(stale_submit.is_err(), "stale fence token must be rejected");
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let make_agent_session = |mode| {
+                let agent = Agent::new(
+                    Arc::new(SilentProvider),
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig {
+                        system_prompt: None,
+                        max_tool_iterations: 50,
+                        stream_options: StreamOptions::default(),
+                        block_images: false,
+                    },
+                );
+                AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                )
+                .with_reliability_enabled(true)
+                .with_reliability_mode(mode)
+            };
+
+            let result: Result<AssistantMessage> = Ok(AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            });
+
+            let hard_session = make_agent_session(ReliabilityEnforcementMode::Hard);
+            let hard_outcome = hard_session
+                .append_reliability_trace_entries(snapshot.clone(), &result)
+                .await;
+            assert!(
+                hard_outcome.is_err(),
+                "hard mode must reject phase violations"
+            );
+
+            let soft_session = make_agent_session(ReliabilityEnforcementMode::Soft);
+            let soft_outcome = soft_session
+                .append_reliability_trace_entries(snapshot, &result)
+                .await;
+            assert!(
+                soft_outcome.is_ok(),
+                "soft mode should record phase violations without rejecting"
+            );
+        });
     }
 }
