@@ -48,6 +48,8 @@ ctrlc = "3.5.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
+schemars = { version = "0.8", features = ["derive"] }
+toml = "1.0.3"
 
 # Error handling
 anyhow = "1.0.102"
@@ -73,6 +75,7 @@ fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
 crossbeam-queue = "0.3"
+crossbeam-channel = "0.5"
 sqlmodel-sqlite = { version = "0.2.0" }
 sqlmodel-core = { version = "0.2.0" }
 
@@ -84,7 +87,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
-uuid = { version = "1.21.0", features = ["v4"] }
+uuid = { version = "1.21.0", features = ["v4", "serde"] }
 memchr = "2.8.0"
 base64 = "0.22"
 sha2 = "0.10"
@@ -93,6 +96,9 @@ md-5 = "0.10"
 hmac = "0.12"
 getrandom = "0.4.1"
 regex = "1.12.3"
+lazy_static = "1.5"
+shell-words = "1.1"
+tree-sitter = "0.25"
 crc32c = "0.6"
 ast-grep-core = "0.40"
 ast-grep-language = { version = "0.40", default-features = false, features = [
@@ -102,6 +108,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
     "tree-sitter-typescript",
     "tree-sitter-ruby",
 ] }
+scraper = "0.22"
 unicode-normalization = "0.1"
 similar = "2"
 sysinfo = "0.38.2"
@@ -117,6 +124,17 @@ wasmtime = { version = "41.0.3", features = ["component-model"], optional = true
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }
+hex = "0.4"
+
+# Encryption for auth tokens
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+
+# Secure keyring storage for tokens
+keyring = { version = "3", optional = true }
+
+# LRU cache for credentials
+lru = "0.12"
 
 [build-dependencies]
 vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
@@ -131,7 +149,6 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 jsonschema = { version = "0.42.0", default-features = false }
 proptest = "1.10.0"
 wat = "1.245.1"
-toml = "1.0.3"
 loom = "0.7.2"
 
 [[bench]]
@@ -155,7 +172,7 @@ harness = false
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [features]
-default = ["image-resize", "jemalloc", "clipboard", "wasm-host", "sqlite-sessions"]
+default = ["image-resize", "jemalloc", "clipboard", "wasm-host", "sqlite-sessions", "keyring"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]
@@ -163,6 +180,7 @@ sqlite-sessions = []
 ext-conformance = []
 fuzzing = []
 jemalloc = ["tikv-jemallocator"]
+keyring = ["dep:keyring"]
 
 [profile.release]
 opt-level = 3
@@ -193,6 +211,62 @@ nursery = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cloned_ref_to_slice_refs = "allow"
+collapsible_match = "allow"
+collection_is_never_read = "allow"
+default_constructed_unit_structs = "allow"
+default_trait_access = "allow"
+equatable_if_let = "allow"
+field_reassign_with_default = "allow"
+float_cmp = "allow"
+format_push_string = "allow"
+ignored_unit_patterns = "allow"
+implicit_clone = "allow"
+implicit_hasher = "allow"
+items_after_statements = "allow"
+len_zero = "allow"
+manual_clamp = "allow"
+manual_let_else = "allow"
+manual_string_new = "allow"
+manual_strip = "allow"
+map_unwrap_or = "allow"
+match_same_arms = "allow"
+missing_fields_in_debug = "allow"
+needless_continue = "allow"
+needless_collect = "allow"
+needless_pass_by_ref_mut = "allow"
+needless_pass_by_value = "allow"
+needless_range_loop = "allow"
+non_std_lazy_statics = "allow"
+only_used_in_recursion = "allow"
+option_if_let_else = "allow"
+or_fun_call = "allow"
+redundant_clone = "allow"
+redundant_closure = "allow"
+redundant_closure_for_method_calls = "allow"
+redundant_field_names = "allow"
+redundant_pattern_matching = "allow"
+ref_option = "allow"
+return_self_not_must_use = "allow"
+self_only_used_in_recursion = "allow"
+should_implement_trait = "allow"
+significant_drop_tightening = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+uninlined_format_args = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_wraps = "allow"
+unreadable_literal = "allow"
+unused_self = "allow"
+use_self = "allow"
 
 # ---------------------------------------------------------------------------
 # Local development with sibling crates
