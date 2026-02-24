@@ -1,7 +1,10 @@
 //! Configuration loading and management.
 
+pub mod schema;
+
 use crate::agent::QueueMode;
 use crate::error::{Error, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write as _;
@@ -9,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 /// Main configuration structure.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct Config {
     // Appearance
@@ -114,6 +117,12 @@ pub struct Config {
     // Runtime Risk Controller
     #[serde(alias = "extensionRisk")]
     pub extension_risk: Option<ExtensionRiskConfig>,
+
+    // Reliability hardening controls
+    pub reliability: Option<ReliabilityConfig>,
+
+    // Auth configuration
+    pub auth: Option<AuthConfig>,
 }
 
 /// Extension capability policy configuration.
@@ -131,7 +140,7 @@ pub struct Config {
 ///   }
 /// }
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ExtensionPolicyConfig {
     /// Policy profile: "safe" (default), "balanced", or "permissive".
@@ -145,7 +154,7 @@ pub struct ExtensionPolicyConfig {
 /// Repair policy configuration.
 ///
 /// Controls how the agent handles broken or incompatible extensions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct RepairPolicyConfig {
     /// Repair mode: "off", "suggest" (default), "auto-safe", "auto-strict".
@@ -155,7 +164,7 @@ pub struct RepairPolicyConfig {
 /// Runtime risk controller configuration for extension hostcalls.
 ///
 /// Deterministic, non-LLM controls for dynamic hardening/denial decisions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ExtensionRiskConfig {
     /// Enable runtime risk controller.
@@ -178,6 +187,84 @@ pub struct ExtensionRiskConfig {
     /// mode (score-only, no blocking).  Defaults to `true` when risk is
     /// enabled.
     pub enforce: Option<bool>,
+}
+
+/// Reliability hardening configuration for execution safety checks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ReliabilityConfig {
+    /// Master switch for reliability checks and typed phase guards.
+    pub enabled: Option<bool>,
+    /// Enforcement mode for reliability checks.
+    #[serde(alias = "enforcementMode")]
+    pub enforcement_mode: Option<ReliabilityEnforcementMode>,
+    /// Require command evidence before allowing close.
+    #[serde(alias = "requireEvidenceForClose")]
+    pub require_evidence_for_close: Option<bool>,
+    /// Maximum touched files allowed for an atomic task.
+    #[serde(alias = "maxTouchedFiles")]
+    pub max_touched_files: Option<u16>,
+    /// Default maximum attempts used for new task contracts.
+    #[serde(alias = "defaultMaxAttempts")]
+    pub default_max_attempts: Option<u8>,
+    /// Allow open-ended defer states. Defaults to false.
+    #[serde(alias = "allowOpenEndedDefer")]
+    pub allow_open_ended_defer: Option<bool>,
+    /// Default verification timeout in seconds.
+    #[serde(alias = "verifyTimeoutSecDefault")]
+    pub verify_timeout_sec_default: Option<u32>,
+    /// Optional lease provider mode ("local" default, "external" for pluggable providers).
+    #[serde(alias = "leaseProvider")]
+    pub lease_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReliabilityEnforcementMode {
+    #[default]
+    Observe,
+    Soft,
+    Hard,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Auth configuration for refresh and cache settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Background refresh worker settings.
+    pub refresh: Option<AuthRefreshConfig>,
+    /// Credential cache settings.
+    pub cache: Option<AuthCacheConfig>,
+}
+
+/// Background refresh worker configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AuthRefreshConfig {
+    /// How many seconds before token expiry to trigger refresh (default: 600).
+    #[serde(alias = "leadTimeSecs")]
+    pub lead_time_secs: Option<u64>,
+    /// How often to check for tokens needing refresh (default: 60).
+    #[serde(alias = "checkIntervalSecs")]
+    pub check_interval_secs: Option<u64>,
+    /// Maximum concurrent refresh operations (default: 5).
+    #[serde(alias = "maxConcurrency")]
+    pub max_concurrency: Option<usize>,
+}
+
+/// Credential cache configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AuthCacheConfig {
+    /// Enable credential caching.
+    pub enabled: Option<bool>,
+    /// Cache TTL in seconds (default: 300).
+    #[serde(alias = "ttlSecs")]
+    pub ttl_secs: Option<u64>,
 }
 
 /// Resolved extension policy plus explainability metadata.
@@ -218,7 +305,7 @@ pub struct ResolvedExtensionRisk {
     pub settings: crate::extensions::RuntimeRiskConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
@@ -228,26 +315,46 @@ pub struct CompactionSettings {
     pub keep_recent_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct BranchSummarySettings {
     #[serde(alias = "reserveTokens")]
     pub reserve_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct RetrySettings {
+    /// Enable retry (DEFAULT: false - opt-in only).
     pub enabled: Option<bool>,
-    #[serde(alias = "maxRetries")]
+    /// Maximum retry attempts.
+    #[serde(alias = "maxRetries", alias = "maxAttempts")]
     pub max_retries: Option<u32>,
+    /// Model to use for reviewing attempts.
+    #[serde(alias = "reviewerModel")]
+    pub reviewer_model: Option<String>,
+    /// Token budget per attempt.
+    #[serde(alias = "tokenBudget")]
+    pub token_budget: Option<usize>,
+    /// Base delay between retries (ms).
     #[serde(alias = "baseDelayMs")]
     pub base_delay_ms: Option<u32>,
+    /// Maximum delay between retries (ms).
     #[serde(alias = "maxDelayMs")]
     pub max_delay_ms: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl RetrySettings {
+    /// Check if retry is enabled (OPT-IN: defaults to false).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+/// Phase-2 plan alias for retry configuration.
+pub type RetryConfig = RetrySettings;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ImageSettings {
     #[serde(alias = "autoResize")]
@@ -256,7 +363,7 @@ pub struct ImageSettings {
     pub block_images: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct MarkdownSettings {
     /// Indentation (in spaces) applied to code blocks in rendered output.
@@ -264,7 +371,7 @@ pub struct MarkdownSettings {
     pub code_block_indent: Option<u8>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct TerminalSettings {
     #[serde(alias = "showImages")]
@@ -273,7 +380,7 @@ pub struct TerminalSettings {
     pub clear_on_shrink: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ThinkingBudgets {
     pub minimal: Option<u32>,
@@ -283,7 +390,7 @@ pub struct ThinkingBudgets {
     pub xhigh: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum PackageSource {
     String(String),
@@ -505,6 +612,12 @@ impl Config {
 
             // Runtime Risk Controller
             extension_risk: merge_extension_risk(base.extension_risk, other.extension_risk),
+
+            // Reliability hardening
+            reliability: merge_reliability(base.reliability, other.reliability),
+
+            // Auth configuration
+            auth: other.auth.or(base.auth),
         }
     }
 
@@ -547,11 +660,15 @@ impl Config {
     }
 
     pub fn retry_enabled(&self) -> bool {
-        self.retry.as_ref().and_then(|r| r.enabled).unwrap_or(true)
+        self.retry.as_ref().is_some_and(RetrySettings::is_enabled)
     }
 
     pub fn retry_max_retries(&self) -> u32 {
         self.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3)
+    }
+
+    pub fn retry_max_attempts(&self) -> usize {
+        self.retry_max_retries() as usize
     }
 
     pub fn retry_base_delay_ms(&self) -> u32 {
@@ -566,6 +683,14 @@ impl Config {
             .as_ref()
             .and_then(|r| r.max_delay_ms)
             .unwrap_or(60000)
+    }
+
+    pub fn retry_reviewer_model(&self) -> Option<String> {
+        self.retry.as_ref().and_then(|r| r.reviewer_model.clone())
+    }
+
+    pub fn retry_token_budget(&self) -> Option<usize> {
+        self.retry.as_ref().and_then(|r| r.token_budget)
     }
 
     pub fn image_auto_resize(&self) -> bool {
@@ -622,6 +747,63 @@ impl Config {
 
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
+    }
+
+    pub fn reliability_enabled(&self) -> bool {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn reliability_enforcement_mode(&self) -> ReliabilityEnforcementMode {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.enforcement_mode)
+            .unwrap_or_default()
+    }
+
+    pub fn reliability_require_evidence_for_close(&self) -> bool {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.require_evidence_for_close)
+            .unwrap_or(true)
+    }
+
+    pub fn reliability_max_touched_files(&self) -> u16 {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.max_touched_files)
+            .unwrap_or(8)
+    }
+
+    pub fn reliability_default_max_attempts(&self) -> u8 {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.default_max_attempts)
+            .unwrap_or(3)
+    }
+
+    pub fn reliability_allow_open_ended_defer(&self) -> bool {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.allow_open_ended_defer)
+            .unwrap_or(false)
+    }
+
+    pub fn reliability_verify_timeout_sec_default(&self) -> u32 {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.verify_timeout_sec_default)
+            .unwrap_or(600)
+    }
+
+    pub fn reliability_lease_provider(&self) -> Option<&str> {
+        self.reliability
+            .as_ref()
+            .and_then(|r| r.lease_provider.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
     }
 
     /// Resolve the extension policy from config, CLI override, and env var.
@@ -1024,6 +1206,8 @@ fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Opt
             max_retries: other.max_retries.or(base.max_retries),
             base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
             max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
+            reviewer_model: other.reviewer_model.or(base.reviewer_model),
+            token_budget: other.token_budget.or(base.token_budget),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1128,6 +1312,31 @@ fn merge_extension_risk(
     }
 }
 
+fn merge_reliability(
+    base: Option<ReliabilityConfig>,
+    other: Option<ReliabilityConfig>,
+) -> Option<ReliabilityConfig> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ReliabilityConfig {
+            enabled: other.enabled.or(base.enabled),
+            enforcement_mode: other.enforcement_mode.or(base.enforcement_mode),
+            require_evidence_for_close: other
+                .require_evidence_for_close
+                .or(base.require_evidence_for_close),
+            max_touched_files: other.max_touched_files.or(base.max_touched_files),
+            default_max_attempts: other.default_max_attempts.or(base.default_max_attempts),
+            allow_open_ended_defer: other.allow_open_ended_defer.or(base.allow_open_ended_defer),
+            verify_timeout_sec_default: other
+                .verify_timeout_sec_default
+                .or(base.verify_timeout_sec_default),
+            lease_provider: other.lease_provider.or(base.lease_provider),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
 fn load_settings_json_object(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(Value::Object(serde_json::Map::new()));
@@ -1219,12 +1428,12 @@ fn patch_settings_file(path: &Path, patch: Value) -> Result<Value> {
 mod tests {
     use super::{
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
-        ExtensionRiskConfig, ImageSettings, RepairPolicyConfig, RetrySettings, SettingsScope,
-        TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
-        extension_index_path_from_env, global_dir_from_env, merge_branch_summary, merge_compaction,
-        merge_extension_policy, merge_extension_risk, merge_images, merge_repair_policy,
-        merge_retry, merge_terminal, merge_thinking_budgets, package_dir_from_env,
-        sessions_dir_from_env,
+        ExtensionRiskConfig, ImageSettings, ReliabilityConfig, ReliabilityEnforcementMode,
+        RepairPolicyConfig, RetrySettings, SettingsScope, TerminalSettings, ThinkingBudgets,
+        deep_merge_settings_value, extension_index_path_from_env, global_dir_from_env,
+        merge_branch_summary, merge_compaction, merge_extension_policy, merge_extension_risk,
+        merge_images, merge_reliability, merge_repair_policy, merge_retry, merge_terminal,
+        merge_thinking_budgets, package_dir_from_env, sessions_dir_from_env,
     };
     use crate::agent::QueueMode;
     use proptest::prelude::*;
@@ -1360,7 +1569,7 @@ mod tests {
         assert!(config.compaction_enabled());
         assert_eq!(config.compaction_reserve_tokens(), 16384);
         assert_eq!(config.compaction_keep_recent_tokens(), 20000);
-        assert!(config.retry_enabled());
+        assert!(!config.retry_enabled());
         assert_eq!(config.retry_max_retries(), 3);
         assert_eq!(config.retry_base_delay_ms(), 2000);
         assert_eq!(config.retry_max_delay_ms(), 60000);
@@ -1369,6 +1578,89 @@ mod tests {
         assert!(!config.terminal_clear_on_shrink());
         assert!(config.shell_path.is_none());
         assert!(config.shell_command_prefix.is_none());
+        assert!(config.reliability_enabled());
+        assert_eq!(
+            config.reliability_enforcement_mode(),
+            ReliabilityEnforcementMode::Observe
+        );
+        assert!(config.reliability_require_evidence_for_close());
+        assert_eq!(config.reliability_max_touched_files(), 8);
+        assert_eq!(config.reliability_default_max_attempts(), 3);
+        assert!(!config.reliability_allow_open_ended_defer());
+        assert_eq!(config.reliability_verify_timeout_sec_default(), 600);
+        assert!(config.reliability_lease_provider().is_none());
+    }
+
+    #[test]
+    fn merge_reliability_combines_global_and_project_values() {
+        let base = Some(ReliabilityConfig {
+            enabled: Some(true),
+            enforcement_mode: Some(ReliabilityEnforcementMode::Observe),
+            require_evidence_for_close: Some(true),
+            max_touched_files: Some(8),
+            default_max_attempts: Some(3),
+            allow_open_ended_defer: Some(false),
+            verify_timeout_sec_default: Some(600),
+            lease_provider: Some("local".to_string()),
+        });
+        let other = Some(ReliabilityConfig {
+            enabled: None,
+            enforcement_mode: Some(ReliabilityEnforcementMode::Hard),
+            require_evidence_for_close: Some(false),
+            max_touched_files: Some(3),
+            default_max_attempts: Some(5),
+            allow_open_ended_defer: None,
+            verify_timeout_sec_default: Some(1200),
+            lease_provider: Some("external".to_string()),
+        });
+
+        let merged = merge_reliability(base, other).expect("merged reliability");
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(
+            merged.enforcement_mode,
+            Some(ReliabilityEnforcementMode::Hard)
+        );
+        assert_eq!(merged.require_evidence_for_close, Some(false));
+        assert_eq!(merged.max_touched_files, Some(3));
+        assert_eq!(merged.default_max_attempts, Some(5));
+        assert_eq!(merged.allow_open_ended_defer, Some(false));
+        assert_eq!(merged.verify_timeout_sec_default, Some(1200));
+        assert_eq!(merged.lease_provider.as_deref(), Some("external"));
+    }
+
+    #[test]
+    fn load_parses_reliability_config_and_accessors() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "reliability": {
+                    "enabled": true,
+                    "enforcementMode": "soft",
+                    "requireEvidenceForClose": false,
+                    "maxTouchedFiles": 5,
+                    "defaultMaxAttempts": 4,
+                    "allowOpenEndedDefer": true,
+                    "verifyTimeoutSecDefault": 900,
+                    "leaseProvider": "external"
+                }
+            }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert!(config.reliability_enabled());
+        assert_eq!(
+            config.reliability_enforcement_mode(),
+            ReliabilityEnforcementMode::Soft
+        );
+        assert!(!config.reliability_require_evidence_for_close());
+        assert_eq!(config.reliability_max_touched_files(), 5);
+        assert_eq!(config.reliability_default_max_attempts(), 4);
+        assert!(config.reliability_allow_open_ended_defer());
+        assert_eq!(config.reliability_verify_timeout_sec_default(), 900);
+        assert_eq!(config.reliability_lease_provider(), Some("external"));
     }
 
     #[test]
@@ -2869,8 +3161,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_base_delay in prop::option::of(100u32..5000),
             ) {
-                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None };
-                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None };
+                let base = RetrySettings { enabled: b_en, max_retries: b_max, reviewer_model: None, token_budget: None, base_delay_ms: None, max_delay_ms: None };
+                let other = RetrySettings { enabled: o_en, max_retries: None, reviewer_model: None, token_budget: None, base_delay_ms: o_base_delay, max_delay_ms: None };
                 let result = merge_retry(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.max_retries, b_max); // other had None, base passes through
