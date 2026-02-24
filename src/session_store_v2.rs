@@ -1333,6 +1333,14 @@ pub fn session_entry_to_frame_args(
         SessionEntry::BranchSummary(_) => "branch_summary",
         SessionEntry::Label(_) => "label",
         SessionEntry::SessionInfo(_) => "session_info",
+        SessionEntry::StateDigest(_) => "reliability/state_digest.v1",
+        SessionEntry::TaskCheckpoint(_) => "reliability/task_checkpoint.v1",
+        SessionEntry::TaskCreated(_) => "reliability/task_created.v1",
+        SessionEntry::TaskTransition(_) => "reliability/task_transition.v1",
+        SessionEntry::VerificationEvidence(_) => "reliability/verification_evidence.v1",
+        SessionEntry::CloseDecision(_) => "reliability/close_decision.v1",
+        SessionEntry::HumanBlockerRaised(_) => "reliability/human_blocker_raised.v1",
+        SessionEntry::HumanBlockerResolved(_) => "reliability/human_blocker_resolved.v1",
         SessionEntry::Custom(_) => "custom",
     };
 
@@ -1682,6 +1690,582 @@ mod proptests {
             let result = v2_sidecar_path(&input);
             let name = result.file_name().unwrap().to_str().unwrap();
             assert_eq!(name, format!("{stem}.v2"));
+        }
+    }
+
+    // ====================================================================
+    // SegmentFrame and IndexEntry property tests
+    // ====================================================================
+
+    mod frame_props {
+        use super::*;
+        use proptest::option;
+
+        fn segment_frame_strategy() -> impl Strategy<Value = SegmentFrame> {
+            (
+                any::<u64>(),
+                any::<u64>(),
+                any::<u64>(),
+                "[a-z]{1,20}",
+                option::of("[a-z]{1,20}"),
+                "[a-z]{1,15}",
+                "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z",
+                json_strategy(),
+            )
+                .prop_map(
+                    |(
+                        segment_seq,
+                        frame_seq,
+                        entry_seq,
+                        entry_id,
+                        parent_entry_id,
+                        entry_type,
+                        timestamp,
+                        payload,
+                    )| {
+                        let raw_string = serde_json::to_string(&payload).unwrap();
+                        let raw_payload = RawValue::from_string(raw_string).unwrap();
+                        let (payload_sha256, payload_bytes) =
+                            payload_hash_and_size(&raw_payload).unwrap();
+
+                        SegmentFrame {
+                            schema: SEGMENT_FRAME_SCHEMA.to_string(),
+                            segment_seq,
+                            frame_seq,
+                            entry_seq,
+                            entry_id,
+                            parent_entry_id,
+                            entry_type,
+                            timestamp,
+                            payload_sha256,
+                            payload_bytes,
+                            payload: raw_payload,
+                        }
+                    },
+                )
+        }
+
+        fn json_strategy() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                any::<i64>().prop_map(|n| Value::Number(n.into())),
+                any::<String>().prop_map(Value::String),
+                prop::collection::vec(
+                    prop_oneof![
+                        Just(Value::Null),
+                        any::<bool>().prop_map(Value::Bool),
+                        any::<String>().prop_map(Value::String),
+                    ],
+                    0..3
+                )
+                .prop_map(Value::Array),
+            ]
+        }
+
+        proptest! {
+            /// Test SegmentFrame serialization roundtrip
+            #[test]
+            fn segment_frame_roundtrip(frame in segment_frame_strategy()) {
+                let json = serde_json::to_string(&frame).expect("serialize");
+                let parsed: SegmentFrame = serde_json::from_str(&json).expect("deserialize");
+
+                prop_assert_eq!(frame.schema, parsed.schema);
+                prop_assert_eq!(frame.segment_seq, parsed.segment_seq);
+                prop_assert_eq!(frame.frame_seq, parsed.frame_seq);
+                prop_assert_eq!(frame.entry_seq, parsed.entry_seq);
+                prop_assert_eq!(frame.entry_id, parsed.entry_id);
+                prop_assert_eq!(frame.parent_entry_id, parsed.parent_entry_id);
+                prop_assert_eq!(frame.entry_type, parsed.entry_type);
+                prop_assert_eq!(frame.payload_sha256, parsed.payload_sha256);
+                prop_assert_eq!(frame.payload_bytes, parsed.payload_bytes);
+            }
+
+            /// Test payload hash consistency
+            #[test]
+            fn payload_hash_consistent(payload in json_strategy()) {
+                let raw_string = serde_json::to_string(&payload).unwrap();
+                let raw = RawValue::from_string(raw_string).unwrap();
+
+                let (hash1, size1) = payload_hash_and_size(&raw).unwrap();
+                let (hash2, size2) = payload_hash_and_size(&raw).unwrap();
+
+                prop_assert_eq!(&hash1, &hash2, "Hash should be deterministic");
+                prop_assert_eq!(size1, size2, "Size should be deterministic");
+                prop_assert_eq!(hash1.len(), 64, "SHA-256 hash should be 64 hex chars");
+            }
+
+            /// Test that payload size matches serialized length
+            #[test]
+            fn payload_size_matches_bytes(payload in json_strategy()) {
+                let raw_string = serde_json::to_string(&payload).unwrap();
+                let raw = RawValue::from_string(raw_string.clone()).unwrap();
+                let (_, size) = payload_hash_and_size(&raw).unwrap();
+
+                prop_assert_eq!(size, raw_string.len() as u64);
+            }
+        }
+    }
+
+    // ====================================================================
+    // Manifest and Checkpoint property tests
+    // ====================================================================
+
+    mod manifest_props {
+        use super::*;
+
+        fn store_head_strategy() -> impl Strategy<Value = StoreHead> {
+            (any::<u64>(), any::<u64>(), "[a-z]{1,20}").prop_map(
+                |(segment_seq, entry_seq, entry_id)| StoreHead {
+                    segment_seq,
+                    entry_seq,
+                    entry_id,
+                },
+            )
+        }
+
+        fn manifest_counters_strategy() -> impl Strategy<Value = ManifestCounters> {
+            (
+                any::<u64>(),
+                any::<u64>(),
+                any::<u64>(),
+                any::<u64>(),
+                any::<u64>(),
+            )
+                .prop_map(
+                    |(
+                        entries_total,
+                        messages_total,
+                        branches_total,
+                        compactions_total,
+                        bytes_total,
+                    )| {
+                        ManifestCounters {
+                            entries_total,
+                            messages_total,
+                            branches_total,
+                            compactions_total,
+                            bytes_total,
+                        }
+                    },
+                )
+        }
+
+        fn manifest_files_strategy() -> impl Strategy<Value = ManifestFiles> {
+            (
+                "[a-z]{1,10}",
+                any::<u64>(),
+                "[a-z]{1,10}",
+                "[a-z]{1,10}",
+                "[a-z]{1,10}",
+            )
+                .prop_map(
+                    |(
+                        segment_dir,
+                        segment_count,
+                        index_path,
+                        checkpoint_dir,
+                        migration_ledger_path,
+                    )| {
+                        ManifestFiles {
+                            segment_dir,
+                            segment_count,
+                            index_path,
+                            checkpoint_dir,
+                            migration_ledger_path,
+                        }
+                    },
+                )
+        }
+
+        fn manifest_integrity_strategy() -> impl Strategy<Value = ManifestIntegrity> {
+            ("[0-9a-f]{64}", "[0-9a-f]{64}", "[0-9A-F]{8}").prop_map(
+                |(chain_hash, manifest_hash, last_crc32c)| ManifestIntegrity {
+                    chain_hash,
+                    manifest_hash,
+                    last_crc32c,
+                },
+            )
+        }
+
+        fn manifest_invariants_strategy() -> impl Strategy<Value = ManifestInvariants> {
+            (
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(
+                        parent_links_closed,
+                        monotonic_entry_seq,
+                        monotonic_segment_seq,
+                        index_within_segment_bounds,
+                        branch_heads_indexed,
+                        checkpoints_monotonic,
+                        hash_chain_valid,
+                    )| {
+                        ManifestInvariants {
+                            parent_links_closed,
+                            monotonic_entry_seq,
+                            monotonic_segment_seq,
+                            index_within_segment_bounds,
+                            branch_heads_indexed,
+                            checkpoints_monotonic,
+                            hash_chain_valid,
+                        }
+                    },
+                )
+        }
+
+        fn manifest_strategy() -> impl Strategy<Value = Manifest> {
+            (
+                store_head_strategy(),
+                manifest_counters_strategy(),
+                manifest_files_strategy(),
+                manifest_integrity_strategy(),
+                manifest_invariants_strategy(),
+            )
+                .prop_map(|(head, counters, files, integrity, invariants)| Manifest {
+                    schema: MANIFEST_SCHEMA.to_string(),
+                    store_version: 1,
+                    session_id: "test-session".to_string(),
+                    source_format: "jsonl".to_string(),
+                    created_at: "2026-01-01T00:00:00.000Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00.001Z".to_string(),
+                    head,
+                    counters,
+                    files,
+                    integrity,
+                    invariants,
+                })
+        }
+
+        proptest! {
+            /// Test Manifest roundtrip
+            #[test]
+            fn manifest_roundtrip(manifest in manifest_strategy()) {
+                let json = serde_json::to_string(&manifest).expect("serialize");
+                let parsed: Manifest = serde_json::from_str(&json).expect("deserialize");
+
+                prop_assert_eq!(manifest.store_version, parsed.store_version);
+                prop_assert_eq!(manifest.session_id, parsed.session_id);
+                prop_assert_eq!(manifest.head, parsed.head);
+                prop_assert_eq!(manifest.counters.entries_total, parsed.counters.entries_total);
+            }
+
+            /// Test StoreHead roundtrip
+            #[test]
+            fn store_head_roundtrip(head in store_head_strategy()) {
+                let json = serde_json::to_string(&head).expect("serialize");
+                let parsed: StoreHead = serde_json::from_str(&json).expect("deserialize");
+
+                prop_assert_eq!(head, parsed);
+            }
+
+            /// Test manifest hash is deterministic
+            #[test]
+            fn manifest_hash_deterministic(manifest in manifest_strategy()) {
+                let hash1 = manifest_hash_hex(&manifest).expect("hash");
+                let hash2 = manifest_hash_hex(&manifest).expect("hash");
+
+                prop_assert_eq!(&hash1, &hash2);
+                prop_assert_eq!(hash1.len(), 64);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Concurrent Read/Write Safety Tests
+// =============================================================================
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Test concurrent reads from SessionStoreV2
+    #[test]
+    fn concurrent_reads_no_corruption() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 64 * 1024;
+
+        // Create store and write some entries
+        let mut store = SessionStoreV2::create(&root, max_segment).expect("create store");
+        for i in 0..10 {
+            let payload = serde_json::json!({"index": i, "data": format!("entry-{i}")});
+            store
+                .append_entry(
+                    format!("entry-{i}"),
+                    if i > 0 {
+                        Some(format!("entry-{}", i - 1))
+                    } else {
+                        None
+                    },
+                    "message",
+                    payload,
+                )
+                .expect("append");
+        }
+
+        // Spawn multiple reader threads
+        let store = Arc::new(std::sync::Mutex::new(store));
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    let store = store_clone.lock().unwrap();
+                    let index = store.read_index().expect("read index");
+                    assert!(index.len() >= 10, "Should have at least 10 entries");
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+    }
+
+    /// Test concurrent appends don't corrupt the store
+    #[test]
+    fn concurrent_appends_no_corruption() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 1024 * 1024;
+
+        let store = Arc::new(std::sync::Mutex::new(
+            SessionStoreV2::create(&root, max_segment).expect("create store"),
+        ));
+
+        let mut handles = vec![];
+        let num_threads = 4;
+        let entries_per_thread = 25;
+
+        for thread_id in 0..num_threads {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for i in 0..entries_per_thread {
+                    let mut store = store_clone.lock().unwrap();
+                    let entry_id = format!("thread-{thread_id}-entry-{i}");
+                    let payload = serde_json::json!({
+                        "thread": thread_id,
+                        "index": i,
+                        "data": format!("data-{thread_id}-{i}")
+                    });
+                    store
+                        .append_entry(entry_id, None, "message", payload)
+                        .expect("append");
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+
+        // Verify all entries were written correctly
+        let store = store.lock().unwrap();
+        let index = store.read_index().expect("read index");
+        assert_eq!(
+            index.len(),
+            num_threads * entries_per_thread,
+            "All entries should be present"
+        );
+
+        // Verify integrity
+        store
+            .validate_integrity()
+            .expect("integrity check should pass");
+    }
+
+    /// Test mixed concurrent reads and writes
+    #[test]
+    fn concurrent_read_write_no_corruption() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 1024 * 1024;
+
+        let store = Arc::new(std::sync::Mutex::new(
+            SessionStoreV2::create(&root, max_segment).expect("create store"),
+        ));
+
+        let mut handles = vec![];
+
+        // Writer thread
+        {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for i in 0..100 {
+                    let mut store = store_clone.lock().unwrap();
+                    let payload = serde_json::json!({"write_index": i});
+                    store
+                        .append_entry(format!("write-{i}"), None, "message", payload)
+                        .expect("append");
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Reader threads
+        for _ in 0..3 {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    let store = store_clone.lock().unwrap();
+                    let _ = store.read_index().expect("read index");
+                    let _ = store.entry_count();
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+
+        // Final verification
+        let store = store.lock().unwrap();
+        let index = store.read_index().expect("read index");
+        assert_eq!(index.len(), 100, "Writer should have written 100 entries");
+        store
+            .validate_integrity()
+            .expect("integrity should be valid");
+    }
+
+    /// Test that index and segment files remain consistent under concurrent access
+    #[test]
+    fn index_segment_consistency_under_concurrency() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 1024 * 1024;
+
+        let store = Arc::new(std::sync::Mutex::new(
+            SessionStoreV2::create(&root, max_segment).expect("create store"),
+        ));
+
+        // Write initial entries
+        {
+            let mut store = store.lock().unwrap();
+            for i in 0..20 {
+                store
+                    .append_entry(format!("init-{i}"), None, "message", serde_json::json!({}))
+                    .expect("append");
+            }
+        }
+
+        let mut handles = vec![];
+
+        // Concurrent verification threads
+        for _ in 0..5 {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for _ in 0..50 {
+                    let store = store_clone.lock().unwrap();
+
+                    // Read index
+                    let index = store.read_index().expect("read index");
+
+                    // Verify each index entry points to a valid frame
+                    for row in &index {
+                        if let Ok(Some(frame)) = seek_read_frame(&store, row) {
+                            assert_eq!(frame.entry_seq, row.entry_seq);
+                            assert_eq!(frame.entry_id, row.entry_id);
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should not panic");
+        }
+    }
+
+    /// Test CRC32C checksum consistency
+    #[test]
+    fn crc32c_checksum_consistency() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 64 * 1024;
+
+        let mut store = SessionStoreV2::create(&root, max_segment).expect("create store");
+
+        // Write entry
+        let payload = serde_json::json!({"test": "data"});
+        let index_entry = store
+            .append_entry("test-1".to_string(), None, "message", payload)
+            .expect("append");
+
+        // Read back and verify CRC
+        let frames = store.read_segment(1).expect("read segment");
+        assert!(!frames.is_empty(), "Should have one frame");
+
+        let frame = &frames[0];
+        let serialized = serde_json::to_vec(frame).expect("serialize");
+        let mut line = serialized;
+        line.push(b'\n');
+        let computed_crc = crc32c_upper(&line);
+
+        assert_eq!(index_entry.crc32c, computed_crc, "CRC should match");
+    }
+
+    /// Test chain hash progression
+    #[test]
+    fn chain_hash_progression() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 64 * 1024;
+
+        let mut store = SessionStoreV2::create(&root, max_segment).expect("create store");
+
+        let mut prev_hash = GENESIS_CHAIN_HASH.to_string();
+
+        for i in 0..5 {
+            let payload = serde_json::json!({"entry": i});
+            store
+                .append_entry(format!("hash-test-{i}"), None, "message", payload)
+                .expect("append");
+
+            // The chain hash should have changed
+            assert_ne!(
+                prev_hash, store.chain_hash,
+                "Chain hash should change after each append"
+            );
+            prev_hash = store.chain_hash.clone();
+        }
+    }
+
+    /// Test that entry sequences are strictly increasing
+    #[test]
+    fn entry_sequences_monotonic() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("store");
+        let max_segment = 64 * 1024;
+
+        let mut store = SessionStoreV2::create(&root, max_segment).expect("create store");
+
+        let mut prev_seq = 0u64;
+        for i in 0..100 {
+            let entry = store
+                .append_entry(format!("seq-{i}"), None, "message", serde_json::json!({}))
+                .expect("append");
+
+            assert!(
+                entry.entry_seq > prev_seq,
+                "Entry sequences must be strictly increasing"
+            );
+            prev_seq = entry.entry_seq;
         }
     }
 }

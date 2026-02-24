@@ -7,6 +7,7 @@
 //! - When building provider context, the session inserts the summary before the kept region
 //!   and omits older messages.
 
+use crate::context::visibility::VisibilityState;
 use crate::error::{Error, Result};
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ThinkingLevel, ToolCall,
@@ -19,6 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Approximate characters per token for English text with GPT-family tokenizers.
@@ -31,6 +33,15 @@ const IMAGE_TOKEN_ESTIMATE: usize = 1200;
 
 /// Character-equivalent estimate for an image (IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE).
 const IMAGE_CHAR_ESTIMATE: usize = IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE;
+
+/// Progressive tool-result removal levels.
+/// When context is too full, we progressively remove tool responses starting with
+/// lowest importance. Each level represents a percentage of tool results to remove.
+pub const PROGRESSIVE_REMOVAL_LEVELS: &[u8] = &[0, 10, 20, 50, 100];
+
+/// Auto-compact threshold as percentage of context window.
+/// When context usage exceeds this percentage, auto-compaction is triggered.
+const AUTO_COMPACT_THRESHOLD_PERCENTAGE: u32 = 85;
 
 /// Count the serialized JSON byte length of a [`Value`] without allocating a `String`.
 ///
@@ -107,6 +118,108 @@ pub struct CompactionPreparation {
     pub previous_summary: Option<String>,
     pub file_ops: FileOperations,
     pub settings: ResolvedCompactionSettings,
+}
+
+/// Progressive removal state for tool-result elimination.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressiveRemovalState {
+    /// Current removal level index into PROGRESSIVE_REMOVAL_LEVELS.
+    pub level_index: usize,
+    /// Tool result IDs that have been removed at current level.
+    pub removed_tool_ids: HashSet<String>,
+}
+
+impl ProgressiveRemovalState {
+    /// Get current removal percentage.
+    pub fn current_percentage(&self) -> u8 {
+        PROGRESSIVE_REMOVAL_LEVELS
+            .get(self.level_index)
+            .copied()
+            .unwrap_or(100)
+    }
+
+    /// Advance to next removal level.
+    /// Returns false if already at maximum level (100%).
+    pub fn advance(&mut self) -> bool {
+        if self.level_index + 1 < PROGRESSIVE_REMOVAL_LEVELS.len() {
+            self.level_index += 1;
+            self.removed_tool_ids.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a specific tool result should be removed based on current level.
+    pub fn should_remove(&self, tool_id: &str, _total_tools: usize) -> bool {
+        let percentage = self.current_percentage();
+        if percentage == 0 {
+            return false;
+        }
+        if percentage == 100 {
+            return true;
+        }
+
+        // Use consistent hash-based selection for stable removal across compactions
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        tool_id.hash(&mut hasher);
+        let hash_val = hasher.finish();
+
+        // Remove if hash falls within the percentage threshold
+        let threshold = u64::try_from((u128::from(u64::MAX) * u128::from(percentage)) / 100)
+            .unwrap_or(u64::MAX);
+        hash_val < threshold
+    }
+}
+
+/// Check if auto-compaction should trigger based on context usage.
+pub fn should_auto_compact(current_tokens: u64, context_window: u32) -> bool {
+    let threshold =
+        (u64::from(context_window) * u64::from(AUTO_COMPACT_THRESHOLD_PERCENTAGE)) / 100;
+    current_tokens > threshold
+}
+
+/// Apply visibility-based progressive removal to session entries.
+/// This modifies entries in-place by updating their MessageMetadata.
+/// Returns the number of tool results that were removed.
+pub fn apply_progressive_removal(
+    entries: &mut [SessionEntry],
+    state: &ProgressiveRemovalState,
+) -> usize {
+    let mut removed_count = 0;
+    let mut tool_result_indices = Vec::new();
+
+    // First pass: collect all tool result indices
+    for (idx, entry) in entries.iter().enumerate() {
+        if let SessionEntry::Message(msg_entry) = entry {
+            if matches!(msg_entry.message, SessionMessage::ToolResult { .. }) {
+                tool_result_indices.push(idx);
+            }
+        }
+    }
+
+    let total_tools = tool_result_indices.len();
+    if total_tools == 0 {
+        return 0;
+    }
+
+    // Second pass: mark tools for removal based on state
+    for idx in tool_result_indices {
+        if let SessionEntry::Message(ref mut entry) = entries[idx] {
+            let SessionMessage::ToolResult { tool_call_id, .. } = &entry.message else {
+                continue;
+            };
+
+            if state.should_remove(tool_call_id, total_tools) {
+                // Archive the message from agent context (hidden from LLM, visible in UI)
+                entry.metadata.agent_visible = false;
+                entry.metadata.state = VisibilityState::Hidden;
+                removed_count += 1;
+            }
+        }
+    }
+
+    removed_count
 }
 
 // =============================================================================
@@ -1476,6 +1589,7 @@ mod tests {
 
     // ── Helper: entry constructors ──────────────────────────────────
 
+    use crate::context::visibility::MessageMetadata;
     use crate::model::{ImageContent, ThinkingContent};
     use crate::session::{
         BranchSummaryEntry, CompactionEntry, EntryBase, MessageEntry, ModelChangeEntry,
@@ -1494,6 +1608,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_user_text(text),
+            metadata: MessageMetadata::new(),
         })
     }
 
@@ -1501,6 +1616,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_assistant_text(text, input, output),
+            metadata: MessageMetadata::new(),
         })
     }
 
@@ -1508,6 +1624,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_assistant_tool_call(tool_name, json!({"path": path})),
+            metadata: MessageMetadata::new(),
         })
     }
 
@@ -1515,6 +1632,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_tool_result(text),
+            metadata: MessageMetadata::new(),
         })
     }
 
@@ -1552,6 +1670,7 @@ mod tests {
                 timestamp: None,
                 extra: HashMap::new(),
             },
+            metadata: Default::default(),
         })
     }
 
@@ -2349,6 +2468,717 @@ mod tests {
                 for pair in modified.windows(2) {
                     assert!(pair[0] <= pair[1]);
                 }
+            }
+        }
+
+        // ── Progressive Removal Tests ────────────────────────────────────────
+
+        #[test]
+        fn test_progressive_removal_state_default() {
+            let state = ProgressiveRemovalState::default();
+            assert_eq!(state.level_index, 0);
+            assert_eq!(state.current_percentage(), 0);
+            assert!(state.removed_tool_ids.is_empty());
+        }
+
+        #[test]
+        fn test_progressive_removal_state_advance() {
+            let mut state = ProgressiveRemovalState::default();
+            assert_eq!(state.current_percentage(), 0);
+
+            // First advance
+            assert!(state.advance());
+            assert_eq!(state.current_percentage(), 10);
+            assert!(state.removed_tool_ids.is_empty());
+
+            // Second advance
+            assert!(state.advance());
+            assert_eq!(state.current_percentage(), 20);
+
+            // Advance to 50%
+            assert!(state.advance());
+            assert_eq!(state.current_percentage(), 50);
+
+            // Advance to 100%
+            assert!(state.advance());
+            assert_eq!(state.current_percentage(), 100);
+
+            // Cannot advance beyond 100%
+            assert!(!state.advance());
+            assert_eq!(state.current_percentage(), 100);
+        }
+
+        #[test]
+        fn test_should_remove_zero_percentage() {
+            let state = ProgressiveRemovalState::default();
+            // 0% should never remove
+            assert!(!state.should_remove("tool_1", 10));
+            assert!(!state.should_remove("tool_2", 100));
+        }
+
+        #[test]
+        fn test_should_remove_hundred_percentage() {
+            let mut state = ProgressiveRemovalState::default();
+            state.level_index = PROGRESSIVE_REMOVAL_LEVELS.len() - 1; // 100%
+            // 100% should always remove
+            assert!(state.should_remove("tool_1", 10));
+            assert!(state.should_remove("tool_2", 100));
+        }
+
+        #[test]
+        fn test_auto_compact_threshold() {
+            // 85% of 200k = 170k
+            assert!(should_auto_compact(180_000, 200_000));
+            assert!(should_auto_compact(171_000, 200_000));
+            assert!(!should_auto_compact(169_000, 200_000));
+            assert!(!should_auto_compact(100_000, 200_000));
+        }
+
+        #[test]
+        fn test_apply_progressive_removal_no_tools() {
+            let mut entries = vec![user_entry("id1", "test")];
+
+            let state = ProgressiveRemovalState::default();
+            let removed = apply_progressive_removal(&mut entries, &state);
+            assert_eq!(removed, 0);
+        }
+
+        #[test]
+        fn test_apply_progressive_removal_with_tools() {
+            let mut entries = vec![
+                SessionEntry::Message(MessageEntry {
+                    base: test_base("id1"),
+                    message: SessionMessage::ToolResult {
+                        tool_call_id: "tool_1".to_string(),
+                        tool_name: "read".to_string(),
+                        content: vec![ContentBlock::Text(TextContent::new("result"))],
+                        details: None,
+                        is_error: false,
+                        timestamp: None,
+                    },
+                    metadata: MessageMetadata::new(),
+                }),
+                SessionEntry::Message(MessageEntry {
+                    base: test_base("id2"),
+                    message: SessionMessage::ToolResult {
+                        tool_call_id: "tool_2".to_string(),
+                        tool_name: "grep".to_string(),
+                        content: vec![ContentBlock::Text(TextContent::new("result"))],
+                        details: None,
+                        is_error: false,
+                        timestamp: None,
+                    },
+                    metadata: MessageMetadata::new(),
+                }),
+            ];
+
+            // At 100% removal, all tools should be removed
+            let mut state = ProgressiveRemovalState::default();
+            state.level_index = PROGRESSIVE_REMOVAL_LEVELS.len() - 1;
+            let removed = apply_progressive_removal(&mut entries, &state);
+
+            assert_eq!(removed, 2);
+
+            // Check that metadata was updated
+            if let SessionEntry::Message(ref entry) = entries[0] {
+                assert!(!entry.metadata.agent_visible);
+                assert_eq!(entry.metadata.state, VisibilityState::Hidden);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Property-based tests for compaction
+// =============================================================================
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use crate::context::visibility::MessageMetadata;
+    use crate::model::{AssistantMessage, Cost, StopReason, TextContent, Usage};
+    use crate::session::{EntryBase, MessageEntry};
+    use proptest::collection::vec;
+    use proptest::option;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    // =========================================================================
+    // Strategies for generating test data
+    // =========================================================================
+
+    fn text_content_strategy() -> impl Strategy<Value = TextContent> {
+        any::<String>().prop_map(|text| TextContent::new(text))
+    }
+
+    fn usage_strategy() -> impl Strategy<Value = Usage> {
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(input, output, cache_read, cache_write, total_tokens)| Usage {
+                    input: input % 1_000_000,
+                    output: output % 100_000,
+                    cache_read: cache_read % 500_000,
+                    cache_write: cache_write % 500_000,
+                    total_tokens: total_tokens % 2_000_000,
+                    cost: Cost::default(),
+                },
+            )
+    }
+
+    fn stop_reason_strategy() -> impl Strategy<Value = StopReason> {
+        prop_oneof![
+            Just(StopReason::Stop),
+            Just(StopReason::Length),
+            Just(StopReason::ToolUse),
+            Just(StopReason::Error),
+            Just(StopReason::Aborted),
+        ]
+    }
+
+    fn assistant_message_strategy() -> impl Strategy<Value = AssistantMessage> {
+        (
+            vec(text_content_strategy().prop_map(ContentBlock::Text), 0..5),
+            any::<String>(),
+            any::<String>(),
+            any::<String>(),
+            usage_strategy(),
+            stop_reason_strategy(),
+            option::of(any::<String>()),
+            any::<i64>(),
+        )
+            .prop_map(
+                |(content, api, provider, model, usage, stop_reason, error_message, timestamp)| {
+                    AssistantMessage {
+                        content,
+                        api,
+                        provider,
+                        model,
+                        usage,
+                        stop_reason,
+                        error_message,
+                        timestamp,
+                    }
+                },
+            )
+    }
+
+    fn user_message_strategy() -> impl Strategy<Value = SessionMessage> {
+        any::<String>().prop_map(|text| SessionMessage::User {
+            content: UserContent::Text(text),
+            timestamp: Some(0),
+        })
+    }
+
+    fn assistant_message_variant_strategy() -> impl Strategy<Value = SessionMessage> {
+        assistant_message_strategy().prop_map(|message| SessionMessage::Assistant { message })
+    }
+
+    fn tool_result_message_strategy() -> impl Strategy<Value = SessionMessage> {
+        (
+            any::<String>(),
+            any::<String>(),
+            any::<String>(),
+            any::<bool>(),
+        )
+            .prop_map(|(tool_call_id, tool_name, result_text, is_error)| {
+                SessionMessage::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    content: vec![ContentBlock::Text(TextContent::new(result_text))],
+                    details: None,
+                    is_error,
+                    timestamp: None,
+                }
+            })
+    }
+
+    fn session_message_strategy() -> impl Strategy<Value = SessionMessage> {
+        prop_oneof![
+            user_message_strategy(),
+            assistant_message_variant_strategy(),
+            tool_result_message_strategy(),
+        ]
+    }
+
+    fn entry_base_strategy() -> impl Strategy<Value = EntryBase> {
+        (option::of(any::<String>()), option::of(any::<String>())).prop_map(|(id, parent_id)| {
+            EntryBase {
+                id,
+                parent_id,
+                timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            }
+        })
+    }
+
+    fn message_entry_strategy() -> impl Strategy<Value = MessageEntry> {
+        (entry_base_strategy(), session_message_strategy()).prop_map(|(base, message)| {
+            MessageEntry {
+                base,
+                message,
+                metadata: MessageMetadata::new(),
+            }
+        })
+    }
+
+    fn session_entry_strategy() -> impl Strategy<Value = SessionEntry> {
+        message_entry_strategy().prop_map(SessionEntry::Message)
+    }
+
+    // =========================================================================
+    // Token estimation properties
+    // =========================================================================
+
+    proptest! {
+        /// Test that token estimation is deterministic
+        #[test]
+        fn estimate_tokens_is_deterministic(msg in session_message_strategy()) {
+            let first = estimate_tokens(&msg);
+            let second = estimate_tokens(&msg);
+            prop_assert_eq!(first, second);
+        }
+
+        /// Test that token estimation is non-negative
+        #[test]
+        fn estimate_tokens_non_negative(msg in session_message_strategy()) {
+            let tokens = estimate_tokens(&msg);
+            // estimate_tokens returns u64, which is always non-negative,
+            // but we verify it doesn't panic
+            prop_assert!(tokens < u64::MAX);
+        }
+
+        /// Test that empty messages have zero or minimal tokens
+        #[test]
+        fn estimate_tokens_empty_user_message(
+            text in prop_oneof![Just("".to_string()), Just("   ".to_string()), Just("\n\n".to_string())]
+        ) {
+            let msg = SessionMessage::User {
+                content: UserContent::Text(text),
+                timestamp: Some(0),
+            };
+            let tokens = estimate_tokens(&msg);
+            // Empty or whitespace-only text should have 0 tokens
+            prop_assert!(tokens <= 1);
+        }
+
+        /// Test that longer text generally produces more tokens
+        #[test]
+        fn estimate_tokens_monotonic_in_length(
+            short in "[a-z]{1,10}",
+            long in "[a-z]{100,200}"
+        ) {
+            let short_msg = SessionMessage::User {
+                content: UserContent::Text(short),
+                timestamp: Some(0),
+            };
+            let long_msg = SessionMessage::User {
+                content: UserContent::Text(long),
+                timestamp: Some(0),
+            };
+
+            let short_tokens = estimate_tokens(&short_msg);
+            let long_tokens = estimate_tokens(&long_msg);
+
+            prop_assert!(
+                long_tokens >= short_tokens,
+                "Longer text should have >= tokens: {} vs {}",
+                long_tokens,
+                short_tokens
+            );
+        }
+
+        /// Test token estimation for various message types
+        #[test]
+        fn estimate_tokens_all_message_types(msg in session_message_strategy()) {
+            // Just verify no panic occurs
+            let _tokens = estimate_tokens(&msg);
+        }
+    }
+
+    // =========================================================================
+    // Context estimation properties
+    // =========================================================================
+
+    proptest! {
+        /// Test that context estimation is deterministic
+        #[test]
+        fn estimate_context_tokens_deterministic(
+            msgs in vec(session_message_strategy(), 0..20)
+        ) {
+            let first = estimate_context_tokens(&msgs);
+            let second = estimate_context_tokens(&msgs);
+
+            prop_assert_eq!(first.tokens, second.tokens);
+            prop_assert_eq!(first.last_usage_index, second.last_usage_index);
+        }
+
+        /// Test that empty message list has zero tokens
+        #[test]
+        fn estimate_context_tokens_empty(msgs in vec(session_message_strategy(), 0..=0)) {
+            let estimate = estimate_context_tokens(&msgs);
+            prop_assert_eq!(estimate.tokens, 0);
+            prop_assert!(estimate.last_usage_index.is_none());
+        }
+
+        /// Test that context tokens is non-negative
+        #[test]
+        fn estimate_context_tokens_non_negative(msgs in vec(session_message_strategy(), 0..50)) {
+            let estimate = estimate_context_tokens(&msgs);
+            prop_assert!(estimate.tokens < u64::MAX);
+        }
+    }
+
+    // =========================================================================
+    // Compaction threshold properties
+    // =========================================================================
+
+    proptest! {
+        /// Test should_compact with various inputs
+        #[test]
+        fn should_compact_enabled_check(
+            context_tokens in any::<u64>(),
+            context_window in 1u64..=1_000_000,
+            enabled in any::<bool>()
+        ) {
+            let settings = ResolvedCompactionSettings {
+                enabled,
+                context_window_tokens: context_window as u32,
+                reserve_tokens: 1000,
+                keep_recent_tokens: 500,
+            };
+
+            let result = should_compact(context_tokens, context_window as u32, &settings);
+
+            if !enabled {
+                prop_assert!(!result, "Should never compact when disabled");
+            }
+        }
+
+        /// Test that compaction triggers when well over threshold
+        #[test]
+        fn should_compact_over_threshold(
+            context_window in 10000u32..=200_000,
+            reserve_percent in 1u32..=50
+        ) {
+            let reserve = context_window * reserve_percent / 100;
+            let settings = ResolvedCompactionSettings {
+                enabled: true,
+                context_window_tokens: context_window,
+                reserve_tokens: reserve,
+                keep_recent_tokens: 1000,
+            };
+
+            // Context tokens at 99% of available space (window - reserve)
+            let available = u64::from(context_window).saturating_sub(u64::from(reserve));
+            let context_tokens = (available * 99) / 100;
+
+            let result = should_compact(context_tokens, context_window, &settings);
+
+            // At 99% utilization, should need compaction (if over threshold)
+            // Note: should_compact uses > comparison
+            let threshold = u64::from(context_window).saturating_sub(u64::from(reserve));
+            if context_tokens > threshold {
+                prop_assert!(result);
+            }
+        }
+
+        /// Test that auto-compact threshold is consistent
+        #[test]
+        fn should_auto_compact_consistency(
+            current_tokens in any::<u64>(),
+            context_window in 1u32..=1_000_000
+        ) {
+            let result1 = should_auto_compact(current_tokens, context_window);
+            let result2 = should_auto_compact(current_tokens, context_window);
+            prop_assert_eq!(result1, result2);
+        }
+    }
+
+    // =========================================================================
+    // Progressive removal properties
+    // =========================================================================
+
+    proptest! {
+        /// Test progressive removal state invariants
+        #[test]
+        fn progressive_removal_level_bounds(level_index in 0usize..10) {
+            let mut state = ProgressiveRemovalState::default();
+            state.level_index = level_index.min(PROGRESSIVE_REMOVAL_LEVELS.len() - 1);
+
+            let percentage = state.current_percentage();
+            prop_assert!(percentage <= 100);
+
+            // At level 0, should never remove
+            state.level_index = 0;
+            prop_assert!(!state.should_remove("any_id", 100));
+        }
+
+        /// Test that 0% level removes nothing
+        #[test]
+        fn progressive_removal_zero_removes_nothing(tool_ids in vec("[a-z]{1,10}", 0..20)) {
+            let state = ProgressiveRemovalState::default(); // level 0 = 0%
+
+            for tool_id in &tool_ids {
+                prop_assert!(
+                    !state.should_remove(tool_id, tool_ids.len()),
+                    "0% should not remove any tool"
+                );
+            }
+        }
+
+        /// Test that 100% level removes everything
+        #[test]
+        fn progressive_removal_hundred_removes_all(tool_ids in vec("[a-z]{1,10}", 0..20)) {
+            let mut state = ProgressiveRemovalState::default();
+            state.level_index = PROGRESSIVE_REMOVAL_LEVELS.len() - 1; // 100%
+
+            for tool_id in &tool_ids {
+                prop_assert!(
+                    state.should_remove(tool_id, tool_ids.len()),
+                    "100% should remove all tools"
+                );
+            }
+        }
+
+        /// Test should_remove determinism
+        #[test]
+        fn should_remove_deterministic(tool_id in "[a-z]{1,20}", level in 0usize..5) {
+            let mut state = ProgressiveRemovalState::default();
+            state.level_index = level;
+
+            let first = state.should_remove(&tool_id, 10);
+            let second = state.should_remove(&tool_id, 10);
+
+            prop_assert_eq!(first, second, "should_remove should be deterministic");
+        }
+    }
+
+    // Test advance() behavior as a regular test (no parameters)
+    #[test]
+    fn progressive_removal_advance_limited() {
+        let mut state = ProgressiveRemovalState::default();
+        let mut advances = 0;
+
+        while state.advance() {
+            advances += 1;
+            assert!(advances <= PROGRESSIVE_REMOVAL_LEVELS.len());
+        }
+
+        // Should have reached max level
+        assert_eq!(state.current_percentage(), 100);
+    }
+
+    // =========================================================================
+    // Compaction preserves essential content
+    // =========================================================================
+
+    proptest! {
+        /// Test that compaction cut point finding doesn't panic on various inputs
+        #[test]
+        fn find_cut_point_no_panic(
+            entries in vec(session_entry_strategy(), 0..30),
+            keep_recent in 100u32..=50_000
+        ) {
+            // This should not panic regardless of input
+            let _ = find_cut_point(&entries, 0, entries.len().max(1), keep_recent);
+        }
+
+        /// Test that valid cut points are within bounds
+        #[test]
+        fn find_cut_point_bounds(
+            entries in vec(session_entry_strategy(), 2..30),
+            keep_recent in 100u32..=50_000
+        ) {
+            if entries.len() >= 2 {
+                let result = find_cut_point(&entries, 0, entries.len(), keep_recent);
+                prop_assert!(
+                    result.first_kept_entry_index < entries.len(),
+                    "Cut point must be within bounds: {} >= {}",
+                    result.first_kept_entry_index,
+                    entries.len()
+                );
+            }
+        }
+
+        /// Test find_valid_cut_points returns valid indices
+        #[test]
+        fn find_valid_cut_points_indices(
+            entries in vec(session_entry_strategy(), 0..30)
+        ) {
+            let n = entries.len();
+            let cut_points = find_valid_cut_points(&entries, 0, n);
+
+            for &cp in &cut_points {
+                prop_assert!(cp < n, "Cut point {} must be < {}", cp, n);
+            }
+
+            // Cut points should be sorted
+            for window in cut_points.windows(2) {
+                prop_assert!(window[0] <= window[1], "Cut points should be sorted");
+            }
+        }
+    }
+
+    // =========================================================================
+    // File operations properties
+    // =========================================================================
+
+    proptest! {
+        /// Test that file operation extraction doesn't miss read/write operations
+        #[test]
+        fn extract_file_ops_handles_known_tools(
+            tool_name in prop_oneof![
+                Just("read"),
+                Just("write"),
+                Just("edit"),
+                Just("grep"),
+                Just("bash"),
+                Just("unknown"),
+            ],
+            path in "/[a-z]{1,10}/[a-z]{1,10}\\.[a-z]{2}",
+            success in any::<bool>()
+        ) {
+            let msg = SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: tool_name.to_string(),
+                        arguments: json!({"path": path}),
+                        thought_signature: None,
+                    })],
+                    api: String::new(),
+                    provider: String::new(),
+                    model: String::new(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 0,
+                    usage: Usage::default(),
+                },
+            };
+
+            let mut ops = FileOperations::default();
+            let mut status = HashMap::new();
+            status.insert("call_1".to_string(), success);
+
+            extract_file_ops_from_message(&msg, &mut ops, &status);
+
+            if success {
+                match tool_name {
+                    "read" | "grep" => {
+                        prop_assert!(
+                            ops.read.contains(&path),
+                            "Read/grep should add to read set"
+                        );
+                    }
+                    "write" => {
+                        prop_assert!(
+                            ops.written.contains(&path),
+                            "Write should add to written set"
+                        );
+                    }
+                    "edit" => {
+                        prop_assert!(
+                            ops.edited.contains(&path),
+                            "Edit should add to edited set"
+                        );
+                    }
+                    _ => {}
+                }
+            } else {
+                // Failed tools should not be tracked
+                prop_assert!(ops.read.is_empty());
+                prop_assert!(ops.written.is_empty());
+                prop_assert!(ops.edited.is_empty());
+            }
+        }
+
+        /// Test compute_file_lists consistency
+        #[test]
+        fn compute_file_lists_no_duplicates(
+            read_files in vec("/[a-z]{1,5}.rs", 0..10),
+            written_files in vec("/[a-z]{1,5}.rs", 0..10),
+            edited_files in vec("/[a-z]{1,5}.rs", 0..10)
+        ) {
+            let mut ops = FileOperations::default();
+            for f in &read_files {
+                ops.read.insert(f.clone());
+            }
+            for f in &written_files {
+                ops.written.insert(f.clone());
+            }
+            for f in &edited_files {
+                ops.edited.insert(f.clone());
+            }
+
+            let (read_only, modified) = compute_file_lists(&ops);
+
+            // Read-only and modified should be disjoint
+            for f in &read_only {
+                prop_assert!(
+                    !modified.contains(f),
+                    "File {} should not be in both sets",
+                    f
+                );
+            }
+
+            // Modified should include all written and edited files
+            for f in &written_files {
+                prop_assert!(
+                    modified.contains(f),
+                    "Written file {} should be in modified",
+                    f
+                );
+            }
+            for f in &edited_files {
+                prop_assert!(
+                    modified.contains(f),
+                    "Edited file {} should be in modified",
+                    f
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // CompactionSettings properties
+    // =========================================================================
+
+    // Test default settings as a regular test (no parameters)
+    #[test]
+    fn default_settings_valid() {
+        let settings = ResolvedCompactionSettings::default();
+        assert!(settings.enabled);
+        assert!(settings.context_window_tokens > 0);
+        assert!(settings.reserve_tokens > 0);
+        assert!(settings.keep_recent_tokens > 0);
+    }
+
+    proptest! {
+        /// Test settings with custom values
+        #[test]
+        fn custom_settings_valid(
+            context_window in 1000u32..=500_000,
+            reserve in 100u32..=50_000,
+            keep_recent in 100u32..=100_000,
+            enabled in any::<bool>()
+        ) {
+            prop_assume!(reserve <= context_window);
+            let settings = ResolvedCompactionSettings {
+                enabled,
+                context_window_tokens: context_window,
+                reserve_tokens: reserve,
+                keep_recent_tokens: keep_recent,
+            };
+
+            // Context window should accommodate reserve and keep_recent
+            // (this is a soft constraint, not enforced, but good to verify)
+            if settings.enabled {
+                prop_assert!(settings.context_window_tokens >= settings.reserve_tokens);
             }
         }
     }

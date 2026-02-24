@@ -14018,9 +14018,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             // Use the configured policy to check if the key is a secret.
                             // This respects the disclosure_allowlist in config.json.
-                            let allowed = policy_for_env
-                                .as_ref()
-                                .is_none_or(|policy| !policy.secret_broker.is_secret(&key));
+                            let allowed = policy_for_env.as_ref().map_or_else(
+                                || is_env_var_allowed(&key),
+                                |policy| !policy.secret_broker.is_secret(&key),
+                            );
                             tracing::debug!(
                                 event = "pijs.env.get",
                                 key = %key,
@@ -14339,7 +14340,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
+                                let mut reader = std::io::Read::take(file, MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
                                 reader.read_to_end(&mut buffer).map_err(|err| {
                                     rquickjs::Error::new_loading_message(
@@ -14425,42 +14426,83 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                use std::io::Read;
-                                let file = std::fs::File::open(&checked_path).map_err(|err| {
-                                    // Handle missing asset logic for non-Linux if needed, but for now
-                                    // standard error mapping is fine as the Linux block above handles
-                                    // the logic-heavy TOCTOU path.
-                                    match err.kind() {
-                                        std::io::ErrorKind::NotFound if in_ext_root && configured_repair_mode.should_apply() => {
-                                            // Duplicate logic from Linux block for missing asset fallback
-                                            // ... (omitted for brevity, assume caller handles logic parity)
-                                            // Ideally this logic should be factored out, but for now
-                                            // we just propagate the error.
-                                            rquickjs::Error::new_loading_message(
-                                                &path,
-                                                format!("host read: {err}"),
-                                            )
+                                let file = match std::fs::File::open(&checked_path) {
+                                    Ok(file) => file,
+                                    Err(err)
+                                        if err.kind() == std::io::ErrorKind::NotFound
+                                            && in_ext_root
+                                            && configured_repair_mode.should_apply() =>
+                                    {
+                                        let ext = checked_path
+                                            .extension()
+                                            .and_then(|e| e.to_str())
+                                            .unwrap_or("");
+                                        let fallback = match ext {
+                                            "html" | "htm" => {
+                                                "<!DOCTYPE html><html><body></body></html>"
+                                            }
+                                            "css" => "/* auto-repair: empty stylesheet */",
+                                            "js" | "mjs" => "// auto-repair: empty script",
+                                            "md" | "txt" | "toml" | "yaml" | "yml" => "",
+                                            _ => {
+                                                return Err(rquickjs::Error::new_loading_message(
+                                                    &path,
+                                                    format!("host read: {err}"),
+                                                ));
+                                            }
+                                        };
+
+                                        tracing::info!(
+                                            event = "pijs.repair.missing_asset",
+                                            path = %path,
+                                            ext = %ext,
+                                            "returning empty fallback for missing asset"
+                                        );
+
+                                        if let Ok(mut events) = repair_events.lock() {
+                                            events.push(ExtensionRepairEvent {
+                                                extension_id: String::new(),
+                                                pattern: RepairPattern::MissingAsset,
+                                                original_error: format!(
+                                                    "ENOENT: {}",
+                                                    checked_path.display()
+                                                ),
+                                                repair_action: format!(
+                                                    "returned empty {ext} fallback"
+                                                ),
+                                                success: true,
+                                                timestamp_ms: 0,
+                                            });
                                         }
-                                        _ => rquickjs::Error::new_loading_message(
+
+                                        return Ok(fallback.to_string());
+                                    }
+                                    Err(err) => {
+                                        return Err(rquickjs::Error::new_loading_message(
                                             &path,
                                             format!("host read: {err}"),
-                                        )
+                                        ));
                                     }
-                                })?;
+                                };
 
-                                let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
+                                let mut reader =
+                                    std::io::Read::take(file, MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
-                                reader.read_to_end(&mut buffer).map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read content: {err}"),
-                                    )
-                                })?;
+                                std::io::Read::read_to_end(&mut reader, &mut buffer).map_err(
+                                    |err| {
+                                        rquickjs::Error::new_loading_message(
+                                            &path,
+                                            format!("host read content: {err}"),
+                                        )
+                                    },
+                                )?;
 
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
-                                        format!("host read failed: file exceeds {} bytes", MAX_SYNC_READ_SIZE),
+                                        format!(
+                                            "host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"
+                                        ),
                                     ));
                                 }
 
@@ -21237,7 +21279,7 @@ export default ConfigLoader;
             assert_eq!(r["cryptoHasRandomUUID"], serde_json::json!(true));
             assert_eq!(r["http2HasConnect"], serde_json::json!(true));
             assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
-            assert_eq!(r["missingModuleThrows"], serde_json::json!(true));
+            assert_eq!(r["missingModuleThrows"], serde_json::json!(false));
         });
     }
 
