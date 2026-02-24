@@ -535,12 +535,21 @@ fn bash_nonzero_exit() {
         .await
     });
 
-    // Non-zero exit returns Error::Tool
-    let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
+    // Non-zero exit returns Ok(ToolOutput) with is_error=true.
+    let result = output.expect("non-zero exit should still return tool output");
+    let text = first_text(&result.content);
+    h.log().info(
+        "result",
+        format!("is_error={}, text={text}", result.is_error),
+    );
+    assert!(result.is_error, "non-zero exit must set is_error");
     assert!(
-        matches!(err, Error::Tool { .. }),
-        "should be Tool error: {err}"
+        text.contains("stderr_msg"),
+        "stderr output should be preserved: {text}"
+    );
+    assert!(
+        text.contains("code 42"),
+        "output should include exit code diagnostics: {text}"
     );
 }
 
@@ -559,12 +568,17 @@ fn bash_timeout() {
         .await
     });
 
-    // Timeout should result in an error (cancelled)
-    let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
+    // Timeout should return Ok(ToolOutput) with is_error=true.
+    let result = output.expect("timeout should still return tool output");
+    let text = first_text(&result.content).to_ascii_lowercase();
+    h.log().info(
+        "result",
+        format!("is_error={}, text={text}", result.is_error),
+    );
+    assert!(result.is_error, "timeout must set is_error");
     assert!(
-        matches!(err, Error::Tool { .. }),
-        "should be Tool error: {err}"
+        text.contains("timed out") || text.contains("timeout"),
+        "timeout diagnostics missing: {text}"
     );
 }
 
@@ -583,9 +597,13 @@ fn bash_timeout_reports_partial_output_for_repro() {
         .await
     });
 
-    let err = output.expect_err("timeout should return tool error");
-    let msg = err.to_string().to_ascii_lowercase();
-    h.log().info("result", format!("error={msg}"));
+    let result = output.expect("timeout should return tool output");
+    let msg = first_text(&result.content).to_ascii_lowercase();
+    h.log().info(
+        "result",
+        format!("is_error={}, text={msg}", result.is_error),
+    );
+    assert!(result.is_error, "timeout must set is_error");
     assert!(
         msg.contains("before-timeout"),
         "expected partial command output in timeout diagnostics: {msg}"
@@ -1205,12 +1223,14 @@ fn bash_process_tree_cleanup_on_timeout() {
         .await
     });
 
-    let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
-    assert!(
-        err.to_string().contains("timed out"),
-        "should report timeout: {err}"
+    let result = output.expect("timeout should return tool output");
+    let text = first_text(&result.content);
+    h.log().info(
+        "result",
+        format!("is_error={}, text={text}", result.is_error),
     );
+    assert!(result.is_error, "timeout must set is_error");
+    assert!(text.contains("timed out"), "should report timeout: {text}");
 
     // Give a moment for cleanup
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1330,9 +1350,13 @@ fn bash_exit_code_captured() {
             .await
         });
 
-        let err = output.unwrap_err();
-        let msg = err.to_string();
-        h.log().info("result", format!("exit {code}: error={msg}"));
+        let result = output.expect("non-zero exit should return tool output");
+        let msg = first_text(&result.content).to_string();
+        h.log().info(
+            "result",
+            format!("exit {code}: is_error={}, text={msg}", result.is_error),
+        );
+        assert!(result.is_error, "non-zero exit should set is_error");
         assert!(
             msg.contains(&format!("code {code}")),
             "should contain exit code {code}: {msg}"

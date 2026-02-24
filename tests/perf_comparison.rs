@@ -807,7 +807,7 @@ fn test_comparison_rows_from_empty_data() {
 /// This is intentionally `#[ignore]` so `cargo test` is deterministic and does not
 /// rewrite repository files unless explicitly requested.
 #[test]
-#[ignore = "writes tracked perf artifacts under tests/perf/reports; run manually"]
+#[ignore = "writes tracked perf artifacts under tests/perf/reports; run manually: cargo test --test perf_comparison -- --include-ignored generate_perf_comparison"]
 fn generate_perf_comparison() {
     let root = root_dir();
 

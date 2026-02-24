@@ -491,7 +491,7 @@ mod bash_tool {
 
             let text = get_text_content(&result.content);
             assert!(text.contains("Hello, World!"));
-            assert!(result.details.is_none());
+            assert!(!result.is_error, "successful command should not be error");
         });
     }
 
@@ -505,11 +505,12 @@ mod bash_tool {
                 "timeout": 1
             });
 
-            let err = tool
+            let output = tool
                 .execute("test-id", input, None)
                 .await
-                .expect_err("should timeout");
-            let message = err.to_string();
+                .expect("tool invocation should return output envelope");
+            assert!(output.is_error, "timeout should be marked as error");
+            let message = get_text_content(&output.content);
             harness.log().info_ctx("verify", "timeout message", |ctx| {
                 ctx.push(("message".into(), message.clone()));
             });
@@ -549,11 +550,13 @@ mod bash_tool {
                 "command": "exit 42"
             });
 
-            let err = tool
+            let output = tool
                 .execute("test-id", input, None)
                 .await
-                .expect_err("should error");
-            assert!(err.to_string().contains("Command exited with code 42"));
+                .expect("tool invocation should return output envelope");
+            assert!(output.is_error, "non-zero exit should be marked as error");
+            let message = get_text_content(&output.content);
+            assert!(message.contains("Command exited with code 42"));
         });
     }
 
@@ -1642,9 +1645,13 @@ mod e2e_bash {
                 execute_tool_with_diagnostics(&harness, &tool, "bash", "bash-003", input.clone())
                     .await;
 
-            // Should error with non-zero exit code (127 = command not found)
-            assert!(result.is_err(), "nonexistent command should fail");
-            let message = result.unwrap_err().to_string();
+            // Should be reported as an error output envelope (127 = command not found)
+            let output = result.expect("tool invocation should return output envelope");
+            assert!(
+                output.is_error,
+                "nonexistent command should be marked as error"
+            );
+            let message = get_text_content(&output.content);
             assert!(
                 message.contains("127") || message.contains("not found"),
                 "expected exit code 127 or 'not found' in: {message}"
@@ -1666,8 +1673,9 @@ mod e2e_bash {
                 execute_tool_with_diagnostics(&harness, &tool, "bash", "bash-004", input.clone())
                     .await;
 
-            assert!(result.is_err());
-            let message = result.unwrap_err().to_string();
+            let output = result.expect("tool invocation should return output envelope");
+            assert!(output.is_error, "timeout should be marked as error");
+            let message = get_text_content(&output.content);
             assert!(message.contains("timed out"));
         });
     }
@@ -2130,17 +2138,17 @@ fn e2e_all_tools_roundtrip() {
 }
 
 // ============================================================================
-// Security abuse-case regression tests (bd-1f42.5.1)
+// Security boundary regression tests (bd-1f42.5.1)
 // ============================================================================
-// These tests document the security boundary of the tool layer.
-// Tools intentionally rely on agent-level trust (the LLM) rather than
-// tool-level sandboxing.  These tests verify current behaviour so that
-// any future tightening is deliberate, not accidental.
+// These tests verify current hardened behavior for traversal/escape attempts.
+// Successful blocking may surface as either:
+// - `Err(...)` from `tool.execute`, or
+// - `Ok(ToolOutput { is_error: true, ... })`.
 
 mod security_path_traversal {
     use super::*;
 
-    /// Read tool follows parent-directory traversal (`../`) – by design.
+    /// Read tool should block parent-directory traversal (`../`).
     #[test]
     fn read_parent_dir_traversal() {
         asupersync::test_utils::run_test(|| async {
@@ -2155,16 +2163,20 @@ mod security_path_traversal {
                 "path": "../secret.txt"
             });
             let result = tool.execute("sec-read-01", input, None).await;
-            let output = result.expect("read with ../ should succeed (by design)");
-            let text = get_text_content(&output.content);
-            assert!(
-                text.contains("TOP_SECRET_DATA"),
-                "parent traversal should reach file: {text}"
-            );
+            match result {
+                Ok(output) => {
+                    assert!(output.is_error, "traversal should be marked as error");
+                    let text = get_text_content(&output.content);
+                    assert!(!text.contains("TOP_SECRET_DATA"));
+                }
+                Err(err) => {
+                    assert!(!err.to_string().contains("TOP_SECRET_DATA"));
+                }
+            }
         });
     }
 
-    /// Write tool creates files outside CWD via `../` – by design.
+    /// Write tool should block writes outside CWD via `../`.
     #[test]
     fn write_parent_dir_traversal() {
         asupersync::test_utils::run_test(|| async {
@@ -2179,14 +2191,18 @@ mod security_path_traversal {
                 "content": "ESCAPED_CONTENT"
             });
             let result = tool.execute("sec-write-01", input, None).await;
-            result.expect("write with ../ should succeed (by design)");
+            if let Ok(output) = result {
+                assert!(output.is_error, "traversal write should be marked as error");
+            }
 
-            let written = std::fs::read_to_string(parent.path().join("escaped.txt")).unwrap();
-            assert_eq!(written, "ESCAPED_CONTENT");
+            assert!(
+                !parent.path().join("escaped.txt").exists(),
+                "write traversal should not create escaped file"
+            );
         });
     }
 
-    /// Edit tool operates on files outside CWD via `../` – by design.
+    /// Edit tool should block edits outside CWD via `../`.
     #[test]
     fn edit_parent_dir_traversal() {
         asupersync::test_utils::run_test(|| async {
@@ -2204,14 +2220,16 @@ mod security_path_traversal {
                 "newText": "MODIFIED_CONTENT"
             });
             let result = tool.execute("sec-edit-01", input, None).await;
-            result.expect("edit with ../ should succeed (by design)");
+            if let Ok(output) = result {
+                assert!(output.is_error, "traversal edit should be marked as error");
+            }
 
             let content = std::fs::read_to_string(&target).unwrap();
-            assert_eq!(content, "MODIFIED_CONTENT");
+            assert_eq!(content, "ORIGINAL_CONTENT");
         });
     }
 
-    /// Read tool allows absolute paths outside CWD – by design.
+    /// Read tool should block absolute paths outside CWD.
     #[test]
     fn read_absolute_path_outside_cwd() {
         asupersync::test_utils::run_test(|| async {
@@ -2225,13 +2243,23 @@ mod security_path_traversal {
                 "path": outside_file.to_string_lossy()
             });
             let result = tool.execute("sec-read-02", input, None).await;
-            let output = result.expect("absolute path outside CWD should work");
-            let text = get_text_content(&output.content);
-            assert!(text.contains("OUTSIDE_DATA"));
+            match result {
+                Ok(output) => {
+                    assert!(
+                        output.is_error,
+                        "absolute path outside cwd should be marked as error"
+                    );
+                    let text = get_text_content(&output.content);
+                    assert!(!text.contains("OUTSIDE_DATA"));
+                }
+                Err(err) => {
+                    assert!(!err.to_string().contains("OUTSIDE_DATA"));
+                }
+            }
         });
     }
 
-    /// Read tool follows symlinks that point outside CWD – by design.
+    /// Read tool should block symlink escapes that point outside CWD.
     #[test]
     #[cfg(unix)]
     fn read_symlink_escape() {
@@ -2249,14 +2277,20 @@ mod security_path_traversal {
                 "path": link.to_string_lossy()
             });
             let result = tool.execute("sec-read-03", input, None).await;
-            let output = result.expect("symlink escape should succeed (by design)");
-            let text = get_text_content(&output.content);
-            assert!(text.contains("SYMLINK_SECRET"));
+            match result {
+                Ok(output) => {
+                    assert!(output.is_error, "symlink escape should be marked as error");
+                    let text = get_text_content(&output.content);
+                    assert!(!text.contains("SYMLINK_SECRET"));
+                }
+                Err(err) => {
+                    assert!(!err.to_string().contains("SYMLINK_SECRET"));
+                }
+            }
         });
     }
 
-    /// Write tool replaces symlinks with regular files (atomic rename).
-    /// This prevents symlink-following attacks: the original target is untouched.
+    /// Write tool should reject writes through symlink escape paths.
     #[test]
     #[cfg(unix)]
     fn write_replaces_symlink_with_regular_file() {
@@ -2275,21 +2309,22 @@ mod security_path_traversal {
                 "content": "NEW_CONTENT"
             });
             let result = tool.execute("sec-write-02", input, None).await;
-            result.expect("write at symlink path should succeed");
+            if let Ok(output) = result {
+                assert!(
+                    output.is_error,
+                    "write through symlink should be marked as error"
+                );
+            }
 
-            // Atomic rename replaces the symlink with a regular file
-            assert!(
-                !link.symlink_metadata().unwrap().file_type().is_symlink(),
-                "symlink should be replaced by a regular file"
-            );
-            let link_content = std::fs::read_to_string(&link).unwrap();
-            assert_eq!(link_content, "NEW_CONTENT");
-
-            // Original target is untouched (safe against symlink attacks)
             let target_content = std::fs::read_to_string(&target).unwrap();
             assert_eq!(
                 target_content, "ORIGINAL",
-                "original symlink target should be untouched"
+                "symlink target should remain untouched"
+            );
+
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "symlink should remain in place after blocked write"
             );
         });
     }

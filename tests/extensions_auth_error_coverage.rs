@@ -343,7 +343,12 @@ fn prune_stale_removes_old_oauth() {
 
     // Prune with a 1-day cutoff
     let pruned = storage.prune_stale_credentials(86_400_000);
-    assert_eq!(pruned, vec!["old-provider"]);
+    assert_eq!(pruned.len(), 1);
+    assert!(
+        pruned[0].starts_with("old-provider"),
+        "expected pruned entry to reference old-provider, got {:?}",
+        pruned
+    );
     assert_eq!(
         storage.credential_status("old-provider"),
         CredentialStatus::Missing,

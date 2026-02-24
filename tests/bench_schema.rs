@@ -21,6 +21,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Schema Definitions ──────────────────────────────────────────────────────
@@ -222,11 +224,13 @@ fn has_required_fields(record: &Value, fields: &[&str]) -> Vec<String> {
 
 #[cfg(unix)]
 fn unique_temp_dir(prefix: &str) -> PathBuf {
+    static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("pi-{prefix}-{nanos}"))
+    let seq = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("pi-{prefix}-{}-{nanos}-{seq}", std::process::id()))
 }
 
 #[cfg(unix)]

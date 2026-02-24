@@ -738,7 +738,7 @@ fn truncate_head_empty_lines() {
     assert!(result.truncated, "should truncate");
     assert_eq!(result.output_lines, 3);
     // First 3 lines should be empty strings
-    let lines: Vec<&str> = result.content.split('\n').collect();
+    let lines: Vec<&str> = result.content.split_terminator('\n').collect();
     assert!(lines.len() <= 3, "should have at most 3 lines");
 }
 

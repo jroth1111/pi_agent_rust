@@ -110,9 +110,9 @@ fn openai_body(prompt: &str) -> serde_json::Value {
     })
 }
 
-fn gemini_url(model: &str, api_key: &str) -> String {
+fn gemini_url(model: &str, _api_key: &str) -> String {
     format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
     )
 }
 

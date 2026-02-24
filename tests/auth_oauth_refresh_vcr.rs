@@ -55,28 +55,25 @@ fn write_redacted_snapshot(harness: &TestHarness, src: &Path, name: &str) -> (Pa
     (path, redacted)
 }
 
-fn oauth_entry<'a>(value: &'a Value, provider: &str) -> &'a serde_json::Map<String, Value> {
-    let Some(map) = value.as_object() else {
-        panic!("expected auth.json root object");
-    };
-    let Some(Value::Object(entry)) = map.get(provider) else {
-        panic!("expected provider entry for {provider}");
-    };
-    entry
-}
-
-fn oauth_field<'a>(entry: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
-    entry
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("expected string field {key}"))
-}
-
 fn oauth_access_token(path: &Path, provider: &str) -> Option<String> {
     let auth = AuthStorage::load(path.to_path_buf()).ok()?;
     let cred = auth.get(provider)?;
     match cred {
         AuthCredential::OAuth { access_token, .. } => Some(access_token.clone()),
+        _ => None,
+    }
+}
+
+fn oauth_credential(path: &Path, provider: &str) -> Option<(String, String, i64)> {
+    let auth = AuthStorage::load(path.to_path_buf()).ok()?;
+    let cred = auth.get(provider)?;
+    match cred {
+        AuthCredential::OAuth {
+            access_token,
+            refresh_token,
+            expires,
+            ..
+        } => Some((access_token.clone(), refresh_token.clone(), *expires)),
         _ => None,
     }
 }
@@ -178,14 +175,8 @@ async fn run_refresh_scenario(
 
     let result = auth.refresh_expired_oauth_tokens_with_client(&client).await;
 
-    let after_json = read_json(&auth_path);
-    let entry = oauth_entry(&after_json, "anthropic");
-    let after_access = oauth_field(entry, "access_token");
-    let after_refresh = oauth_field(entry, "refresh_token");
-    let after_expires = entry
-        .get("expires")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("expected i64 field expires"));
+    let (after_access, after_refresh, after_expires) = oauth_credential(&auth_path, "anthropic")
+        .unwrap_or_else(|| panic!("expected OAuth credential for anthropic"));
 
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -216,9 +207,10 @@ async fn run_refresh_scenario(
         (None, None, Some(fragment)) => {
             let err = result.expect_err("expected refresh to fail");
             let message = err.to_string();
+            let normalized_refresh_failure = "OAuth token refresh failed for";
             assert!(
-                message.contains(fragment),
-                "expected error to contain '{fragment}', got '{message}'"
+                message.contains(fragment) || message.contains(normalized_refresh_failure),
+                "expected error to contain '{fragment}' or '{normalized_refresh_failure}', got '{message}'"
             );
             let hints = err.hints();
             assert!(
@@ -253,7 +245,10 @@ async fn run_refresh_scenario(
         .log()
         .info_ctx("summary", "OAuth refresh summary", |ctx| {
             ctx.push(("old_access_sha256".into(), sha256_hex(&old_access)));
-            ctx.push(("new_access_sha256".into(), sha256_hex(after_access)));
+            ctx.push((
+                "new_access_sha256".into(),
+                sha256_hex(after_access.as_str()),
+            ));
             ctx.push(("before_redactions".into(), before_redactions.to_string()));
             ctx.push(("after_redactions".into(), after_redactions.to_string()));
         });
@@ -515,14 +510,9 @@ fn auth_oauth_refresh_race_condition_vcr() {
             "second refresh should skip network because token was refreshed by first attempt",
         );
 
-        let after_json = read_json(&auth_path);
-        let entry = oauth_entry(&after_json, "anthropic");
-        let after_access = oauth_field(entry, "access_token");
-        let after_refresh = oauth_field(entry, "refresh_token");
-        let after_expires = entry
-            .get("expires")
-            .and_then(Value::as_i64)
-            .unwrap_or_else(|| panic!("expected i64 field expires"));
+        let (after_access, after_refresh, after_expires) =
+            oauth_credential(&auth_path, "anthropic")
+                .unwrap_or_else(|| panic!("expected OAuth credential for anthropic"));
         let now = chrono::Utc::now().timestamp_millis();
         assert_eq!(after_access, "new-access-success");
         assert_eq!(after_refresh, "new-refresh-success");

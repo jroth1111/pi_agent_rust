@@ -363,7 +363,7 @@ fn regression_verdict_is_generated() {
     let pass_rate_ok = current_rate >= min_rate;
     let fail_count_ok = current_fail <= max_fail + 36; // baseline max_fail + tolerance
 
-    let verdict = if pass_rate_ok && fail_count_ok {
+    let status = if pass_rate_ok && fail_count_ok {
         "pass"
     } else {
         "fail"
@@ -372,7 +372,8 @@ fn regression_verdict_is_generated() {
     // Build verdict JSON to verify structure.
     let verdict_json = serde_json::json!({
         "schema": "pi.conformance.regression_gate.v1",
-        "verdict": verdict,
+        "status": status,
+        "verdict": status,
         "checks": {
             "pass_rate": {
                 "actual": current_rate,
@@ -387,8 +388,21 @@ fn regression_verdict_is_generated() {
         }
     });
 
+    // Emit the canonical artifact consumed by full-suite gates.
+    let verdict_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/ext_conformance/reports/regression_verdict.json");
+    if let Some(parent) = verdict_path.parent() {
+        std::fs::create_dir_all(parent)
+            .expect("create regression_verdict artifact directory");
+    }
+    let pretty_json =
+        serde_json::to_string_pretty(&verdict_json).expect("serialize regression verdict");
+    std::fs::write(&verdict_path, pretty_json)
+        .expect("write tests/ext_conformance/reports/regression_verdict.json");
+
     // Verify the structure is valid JSON.
     assert!(verdict_json["schema"].is_string());
+    assert!(verdict_json["status"].is_string());
     assert!(verdict_json["verdict"].is_string());
     assert!(verdict_json["checks"]["pass_rate"]["ok"].is_boolean());
     assert!(verdict_json["checks"]["fail_count"]["ok"].is_boolean());

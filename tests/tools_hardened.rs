@@ -648,27 +648,25 @@ mod bash_hardened {
             let result = tool.execute("h-bash-2a", input, None).await;
             assert!(result.is_ok(), "exit 0 should succeed");
 
-            // Exit 1 should fail
+            // Exit 1 should be reported as an error envelope
             let input = serde_json::json!({"command": "exit 1"});
-            let err = tool
+            let output = tool
                 .execute("h-bash-2b", input, None)
                 .await
-                .expect_err("exit 1 should fail");
-            assert!(
-                err.to_string().contains("code 1"),
-                "should report exit code 1"
-            );
+                .expect("tool invocation should return an output envelope");
+            assert!(output.is_error, "exit 1 should mark output as error");
+            let text = get_text(&output.content);
+            assert!(text.contains("code 1"), "should report exit code 1");
 
-            // Exit 127 (command not found convention)
+            // Exit 127 (command not found convention) should also be error envelope
             let input = serde_json::json!({"command": "exit 127"});
-            let err = tool
+            let output = tool
                 .execute("h-bash-2c", input, None)
                 .await
-                .expect_err("exit 127 should fail");
-            assert!(
-                err.to_string().contains("127"),
-                "should report exit code 127"
-            );
+                .expect("tool invocation should return an output envelope");
+            assert!(output.is_error, "exit 127 should mark output as error");
+            let text = get_text(&output.content);
+            assert!(text.contains("127"), "should report exit code 127");
 
             h.log().info("verify", "all exit code boundaries passed");
         });
@@ -680,11 +678,12 @@ mod bash_hardened {
             let h = TestHarness::new("bash_shell_syntax_error");
             let tool = pi::tools::BashTool::new(h.temp_dir());
             let input = serde_json::json!({"command": "if then else fi"});
-            let err = tool
+            let output = tool
                 .execute("h-bash-3", input, None)
                 .await
-                .expect_err("syntax error should fail");
-            let msg = err.to_string();
+                .expect("tool invocation should return an output envelope");
+            assert!(output.is_error, "syntax errors should mark output as error");
+            let msg = get_text(&output.content);
             h.log().info("verify", format!("error={msg}"));
             // Should report non-zero exit
             assert!(
@@ -757,11 +756,12 @@ mod bash_hardened {
                 "command": format!("sleep 30 && touch {marker_str}"),
                 "timeout": 1
             });
-            let err = tool
+            let output = tool
                 .execute("h-bash-7", input, None)
                 .await
-                .expect_err("should timeout");
-            let msg = err.to_string();
+                .expect("tool invocation should return an output envelope");
+            assert!(output.is_error, "timeout should mark output as error");
+            let msg = get_text(&output.content);
             h.log().info("verify", format!("error={msg}"));
             assert!(msg.contains("timed out"), "should report timeout: {msg}");
 

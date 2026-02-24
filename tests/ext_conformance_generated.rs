@@ -4439,7 +4439,7 @@ macro_rules! conformance_test {
     };
     ($name:ident, $ext_id:literal, ignore $(,)?) => {
         #[test]
-        #[ignore = "TODO: enable once full extension conformance runner is supported"]
+        #[ignore = "tier 3-5: multi-file, npm deps, UI, or platform-specific (run with --include-ignored)"]
         fn $name() {
             run_conformance_test($ext_id);
         }

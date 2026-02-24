@@ -123,6 +123,7 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: SessionMessage) -> 
     SessionEntry::Message(MessageEntry {
         base: base(Some(id), parent_id),
         message,
+        metadata: pi::context::MessageMetadata::default(),
     })
 }
 
@@ -349,6 +350,14 @@ fn describe_entry(entry: &SessionEntry) -> String {
         }
         SessionEntry::Label(label) => format!("Entry(Label): {}", label.target_id),
         SessionEntry::SessionInfo(_) => "Entry(SessionInfo)".to_string(),
+        SessionEntry::StateDigest(_) => "Entry(StateDigest)".to_string(),
+        SessionEntry::TaskCheckpoint(_) => "Entry(TaskCheckpoint)".to_string(),
+        SessionEntry::TaskCreated(_) => "Entry(TaskCreated)".to_string(),
+        SessionEntry::TaskTransition(_) => "Entry(TaskTransition)".to_string(),
+        SessionEntry::VerificationEvidence(_) => "Entry(VerificationEvidence)".to_string(),
+        SessionEntry::CloseDecision(_) => "Entry(CloseDecision)".to_string(),
+        SessionEntry::HumanBlockerRaised(_) => "Entry(HumanBlockerRaised)".to_string(),
+        SessionEntry::HumanBlockerResolved(_) => "Entry(HumanBlockerResolved)".to_string(),
         SessionEntry::Custom(custom) => format!("Entry(Custom): {}", custom.custom_type),
     }
 }
@@ -483,6 +492,7 @@ fn prepare_compaction_returns_none_when_first_kept_entry_missing_id() {
     let entries = vec![SessionEntry::Message(MessageEntry {
         base: base(None, None),
         message: user_text("hello"),
+        metadata: pi::context::MessageMetadata::default(),
     })];
 
     dump_timeline(&harness, "setup", &entries);

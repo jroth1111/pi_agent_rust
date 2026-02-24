@@ -6,8 +6,10 @@ use asupersync::runtime::RuntimeBuilder;
 use common::{TestHarness, validate_jsonl};
 use pi::Error;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
+use pi::reliability::{CloseOutcomeKind, ClosePayload, CloseResult, EvidenceRecord, StateDigest};
 use pi::session::{
-    CustomEntry, EntryBase, Session, SessionEntry, SessionHeader, SessionMessage, encode_cwd,
+    CustomEntry, EntryBase, RELIABILITY_STATE_DIGEST_ENTRY_TYPE, Session, SessionEntry,
+    SessionHeader, SessionMessage, encode_cwd,
 };
 use pi::session_index::SessionIndex;
 use proptest::prelude::*;
@@ -157,6 +159,7 @@ fn proptest_message_entries() -> impl Strategy<Value = Vec<SessionEntry>> {
                 entries.push(SessionEntry::Message(pi::session::MessageEntry {
                     base,
                     message,
+                    metadata: pi::context::MessageMetadata::default(),
                 }));
             }
             entries
@@ -728,6 +731,144 @@ fn save_round_trips_custom_entry() {
                 )
             },
             "Custom(customType=note, data.tag=demo)",
+        );
+    });
+}
+
+#[test]
+fn open_accepts_legacy_reliability_custom_entries() {
+    run_async_test(async {
+        let harness = TestHarness::new("open_accepts_legacy_reliability_custom_entries");
+        let legacy_digest = StateDigest::new("legacy objective", "discover");
+        let jsonl = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"sess-legacy-rel\",\"timestamp\":\"2026-02-03T00:00:00.000Z\",\"cwd\":\"/tmp/project\"}}\n\
+{{\"type\":\"message\",\"timestamp\":\"2026-02-03T00:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1706918401000}}}}\n\
+{{\"type\":\"custom\",\"timestamp\":\"2026-02-03T00:00:02.000Z\",\"customType\":\"{}\",\"data\":{}}}\n",
+            RELIABILITY_STATE_DIGEST_ENTRY_TYPE,
+            serde_json::to_string(&legacy_digest).expect("serialize legacy digest")
+        );
+        let path = write_session_file(&harness, &jsonl);
+        let loaded = open_session(&path)
+            .await
+            .expect("open legacy reliability session");
+
+        assert_contains_entry(
+            &loaded.entries,
+            |entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Custom(custom) if custom.custom_type == RELIABILITY_STATE_DIGEST_ENTRY_TYPE
+                )
+            },
+            "legacy reliability custom entry",
+        );
+        let latest = loaded
+            .latest_state_digest_entry()
+            .expect("latest digest from legacy custom");
+        assert_eq!(latest.objective, "legacy objective");
+        assert_eq!(latest.phase, "discover");
+    });
+}
+
+#[test]
+fn mixed_reliability_entries_round_trip_preserves_semantics() {
+    run_async_test(async {
+        let harness = TestHarness::new("mixed_reliability_entries_round_trip_preserves_semantics");
+        let base_dir = harness.temp_path("sessions");
+        let mut session = Session::create_with_dir(Some(base_dir));
+        session.append_message(make_user_message("start"));
+
+        let typed_digest = StateDigest::new("typed objective", "execute");
+        session.append_state_digest_entry(typed_digest.clone());
+        session.append_custom_entry(
+            RELIABILITY_STATE_DIGEST_ENTRY_TYPE.to_string(),
+            Some(
+                serde_json::to_value(StateDigest::new("legacy objective", "verify"))
+                    .expect("legacy value"),
+            ),
+        );
+        let evidence = EvidenceRecord::from_command_output(
+            "task-legacy-mixed",
+            "cargo test session_conformance",
+            0,
+            "ok",
+            "",
+            Vec::new(),
+        );
+        session.append_verification_evidence_entry(evidence);
+
+        let loaded = save_and_reopen(&harness, &mut session).await;
+        assert_contains_entry(
+            &loaded.entries,
+            |entry| matches!(entry, SessionEntry::StateDigest(_)),
+            "typed reliability state digest entry",
+        );
+        assert_contains_entry(
+            &loaded.entries,
+            |entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Custom(custom) if custom.custom_type == RELIABILITY_STATE_DIGEST_ENTRY_TYPE
+                )
+            },
+            "legacy reliability state digest custom entry",
+        );
+        let latest = loaded
+            .latest_state_digest_entry()
+            .expect("latest digest in mixed session");
+        assert_eq!(
+            latest.objective, "legacy objective",
+            "latest digest should resolve across mixed typed+legacy entries",
+        );
+    });
+}
+
+#[test]
+fn html_export_includes_typed_reliability_entries() {
+    run_async_test(async {
+        let harness = TestHarness::new("html_export_includes_typed_reliability_entries");
+        let base_dir = harness.temp_path("sessions");
+        let mut session = Session::create_with_dir(Some(base_dir));
+        session.append_message(make_user_message("hello"));
+        session.append_task_created_entry(
+            "task-html".to_string(),
+            "render reliability html".to_string(),
+            Some("agent-1".to_string()),
+        );
+        let evidence = EvidenceRecord::from_command_output(
+            "task-html",
+            "cargo test --test session_conformance",
+            0,
+            "ok",
+            "",
+            Vec::new(),
+        );
+        session.append_verification_evidence_entry(evidence);
+        session.append_close_decision_entry(
+            ClosePayload {
+                task_id: "task-html".to_string(),
+                outcome: "Completed HTML coverage".to_string(),
+                outcome_kind: Some(CloseOutcomeKind::Success),
+                acceptance_ids: vec!["html-1".to_string()],
+                evidence_ids: vec!["evidence-1".to_string()],
+                trace_parent: Some("bd-jt3.3".to_string()),
+            },
+            CloseResult::approved(),
+        );
+
+        let loaded = save_and_reopen(&harness, &mut session).await;
+        let html = loaded.to_html();
+        assert!(
+            html.contains("Reliability Task Created"),
+            "expected task-created reliability label in html: {html}"
+        );
+        assert!(
+            html.contains("Reliability Verification Evidence"),
+            "expected verification reliability label in html: {html}"
+        );
+        assert!(
+            html.contains("Reliability Close Decision"),
+            "expected close-decision reliability label in html: {html}"
         );
     });
 }

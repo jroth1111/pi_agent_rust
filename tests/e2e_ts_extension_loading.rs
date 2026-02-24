@@ -703,6 +703,10 @@ export default function init(pi: any): void {
 
     let spec_a = JsExtensionLoadSpec::from_entry_path(&ext_a_path).expect("spec a");
     let spec_b = JsExtensionLoadSpec::from_entry_path(&ext_b_path).expect("spec b");
+    assert_ne!(
+        spec_a.extension_id, spec_b.extension_id,
+        "fixture extension IDs must be unique"
+    );
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
@@ -726,9 +730,13 @@ export default function init(pi: any): void {
         let manager = manager.clone();
         async move {
             manager
-                .load_js_extensions(vec![spec_a, spec_b])
+                .load_js_extensions(vec![spec_a])
                 .await
-                .expect("load multiple .ts extensions");
+                .expect("load first .ts extension");
+            manager
+                .load_js_extensions(vec![spec_b])
+                .await
+                .expect("load second .ts extension");
         }
     });
 

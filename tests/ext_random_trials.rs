@@ -818,10 +818,19 @@ fn write_trial_output(run: &TrialRun) {
 
 /// Run a batch of random extension trials.
 ///
-/// This test is `#[ignore]` by default — run with `--include-ignored`.
+/// This test is opt-in to keep default `cargo test` deterministic while still
+/// making trial execution discoverable in normal test output.
+///
+/// Run manually:
+/// `PI_RUN_RANDOM_TRIALS=1 cargo test --test ext_random_trials random_trials_batch -- --nocapture`
 #[test]
-#[ignore = "long-running random trial batch"]
 fn random_trials_batch() {
+    if std::env::var("PI_RUN_RANDOM_TRIALS").ok().as_deref() != Some("1") {
+        eprintln!(
+            "[random_trials] skipped: set PI_RUN_RANDOM_TRIALS=1 to execute long-running batch"
+        );
+        return;
+    }
     let run = run_random_trials();
     write_trial_output(&run);
 

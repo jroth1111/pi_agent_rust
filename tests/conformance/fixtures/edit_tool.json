@@ -60,7 +60,7 @@
       "name": "edit_nonexistent_file",
       "description": "Editing non-existent file should error",
       "input": {
-        "path": "/nonexistent/file.txt",
+        "path": "nonexistent/file.txt",
         "oldText": "old",
         "newText": "new"
       },

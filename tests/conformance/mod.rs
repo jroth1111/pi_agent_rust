@@ -65,6 +65,9 @@ pub struct TestCase {
     /// Tags for filtering tests
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Optional source snippet to run anti-tautology checks against.
+    #[serde(default)]
+    pub quality_probe_source: Option<String>,
 }
 
 /// Setup steps for test initialization.
@@ -110,7 +113,9 @@ pub struct Expected {
 
 /// Result of running a conformance test.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TestResult {
+    #[allow(dead_code)]
     pub name: String,
     pub passed: bool,
     pub message: Option<String>,
@@ -141,6 +146,7 @@ impl TestResult {
 }
 
 /// Load a fixture file from the fixtures directory.
+#[allow(dead_code)]
 pub fn load_fixture(name: &str) -> std::io::Result<FixtureFile> {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/conformance/fixtures")

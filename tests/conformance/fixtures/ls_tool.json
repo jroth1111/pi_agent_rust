@@ -28,7 +28,7 @@
     {
       "name": "ls_nonexistent_directory",
       "description": "List nonexistent directory errors",
-      "input": {"path": "/nonexistent/directory"},
+      "input": {"path": "nonexistent/directory"},
       "expect_error": true,
       "error_contains": "Path not found",
       "expected": {}

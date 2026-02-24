@@ -708,8 +708,8 @@ fn anthropic_base(server: &str) -> String {
     format!("{server}/v1/messages")
 }
 
-fn gemini_route(model: &str, key: &str) -> String {
-    format!("/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}")
+fn gemini_route(model: &str, _key: &str) -> String {
+    format!("/v1beta/models/{model}:streamGenerateContent?alt=sse")
 }
 fn gemini_base(server: &str) -> String {
     format!("{server}/v1beta")

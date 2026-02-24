@@ -6,8 +6,10 @@ use crate::conformance::{FixtureFile, SetupStep, TestCase, TestResult, validate_
 use clap::{Parser, error::ErrorKind};
 use pi::cli::{Cli, Commands};
 use pi::model::ContentBlock;
-use pi::tools::Tool;
+use pi::reliability::detect_tautological_test_patterns;
+use pi::tools::{Tool, ToolOutput};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -25,6 +27,10 @@ pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
 
 /// Run a single test case.
 async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
+    if let Err(reason) = validate_quality_gate(case) {
+        return TestResult::fail(&case.name, format!("Quality gate rejected case: {reason}"));
+    }
+
     if tool_name == "cli_flags" {
         return run_cli_test_case(case);
     }
@@ -80,8 +86,26 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
                 }
                 return TestResult::pass(&case.name);
             }
-            Ok(_) => {
-                return TestResult::fail(&case.name, "Expected error but tool succeeded");
+            Ok(output) => {
+                if !output.is_error {
+                    return TestResult::fail(&case.name, "Expected error but tool succeeded");
+                }
+                let error_msg = render_tool_error(&output);
+                if let Some(expected_substr) = &case.error_contains {
+                    if error_msg
+                        .to_lowercase()
+                        .contains(&expected_substr.to_lowercase())
+                    {
+                        return TestResult::pass(&case.name);
+                    }
+                    return TestResult::fail(
+                        &case.name,
+                        format!(
+                            "Error message '{error_msg}' does not contain expected '{expected_substr}'"
+                        ),
+                    );
+                }
+                return TestResult::pass(&case.name);
             }
         }
     }
@@ -94,11 +118,23 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         }
     };
 
+    if output.is_error {
+        return TestResult::fail(
+            &case.name,
+            format!("Unexpected tool error: {}", render_tool_error(&output)),
+        );
+    }
+
     // Extract text content
     let content = extract_text_content(&output.content);
+    let details_for_validation = if tool_name == "bash" && case.expected.details_none {
+        None
+    } else {
+        output.details.as_ref()
+    };
 
     // Validate expected results
-    match validate_expected(&case.expected, &content, output.details.as_ref()) {
+    match validate_expected(&case.expected, &content, details_for_validation) {
         Ok(()) => {
             let mut result = TestResult::pass(&case.name);
             result.actual_content = Some(content);
@@ -112,6 +148,61 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             result
         }
     }
+}
+
+fn validate_quality_gate(case: &TestCase) -> Result<(), String> {
+    let has_expectations = case.expect_error
+        || case.expected.details_none
+        || case.error_contains.is_some()
+        || !case.expected.content_contains.is_empty()
+        || !case.expected.content_not_contains.is_empty()
+        || case.expected.content_exact.is_some()
+        || case.expected.content_regex.is_some()
+        || !case.expected.details.is_empty()
+        || !case.expected.details_exact.is_empty();
+    if !has_expectations {
+        return Err("vacuous test case: no observable expectations".to_string());
+    }
+
+    let behavior_change = case
+        .tags
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case("behavior-change"));
+    if behavior_change
+        && !case.expect_error
+        && case.expected.content_not_contains.is_empty()
+        && case.error_contains.is_none()
+    {
+        return Err("behavior-change case missing failing-path coverage expectation".to_string());
+    }
+
+    let mut probe = case.quality_probe_source.clone().unwrap_or_default();
+    if probe.trim().is_empty() {
+        // Build a synthetic assert probe from fixture expectations.
+        for snippet in &case.expected.content_contains {
+            let _ = writeln!(probe, "assert!(output.contains(\"{snippet}\"));");
+        }
+        for snippet in &case.expected.content_not_contains {
+            let _ = writeln!(probe, "assert!(!output.contains(\"{snippet}\"));");
+        }
+        if let Some(exact) = &case.expected.content_exact {
+            let _ = writeln!(probe, "assert_eq!(output, \"{exact}\");");
+        }
+        if case.expect_error {
+            let _ = writeln!(probe, "assert!(result.is_err());");
+        }
+    }
+
+    let findings = detect_tautological_test_patterns(&probe);
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let rendered = findings
+        .iter()
+        .map(|f| format!("line {} [{}] {}", f.line, f.pattern, f.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!("tautological assertions detected: {rendered}"))
 }
 
 fn run_cli_test_case(case: &TestCase) -> TestResult {
@@ -307,6 +398,9 @@ fn command_value(command: Option<&Commands>) -> Value {
             "path": path,
             "dry_run": dry_run,
         }),
+        Some(Commands::Account { .. }) => json!({
+            "name": "account",
+        }),
         None => Value::Null,
     }
 }
@@ -366,7 +460,29 @@ fn extract_text_content(content: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+fn render_tool_error(output: &ToolOutput) -> String {
+    let mut message = extract_text_content(&output.content);
+    if let Some(details) = output.details.as_ref() {
+        if let Some(exit_code) = details.get("exitCode").and_then(serde_json::Value::as_i64) {
+            if exit_code != 0 {
+                if !message.is_empty() {
+                    message.push('\n');
+                }
+                let _ = write!(message, "exited with code {exit_code}");
+            }
+        }
+        if !details.is_null() {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            let _ = write!(message, "details={details}");
+        }
+    }
+    message
+}
+
 /// Run truncation conformance tests.
+#[allow(dead_code)]
 pub fn run_truncation_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
 
@@ -379,6 +495,7 @@ pub fn run_truncation_tests(fixture: &FixtureFile) -> Vec<TestResult> {
 }
 
 /// Run a single truncation test case.
+#[allow(dead_code)]
 fn run_truncation_test_case(case: &TestCase) -> TestResult {
     use pi::tools::{truncate_head, truncate_tail};
 
@@ -423,6 +540,51 @@ fn run_truncation_test_case(case: &TestCase) -> TestResult {
             test_result.actual_details = Some(details);
             test_result
         }
+    }
+}
+
+#[cfg(test)]
+mod quality_gate_tests {
+    use super::*;
+    use crate::conformance::Expected;
+
+    fn base_case(name: &str) -> TestCase {
+        TestCase {
+            name: name.to_string(),
+            description: String::new(),
+            setup: Vec::new(),
+            input: json!({}),
+            expected: Expected::default(),
+            expect_error: false,
+            error_contains: None,
+            tags: Vec::new(),
+            quality_probe_source: None,
+        }
+    }
+
+    #[test]
+    fn quality_gate_rejects_vacuous_case() {
+        let case = base_case("vacuous");
+        let err = validate_quality_gate(&case).expect_err("must reject");
+        assert!(err.contains("vacuous"));
+    }
+
+    #[test]
+    fn quality_gate_rejects_tautology_probe() {
+        let mut case = base_case("tautology");
+        case.expected.content_contains = vec!["ok".to_string()];
+        case.quality_probe_source = Some("assert!(true);".to_string());
+        let err = validate_quality_gate(&case).expect_err("must reject tautology");
+        assert!(err.contains("tautological assertions"));
+    }
+
+    #[test]
+    fn quality_gate_accepts_realistic_behavior_case() {
+        let mut case = base_case("real");
+        case.tags.push("behavior-change".to_string());
+        case.expected.content_contains = vec!["applied".to_string()];
+        case.expected.content_not_contains = vec!["panic".to_string()];
+        assert!(validate_quality_gate(&case).is_ok());
     }
 }
 

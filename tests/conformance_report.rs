@@ -743,6 +743,7 @@ fn generate_markdown(
 fn generate_conformance_report_impl() {
     let reports = reports_dir();
     let _ = std::fs::create_dir_all(&reports);
+    let summary_path = reports.join("conformance_summary.json");
 
     // 1. Read manifest
     let manifest_content =
@@ -785,6 +786,19 @@ fn generate_conformance_report_impl() {
         negative_pass,
         negative_pass + negative_fail
     );
+
+    if statuses.is_empty() {
+        let existing_tested = read_json_file(&summary_path)
+            .and_then(|summary| summary.pointer("/counts/tested").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if existing_tested > 0 {
+            eprintln!(
+                "[conformance_report] No runtime conformance inputs found; \
+preserving existing summary (tested={existing_tested})"
+            );
+            return;
+        }
+    }
 
     // 3. Write JSONL events
     let events_path = reports.join("conformance_events.jsonl");
@@ -922,7 +936,6 @@ fn generate_conformance_report_impl() {
             "load_time_benchmarks": with_load_time,
         },
     });
-    let summary_path = reports.join("conformance_summary.json");
     std::fs::write(
         &summary_path,
         serde_json::to_string_pretty(&summary).unwrap_or_default(),

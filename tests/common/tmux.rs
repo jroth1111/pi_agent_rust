@@ -4,7 +4,6 @@
 //! [`TuiSession`] for high-level scripted interactive testing with
 //! step tracking, pane capture, and JSONL artifact emission.
 
-#![cfg(unix)]
 #![allow(dead_code)]
 
 use super::harness::TestHarness;

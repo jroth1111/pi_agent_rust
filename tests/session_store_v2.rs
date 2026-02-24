@@ -1270,6 +1270,7 @@ fn make_message_entry(id: &str, parent_id: Option<&str>, text: &str) -> pi::sess
             content: pi::model::UserContent::Text(text.to_string()),
             timestamp: None,
         },
+        metadata: pi::context::MessageMetadata::default(),
     })
 }
 

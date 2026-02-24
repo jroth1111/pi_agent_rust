@@ -33,9 +33,9 @@ use tempfile::TempDir;
 fn truncate_head_empty_content() {
     let result = truncate_head("", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 1); // empty string = 1 line (no newlines)
+    assert_eq!(result.total_lines, 0); // empty string = 0 lines
     assert_eq!(result.total_bytes, 0);
-    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_lines, 0);
     assert!(!result.first_line_exceeds_limit);
 }
 
@@ -70,7 +70,7 @@ fn truncate_head_truncated_by_lines_not_bytes() {
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
     assert_eq!(result.output_lines, 3);
-    assert_eq!(result.content, "a\nb\nc");
+    assert_eq!(result.content, "a\nb\nc\n");
 }
 
 #[test]
@@ -83,14 +83,15 @@ fn truncate_head_truncated_by_bytes_not_lines() {
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
     assert_eq!(result.output_lines, 2);
-    assert_eq!(result.content, "aaaa\nbbbb");
+    assert_eq!(result.content, "aaaa\nbbbb\n");
 }
 
 #[test]
 fn truncate_head_single_newline_only() {
     let result = truncate_head("\n", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 2); // "\n" = empty line + empty line after
+    assert_eq!(result.total_lines, 1); // trailing newline terminates one empty line
+    assert_eq!(result.output_lines, 1);
     assert_eq!(result.content, "\n");
 }
 
@@ -98,10 +99,10 @@ fn truncate_head_single_newline_only() {
 fn truncate_head_trailing_newline_preserved() {
     let content = "line1\nline2\n";
     let result = truncate_head(content, 2, 1024);
-    // "line1\nline2\n" has 3 lines (last is empty after trailing newline)
-    // With max_lines=2, we get "line1\nline2"
-    assert!(result.truncated);
+    // Trailing newline terminates the second line (not a third line).
+    assert!(!result.truncated);
     assert_eq!(result.output_lines, 2);
+    assert_eq!(result.content, content);
 }
 
 #[test]
@@ -126,9 +127,9 @@ fn truncate_head_unicode_multibyte() {
     // Each emoji is 4 bytes
     let content = "\u{1F600}\u{1F601}\n\u{1F602}";
     let result = truncate_head(content, 10, 8);
-    // First line: 8 bytes (2 emojis). Byte budget = 8.
-    // First line fits exactly.
-    assert_eq!(result.output_lines, 1);
+    // First line bytes fit exactly (8), but retaining a complete line includes the newline (9).
+    assert_eq!(result.output_lines, 0);
+    assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1386,21 +1387,22 @@ fn hints_api_generic() {
 
 #[test]
 fn truncate_head_byte_boundary_between_lines() {
-    // "ab\ncd\nef" -> line sizes: "ab"=2, "\ncd"=3 (total 5), "\nef"=3 (total 8)
+    // Head truncation keeps complete lines including newline separators.
+    // "ab\ncd\nef" first retained line is "ab\n" (3 bytes).
     let content = "ab\ncd\nef";
-    // Byte limit 5 → "ab\ncd" = 5 bytes exactly
+    // Byte limit 5 cannot include the second full line ("cd\n"), so only first line is kept.
     let result = truncate_head(content, 100, 5);
-    assert_eq!(result.content, "ab\ncd");
-    assert_eq!(result.output_lines, 2);
+    assert_eq!(result.content, "ab\n");
+    assert_eq!(result.output_lines, 1);
     assert!(result.truncated);
 }
 
 #[test]
 fn truncate_head_byte_limit_one_less_than_line_end() {
-    // "ab\ncd\nef" with limit 4 → "ab" only (can't fit "\ncd" = 3 more bytes, total would be 5)
+    // With limit 4, only first complete line ("ab\n" = 3 bytes) fits.
     let content = "ab\ncd\nef";
     let result = truncate_head(content, 100, 4);
-    assert_eq!(result.content, "ab");
+    assert_eq!(result.content, "ab\n");
     assert_eq!(result.output_lines, 1);
 }
 
@@ -1438,8 +1440,8 @@ fn truncate_head_both_limits_hit_bytes_first() {
     let content = "a\nb\nc";
     let result = truncate_head(content, 100, 3);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-    // "a\nb" = 3 bytes
-    assert_eq!(result.content, "a\nb");
+    // Complete-line semantics retain only "a\n" under this byte budget.
+    assert_eq!(result.content, "a\n");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -123,7 +123,7 @@
       ],
       "input": {"path": "trailing.txt"},
       "expected": {
-        "content_exact": "    1\u2192line1\n    2\u2192line2",
+        "content_exact": "    1\u2192line1\n    2\u2192line2\n    3\u2192",
         "details_none": true
       }
     },

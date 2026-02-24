@@ -31,6 +31,7 @@
 //! 18. Opportunity matrix (bd-3ar8v.6.1)
 //! 19. Parameter sweeps (bd-3ar8v.6.2)
 //! 20. Conformance+stress lineage coherence (bd-3ar8v.6.3)
+//! 21. Reliability hard-mode rollout + enforcement gate (bd-jt3.16)
 //!
 //! Run:
 //!   cargo test --test `ci_full_suite_gate` -- --nocapture
@@ -45,6 +46,8 @@ const QA_RUNBOOK_PATH: &str = "docs/qa-runbook.md";
 const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
 const PRACTICAL_FINISH_SNAPSHOT_PATH: &str =
     "tests/full_suite_gate/practical_finish_issues_snapshot.jsonl";
+const RELIABILITY_HARD_MODE_GATE_ARTIFACT_REL: &str =
+    "tests/full_suite_gate/reliability_hard_mode_gate.json";
 const PRACTICAL_FINISH_ISSUE_SOURCES: &[&str] = &[
     ".beads/issues.jsonl",
     ".beads/beads.base.jsonl",
@@ -2095,6 +2098,175 @@ fn write_json_artifact(
     write_non_empty_artifact(path, artifact_rel, &payload)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ReliabilityHardModeCheck {
+    id: String,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReliabilityHardModeGateReport {
+    schema: String,
+    generated_at: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    checks: Vec<ReliabilityHardModeCheck>,
+}
+
+fn evaluate_reliability_hard_mode_gate(root: &Path) -> (String, Option<String>) {
+    use chrono::{SecondsFormat, Utc};
+
+    let mut checks = Vec::new();
+    let mut missing = Vec::new();
+
+    let check_contains = |path: &Path, tokens: &[&str]| -> Result<(), String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        let missing_tokens = tokens
+            .iter()
+            .copied()
+            .filter(|token| !text.contains(token))
+            .collect::<Vec<_>>();
+        if missing_tokens.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} missing token(s): {}",
+                path.display(),
+                missing_tokens.join(", ")
+            ))
+        }
+    };
+
+    let readme_path = root.join("README.md");
+    let readme_tokens = [
+        "## Reliability Rollout (Observe -> Soft -> Hard)",
+        "Phase A (Observe)",
+        "Phase B (Soft)",
+        "Phase C (Hard)",
+    ];
+    match check_contains(&readme_path, &readme_tokens) {
+        Ok(()) => checks.push(ReliabilityHardModeCheck {
+            id: "docs_rollout".to_string(),
+            ok: true,
+            detail: "README rollout playbook markers present".to_string(),
+        }),
+        Err(err) => {
+            missing.push("README rollout section missing required phase markers".to_string());
+            checks.push(ReliabilityHardModeCheck {
+                id: "docs_rollout".to_string(),
+                ok: false,
+                detail: err,
+            });
+        }
+    }
+
+    let rpc_path = root.join("src/rpc.rs");
+    let rpc_tokens = [
+        "fn reliability_close_trace_chain_enforced()",
+        "fn reliability_open_ended_defer_requires_trigger_when_disabled()",
+        "fn reliability_external_lease_provider_conflicts()",
+    ];
+    match check_contains(&rpc_path, &rpc_tokens) {
+        Ok(()) => checks.push(ReliabilityHardModeCheck {
+            id: "rpc_hard_mode_tests".to_string(),
+            ok: true,
+            detail: "RPC hard-mode enforcement tests are present".to_string(),
+        }),
+        Err(err) => {
+            missing.push("RPC hard-mode enforcement tests are incomplete".to_string());
+            checks.push(ReliabilityHardModeCheck {
+                id: "rpc_hard_mode_tests".to_string(),
+                ok: false,
+                detail: err,
+            });
+        }
+    }
+
+    let lease_path = root.join("src/reliability/lease.rs");
+    let lease_tokens = [
+        "pub trait LeaseProvider",
+        "InMemoryExternalLeaseProvider",
+        "TaskAlreadyLeased",
+    ];
+    match check_contains(&lease_path, &lease_tokens) {
+        Ok(()) => checks.push(ReliabilityHardModeCheck {
+            id: "lease_provider_hooks".to_string(),
+            ok: true,
+            detail: "lease-provider hook and conflict markers are present".to_string(),
+        }),
+        Err(err) => {
+            missing.push(
+                "lease-provider hook/conflict implementation markers are missing".to_string(),
+            );
+            checks.push(ReliabilityHardModeCheck {
+                id: "lease_provider_hooks".to_string(),
+                ok: false,
+                detail: err,
+            });
+        }
+    }
+
+    let ci_path = root.join(CI_WORKFLOW_PATH);
+    let ci_tokens = [
+        "Full-suite gate [linux]",
+        "cargo test --test ci_full_suite_gate",
+        "-- full_suite_gate --nocapture --exact",
+    ];
+    match check_contains(&ci_path, &ci_tokens) {
+        Ok(()) => checks.push(ReliabilityHardModeCheck {
+            id: "ci_wiring".to_string(),
+            ok: true,
+            detail: "CI workflow includes full-suite gate invocation".to_string(),
+        }),
+        Err(err) => {
+            missing.push("CI workflow is missing full-suite gate wiring".to_string());
+            checks.push(ReliabilityHardModeCheck {
+                id: "ci_wiring".to_string(),
+                ok: false,
+                detail: err,
+            });
+        }
+    }
+
+    let mut status = if missing.is_empty() { "pass" } else { "fail" }.to_string();
+    let mut detail = if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Reliability hard-mode gate failed: {}",
+            missing.join("; ")
+        ))
+    };
+
+    let report = ReliabilityHardModeGateReport {
+        schema: "pi.ci.reliability_hard_mode_gate.v1".to_string(),
+        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        status: status.clone(),
+        detail: detail.clone(),
+        checks,
+    };
+
+    let report_path = root.join(RELIABILITY_HARD_MODE_GATE_ARTIFACT_REL);
+    if let Some(parent) = report_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = write_json_artifact(
+        &report_path,
+        RELIABILITY_HARD_MODE_GATE_ARTIFACT_REL,
+        &report,
+    ) {
+        status = "fail".to_string();
+        detail = Some(format!(
+            "Reliability hard-mode gate failed to emit artifact: {err}"
+        ));
+    }
+
+    (status, detail)
+}
+
 fn assert_non_empty_text_artifact(path: &Path, artifact_rel: &str) -> Result<u64, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|err| format!("failed to read {artifact_rel} at {}: {err}", path.display()))?;
@@ -2556,6 +2728,22 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
         detail,
         reproduce_command: Some(
             "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact".to_string(),
+        ),
+    });
+
+    // Gate 21: Reliability hard-mode rollout + enforcement gate (bd-jt3.16).
+    let (status, detail) = evaluate_reliability_hard_mode_gate(root);
+    gates.push(SubGate {
+        id: "reliability_hard_mode".to_string(),
+        name: "Reliability hard-mode rollout + enforcement".to_string(),
+        bead: "bd-jt3.16".to_string(),
+        status,
+        blocking: true,
+        artifact_path: Some(RELIABILITY_HARD_MODE_GATE_ARTIFACT_REL.to_string()),
+        detail,
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- full_suite_gate --nocapture --exact"
+                .to_string(),
         ),
     });
 
@@ -4642,6 +4830,36 @@ fn practical_finish_sub_gate_is_blocking_and_points_to_dedicated_artifact() {
         gate.artifact_path.as_deref(),
         Some(PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL),
         "practical-finish gate should point at dedicated checkpoint artifact"
+    );
+}
+
+#[test]
+fn reliability_hard_mode_sub_gate_is_blocking_and_points_to_dedicated_artifact() {
+    let gates = collect_gates(&repo_root());
+    let gate = gates
+        .iter()
+        .find(|gate| gate.id == "reliability_hard_mode")
+        .expect("reliability_hard_mode gate should exist");
+    assert!(
+        gate.blocking,
+        "reliability_hard_mode gate must be release-blocking"
+    );
+    assert_eq!(
+        gate.artifact_path.as_deref(),
+        Some(RELIABILITY_HARD_MODE_GATE_ARTIFACT_REL),
+        "reliability_hard_mode gate should point at dedicated artifact"
+    );
+}
+
+#[test]
+fn reliability_hard_mode_gate_fails_closed_with_actionable_detail_on_missing_sources() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let (status, detail) = evaluate_reliability_hard_mode_gate(temp.path());
+    assert_eq!(status, "fail");
+    let detail = detail.unwrap_or_default();
+    assert!(
+        detail.contains("Reliability hard-mode gate failed"),
+        "gate should provide actionable failure detail: {detail}"
     );
 }
 
