@@ -1,0 +1,571 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const MAX_SKILL_NAME_LEN: usize = 64;
+pub const MAX_SKILL_DESC_LEN: usize = 1024;
+
+pub const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
+    "name",
+    "description",
+    "license",
+    "compatibility",
+    "metadata",
+    "allowed-tools",
+    "disable-model-invocation",
+];
+
+#[derive(Debug, Clone)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub file_path: PathBuf,
+    pub base_dir: PathBuf,
+    pub source: String,
+    pub disable_model_invocation: bool,
+}
+
+pub fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if name != parent_dir {
+        errors.push(format!(
+            "name \"{name}\" does not match parent directory \"{parent_dir}\""
+        ));
+    }
+
+    if name.len() > MAX_SKILL_NAME_LEN {
+        errors.push(format!(
+            "name exceeds {MAX_SKILL_NAME_LEN} characters ({})",
+            name.len()
+        ));
+    }
+
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        errors.push(
+            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)"
+                .to_string(),
+        );
+    }
+
+    if name.starts_with('-') || name.ends_with('-') {
+        errors.push("name must not start or end with a hyphen".to_string());
+    }
+
+    if name.contains("--") {
+        errors.push("name must not contain consecutive hyphens".to_string());
+    }
+
+    errors
+}
+
+pub fn validate_description(description: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    if description.trim().is_empty() {
+        errors.push("description is required".to_string());
+    } else if description.len() > MAX_SKILL_DESC_LEN {
+        errors.push(format!(
+            "description exceeds {MAX_SKILL_DESC_LEN} characters ({})",
+            description.len()
+        ));
+    }
+    errors
+}
+
+pub fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let allowed: HashSet<&str> = ALLOWED_SKILL_FRONTMATTER.into_iter().collect();
+    let mut errors = Vec::new();
+    for key in keys {
+        if !allowed.contains(key.as_str()) {
+            errors.push(format!("unknown frontmatter field \"{key}\""));
+        }
+    }
+    errors
+}
+
+pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
+    let visible: Vec<&Skill> = skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
+    if visible.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
+        "Use the read tool to load a skill's file when the task matches its description."
+            .to_string(),
+        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
+        String::new(),
+        "<available_skills>".to_string(),
+    ];
+
+    for skill in visible {
+        lines.push("  <skill>".to_string());
+        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
+        lines.push(format!(
+            "    <description>{}</description>",
+            escape_xml(&skill.description)
+        ));
+        lines.push(format!(
+            "    <location>{}</location>",
+            escape_xml(&skill.file_path.display().to_string())
+        ));
+        lines.push("  </skill>".to_string());
+    }
+
+    lines.push("</available_skills>".to_string());
+    lines.join("\n")
+}
+
+pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+    if !text.starts_with("/skill:") {
+        return text.to_string();
+    }
+
+    let space_index = text.find(' ');
+    let name = space_index.map_or(&text[7..], |idx| &text[7..idx]);
+    let args = space_index.map_or("", |idx| text[idx + 1..].trim());
+
+    let Some(skill) = skills.iter().find(|s| s.name == name) else {
+        return text.to_string();
+    };
+
+    match fs::read_to_string(&skill.file_path) {
+        Ok(content) => {
+            let body = strip_frontmatter(&content).trim().to_string();
+            let block = format!(
+                "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+                skill.name,
+                skill.file_path.display(),
+                skill.base_dir.display(),
+                body
+            );
+            if args.is_empty() {
+                block
+            } else {
+                format!("{block}\n\n{args}")
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "Warning: Failed to read skill {}: {err}",
+                skill.file_path.display()
+            );
+            text.to_string()
+        }
+    }
+}
+
+pub(crate) fn escape_xml(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedFrontmatter {
+    pub frontmatter: HashMap<String, String>,
+    pub body: String,
+}
+
+pub fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
+    let mut lines = raw.lines();
+    let Some(first) = lines.next() else {
+        return ParsedFrontmatter {
+            frontmatter: HashMap::new(),
+            body: String::new(),
+        };
+    };
+
+    if first.trim() != "---" {
+        return ParsedFrontmatter {
+            frontmatter: HashMap::new(),
+            body: raw.to_string(),
+        };
+    }
+
+    let mut front_lines = Vec::new();
+    let mut body_lines = Vec::new();
+    let mut in_frontmatter = true;
+    for line in lines {
+        if in_frontmatter {
+            if line.trim() == "---" {
+                in_frontmatter = false;
+                continue;
+            }
+            front_lines.push(line);
+        } else {
+            body_lines.push(line);
+        }
+    }
+
+    if in_frontmatter {
+        return ParsedFrontmatter {
+            frontmatter: HashMap::new(),
+            body: raw.to_string(),
+        };
+    }
+
+    ParsedFrontmatter {
+        frontmatter: parse_frontmatter_lines(&front_lines),
+        body: body_lines.join("\n"),
+    }
+}
+
+fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        map.insert(key.to_string(), value.to_string());
+    }
+    map
+}
+
+pub fn strip_frontmatter(raw: &str) -> String {
+    parse_frontmatter(raw).body
+}
+
+pub fn infer_skill_name(path: &Path) -> String {
+    path.parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- validate_name ---
+
+    #[test]
+    fn validate_name_valid() {
+        assert!(validate_name("my-skill", "my-skill").is_empty());
+    }
+
+    #[test]
+    fn validate_name_too_long() {
+        let long = "a".repeat(MAX_SKILL_NAME_LEN + 1);
+        let errors = validate_name(&long, &long);
+        assert!(errors.iter().any(|e| e.contains("exceeds")));
+    }
+
+    #[test]
+    fn validate_name_invalid_chars() {
+        let errors = validate_name("My_Skill!", "My_Skill!");
+        assert!(errors.iter().any(|e| e.contains("invalid characters")));
+    }
+
+    #[test]
+    fn validate_name_leading_hyphen() {
+        let errors = validate_name("-skill", "-skill");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("start or end with a hyphen"))
+        );
+    }
+
+    #[test]
+    fn validate_name_trailing_hyphen() {
+        let errors = validate_name("skill-", "skill-");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("start or end with a hyphen"))
+        );
+    }
+
+    #[test]
+    fn validate_name_double_hyphen() {
+        let errors = validate_name("my--skill", "my--skill");
+        assert!(errors.iter().any(|e| e.contains("consecutive hyphens")));
+    }
+
+    #[test]
+    fn validate_name_mismatch_parent_dir() {
+        let errors = validate_name("foo", "bar");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("does not match parent directory"))
+        );
+    }
+
+    // --- validate_description ---
+
+    #[test]
+    fn validate_description_empty() {
+        let errors = validate_description("");
+        assert!(errors.iter().any(|e| e.contains("required")));
+    }
+
+    #[test]
+    fn validate_description_whitespace_only() {
+        let errors = validate_description("   ");
+        assert!(errors.iter().any(|e| e.contains("required")));
+    }
+
+    #[test]
+    fn validate_description_too_long() {
+        let long = "x".repeat(MAX_SKILL_DESC_LEN + 1);
+        let errors = validate_description(&long);
+        assert!(errors.iter().any(|e| e.contains("exceeds")));
+    }
+
+    #[test]
+    fn validate_description_valid() {
+        assert!(validate_description("A valid description").is_empty());
+    }
+
+    // --- validate_frontmatter_fields ---
+
+    #[test]
+    fn validate_frontmatter_fields_all_valid() {
+        let keys: Vec<String> = vec!["name".into(), "description".into(), "license".into()];
+        assert!(validate_frontmatter_fields(keys.iter()).is_empty());
+    }
+
+    #[test]
+    fn validate_frontmatter_fields_unknown() {
+        let keys: Vec<String> = vec!["name".into(), "unknown-field".into()];
+        let errors = validate_frontmatter_fields(keys.iter());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("unknown-field"));
+    }
+
+    // --- parse_frontmatter ---
+
+    #[test]
+    fn parse_frontmatter_no_frontmatter() {
+        let parsed = parse_frontmatter("Just a body\nwith lines");
+        assert!(parsed.frontmatter.is_empty());
+        assert_eq!(parsed.body, "Just a body\nwith lines");
+    }
+
+    #[test]
+    fn parse_frontmatter_valid() {
+        let raw = "---\nname: my-skill\ndescription: A skill\n---\nBody content";
+        let parsed = parse_frontmatter(raw);
+        assert_eq!(parsed.frontmatter.get("name").unwrap(), "my-skill");
+        assert_eq!(parsed.frontmatter.get("description").unwrap(), "A skill");
+        assert_eq!(parsed.body, "Body content");
+    }
+
+    #[test]
+    fn parse_frontmatter_unclosed() {
+        let raw = "---\nname: test\nno closing delimiter";
+        let parsed = parse_frontmatter(raw);
+        // Unclosed frontmatter treated as plain body
+        assert!(parsed.frontmatter.is_empty());
+        assert_eq!(parsed.body, raw);
+    }
+
+    #[test]
+    fn parse_frontmatter_comments_and_empty() {
+        let raw = "---\n# comment\nname: test\n\n---\nBody";
+        let parsed = parse_frontmatter(raw);
+        assert_eq!(parsed.frontmatter.len(), 1);
+        assert_eq!(parsed.frontmatter.get("name").unwrap(), "test");
+    }
+
+    #[test]
+    fn parse_frontmatter_quoted_values() {
+        let raw = "---\nname: \"my-skill\"\ndescription: 'A description'\n---\n";
+        let parsed = parse_frontmatter(raw);
+        assert_eq!(parsed.frontmatter.get("name").unwrap(), "my-skill");
+        assert_eq!(
+            parsed.frontmatter.get("description").unwrap(),
+            "A description"
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_empty_input() {
+        let parsed = parse_frontmatter("");
+        assert!(parsed.frontmatter.is_empty());
+        assert!(parsed.body.is_empty());
+    }
+
+    // --- escape_xml ---
+
+    #[test]
+    fn escape_xml_all_special_chars() {
+        assert_eq!(escape_xml("&"), "&amp;");
+        assert_eq!(escape_xml("<"), "&lt;");
+        assert_eq!(escape_xml(">"), "&gt;");
+        assert_eq!(escape_xml("\""), "&quot;");
+        assert_eq!(escape_xml("'"), "&apos;");
+    }
+
+    #[test]
+    fn escape_xml_mixed() {
+        assert_eq!(
+            escape_xml("a <b> & 'c' \"d\""),
+            "a &lt;b&gt; &amp; &apos;c&apos; &quot;d&quot;"
+        );
+    }
+
+    #[test]
+    fn escape_xml_no_special() {
+        assert_eq!(escape_xml("plain text"), "plain text");
+    }
+
+    // --- expand_skill_command ---
+
+    #[test]
+    fn expand_skill_command_not_a_skill_command() {
+        let skills = vec![];
+        assert_eq!(expand_skill_command("hello world", &skills), "hello world");
+    }
+
+    #[test]
+    fn expand_skill_command_missing_skill() {
+        let skills = vec![];
+        let result = expand_skill_command("/skill:nonexistent", &skills);
+        assert_eq!(result, "/skill:nonexistent");
+    }
+
+    #[test]
+    fn expand_skill_command_valid_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: my-skill\ndescription: test\n---\nDo something",
+        )
+        .unwrap();
+
+        let skills = vec![Skill {
+            name: "my-skill".to_string(),
+            description: "test".to_string(),
+            file_path: skill_file.clone(),
+            base_dir: skill_dir.clone(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+        }];
+
+        let result = expand_skill_command("/skill:my-skill", &skills);
+        assert!(result.contains("<skill name=\"my-skill\""));
+        assert!(result.contains("Do something"));
+    }
+
+    #[test]
+    fn expand_skill_command_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: my-skill\ndescription: test\n---\nBody",
+        )
+        .unwrap();
+
+        let skills = vec![Skill {
+            name: "my-skill".to_string(),
+            description: "test".to_string(),
+            file_path: skill_file.clone(),
+            base_dir: skill_dir.clone(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+        }];
+
+        let result = expand_skill_command("/skill:my-skill extra args here", &skills);
+        assert!(result.contains("extra args here"));
+    }
+
+    // --- format_skills_for_prompt ---
+
+    #[test]
+    fn format_skills_for_prompt_empty() {
+        assert_eq!(format_skills_for_prompt(&[]), "");
+    }
+
+    #[test]
+    fn format_skills_for_prompt_filters_disabled() {
+        let skills = vec![Skill {
+            name: "hidden".to_string(),
+            description: "Hidden skill".to_string(),
+            file_path: PathBuf::from("/tmp/hidden/SKILL.md"),
+            base_dir: PathBuf::from("/tmp/hidden"),
+            source: "test".to_string(),
+            disable_model_invocation: true,
+        }];
+        assert_eq!(format_skills_for_prompt(&skills), "");
+    }
+
+    #[test]
+    fn format_skills_for_prompt_multiple() {
+        let skills = vec![
+            Skill {
+                name: "skill-a".to_string(),
+                description: "First skill".to_string(),
+                file_path: PathBuf::from("/tmp/skill-a/SKILL.md"),
+                base_dir: PathBuf::from("/tmp/skill-a"),
+                source: "test".to_string(),
+                disable_model_invocation: false,
+            },
+            Skill {
+                name: "skill-b".to_string(),
+                description: "Second skill".to_string(),
+                file_path: PathBuf::from("/tmp/skill-b/SKILL.md"),
+                base_dir: PathBuf::from("/tmp/skill-b"),
+                source: "test".to_string(),
+                disable_model_invocation: false,
+            },
+        ];
+        let result = format_skills_for_prompt(&skills);
+        assert!(result.contains("<name>skill-a</name>"));
+        assert!(result.contains("<name>skill-b</name>"));
+        assert!(result.contains("<available_skills>"));
+        assert!(result.contains("</available_skills>"));
+    }
+
+    // --- strip_frontmatter ---
+
+    #[test]
+    fn strip_frontmatter_returns_body() {
+        let raw = "---\nname: test\n---\nThe body";
+        assert_eq!(strip_frontmatter(raw), "The body");
+    }
+
+    // --- infer_skill_name ---
+
+    #[test]
+    fn infer_skill_name_normal_path() {
+        let path = Path::new("/skills/my-skill/SKILL.md");
+        assert_eq!(infer_skill_name(path), "my-skill");
+    }
+
+    #[test]
+    fn infer_skill_name_root_path() {
+        let path = Path::new("/SKILL.md");
+        assert_eq!(infer_skill_name(path), "");
+    }
+}
