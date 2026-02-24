@@ -302,8 +302,24 @@
       "id": "scn-todo-neg-001",
       "kind": "tool",
       "summary": "Negative: todo tool fails with invalid action argument",
+      "event_name": null,
+      "tool_name": "todo",
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "arguments": {
+          "action": "invalid-action"
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

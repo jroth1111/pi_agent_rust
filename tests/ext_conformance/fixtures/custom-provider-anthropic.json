@@ -90,8 +90,20 @@
       "id": "scn-custom-provider-anthropic-neg-001",
       "kind": "provider",
       "summary": "Negative: provider registration fails with missing API key env var",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": "custom-anthropic",
+      "input": null,
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

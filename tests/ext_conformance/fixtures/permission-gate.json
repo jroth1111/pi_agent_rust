@@ -221,8 +221,30 @@
       "id": "scn-permission-gate-neg-001",
       "kind": "event",
       "summary": "Negative: permission gate errors on malformed tool call event",
+      "event_name": "tool_call",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": false
+        },
+        "event": {
+          "toolName": "bash",
+          "input": {
+            "command": null
+          }
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

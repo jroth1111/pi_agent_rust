@@ -1,0 +1,27 @@
+{
+  "schema": "pi.ci.reliability_hard_mode_gate.v1",
+  "generated_at": "2026-02-22T23:30:15.223Z",
+  "status": "pass",
+  "checks": [
+    {
+      "id": "docs_rollout",
+      "ok": true,
+      "detail": "README rollout playbook markers present"
+    },
+    {
+      "id": "rpc_hard_mode_tests",
+      "ok": true,
+      "detail": "RPC hard-mode enforcement tests are present"
+    },
+    {
+      "id": "lease_provider_hooks",
+      "ok": true,
+      "detail": "lease-provider hook and conflict markers are present"
+    },
+    {
+      "id": "ci_wiring",
+      "ok": true,
+      "detail": "CI workflow includes full-suite gate invocation"
+    }
+  ]
+}

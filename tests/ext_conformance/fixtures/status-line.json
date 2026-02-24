@@ -128,8 +128,27 @@
       "id": "scn-status-line-neg-001",
       "kind": "event",
       "summary": "Negative: status line handler errors on unsupported event type",
+      "event_name": "turn_start",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": true
+        },
+        "event": {
+          "type": "unsupported_event"
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

@@ -1,0 +1,66 @@
+{
+  "schema": "pi.perf.phase1_matrix_validation.v1",
+  "run_id": "20260216T041030Z",
+  "correlation_id": "bd-3ar8v.3.8-20260216T041030Z",
+  "generated_at_utc": "2026-02-17T00:00:00Z",
+  "matrix_cells": [
+    {
+      "workload_partition": "matched-state",
+      "session_messages": 100000,
+      "scenario_id": "matched-state/session_100000",
+      "status": "pass",
+      "stage_attribution": {
+        "open_ms": 48.0,
+        "append_ms": 36.0,
+        "save_ms": 22.0,
+        "index_ms": 11.0,
+        "total_stage_ms": 117.0
+      }
+    },
+    {
+      "workload_partition": "realistic",
+      "session_messages": 100000,
+      "scenario_id": "realistic/session_100000",
+      "status": "pass",
+      "stage_attribution": {
+        "open_ms": 44.0,
+        "append_ms": 32.0,
+        "save_ms": 19.0,
+        "index_ms": 10.0,
+        "total_stage_ms": 105.0
+      }
+    }
+  ],
+  "weighted_bottleneck_attribution": {
+    "schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+    "status": "missing",
+    "weighting_policy": "session_messages",
+    "confidence_method": "weighted_normal_approx_95",
+    "per_scale": [],
+    "global_ranking": [],
+    "lineage": {
+      "source_stream": "phase1_matrix_validation.matrix_cells",
+      "source_cell_count": 2,
+      "valid_cell_count": 0
+    }
+  },
+  "consumption_contract": {
+    "artifact_ready_for_phase5": false,
+    "downstream_beads": [
+      "bd-3ar8v.6.1",
+      "bd-3ar8v.6.2"
+    ],
+    "downstream_consumers": {
+      "opportunity_matrix": {
+        "bead_id": "bd-3ar8v.6.1",
+        "selector": "weighted_bottleneck_attribution.global_ranking",
+        "source_artifact": "phase1_matrix_validation"
+      },
+      "parameter_sweeps": {
+        "bead_id": "bd-3ar8v.6.2",
+        "selector": "weighted_bottleneck_attribution.per_scale",
+        "source_artifact": "phase1_matrix_validation"
+      }
+    }
+  }
+}

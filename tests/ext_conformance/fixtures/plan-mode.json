@@ -206,8 +206,25 @@
       "id": "scn-plan-mode-neg-001",
       "kind": "command",
       "summary": "Negative: plan command fails with invalid mode argument",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": "plan",
+      "provider_id": null,
+      "input": {
+        "args": "--invalid-mode",
+        "ctx": {
+          "has_ui": false
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

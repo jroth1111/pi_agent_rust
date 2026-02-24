@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-19T06:55:32Z
+> Generated: 2026-02-22T06:28:55Z
 
 ## Summary
 
@@ -9,87 +9,85 @@
 | Total budgets | 13 |
 | CI-enforced | 8 |
 | CI-enforced with data | 1 |
-| CI-enforced FAIL | 7 |
-| CI-enforced NO_DATA | 0 |
+| CI-enforced FAIL | 0 |
+| CI-enforced NO_DATA | 7 |
 | PASS | 3 |
-| FAIL | 7 |
-| No data | 3 |
+| FAIL | 0 |
+| No data | 10 |
 
-| Failing data contracts | 9 |
+| Failing data contracts | 8 |
 
 ## Startup
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `startup_version_p95` | p95 latency | 100 ms | - | FAIL | Yes |
+| `startup_version_p95` | p95 latency | 100 ms | - | NO_DATA | Yes |
 | `startup_full_agent_p95` | p95 latency | 200 ms | - | NO_DATA | No |
 
 ## Extension
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | - | FAIL | Yes |
+| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | - | NO_DATA | Yes |
 | `ext_cold_load_complex_p95` | p95 cold load time | 50 ms | - | NO_DATA | No |
-| `ext_load_60_total` | total load time (60 official extensions) | 10000 ms | 6198.0 | PASS | No |
+| `ext_load_60_total` | total load time (60 official extensions) | 10000 ms | - | NO_DATA | No |
 
 ## Tool_call
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `tool_call_latency_p99` | p99 per-call latency | 200 us | - | FAIL | Yes |
-| `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | - | FAIL | Yes |
+| `tool_call_latency_p99` | p99 per-call latency | 200 us | - | NO_DATA | Yes |
+| `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | - | NO_DATA | Yes |
 
 ## Event_dispatch
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | - | NO_DATA | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 34 | PASS | No |
 
 ## Policy
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `policy_eval_p99` | p99 evaluation time | 500 ns | - | FAIL | Yes |
+| `policy_eval_p99` | p99 evaluation time | 500 ns | - | NO_DATA | Yes |
 
 ## Memory
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 4.8 | PASS | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 15.7 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 22 MB | - | FAIL | Yes |
+| `binary_size_release` | release binary size | 22 MB | - | NO_DATA | Yes |
 
 ## Protocol
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | FAIL | Yes |
+| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | NO_DATA | Yes |
 
 ## Failing Data Contracts
 
-- `missing_or_stale_budget_artifact` (`startup_version_p95`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`startup_version_p95`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`ext_cold_load_simple_p95`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`ext_cold_load_simple_p95`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`tool_call_latency_p99`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl]
+- `missing_or_stale_budget_artifact` (`tool_call_latency_p99`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`tool_call_throughput_min`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl]
+- `missing_or_stale_budget_artifact` (`tool_call_throughput_min`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`policy_eval_p99`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]
+- `missing_or_stale_budget_artifact` (`policy_eval_p99`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/ext_policy/evaluate]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`binary_size_release`): missing artifacts; expected one of [/data/tmp/pi_agent_rust/codex/perf/release/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]
+- `missing_or_stale_budget_artifact` (`binary_size_release`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/release/pi, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/pi]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`protocol_parse_p99`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]
+- `missing_or_stale_budget_artifact` (`protocol_parse_p99`): missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_e2e_matrix_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (51.83h old)
+- `missing_or_stale_e2e_matrix_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /Users/gwizz/CascadeProjects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (46.24h old)
   - Remediation: Generate fresh extension_benchmark_stratification.json in the current perf run.
-- `missing_or_stale_phase1_matrix_validation_evidence` (`global`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/results/phase1_matrix_validation.json, /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json]
-  - Remediation: Generate fresh phase1_matrix_validation.json in the current perf run.
 
 ## Measurement Methodology
 

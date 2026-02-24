@@ -119,69 +119,63 @@
     }
   ],
   "ci_enforced": 8,
-  "ci_fail": 7,
-  "ci_no_data": 0,
+  "ci_fail": 0,
+  "ci_no_data": 7,
   "ci_with_data": 1,
-  "data_contract_failures_count": 9,
-  "fail": 7,
+  "data_contract_failures_count": 8,
+  "fail": 0,
   "failing_data_contracts": [
     {
       "budget_name": "startup_version_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "ext_cold_load_simple_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "tool_call_latency_p99",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/pijs_workload.jsonl]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "tool_call_throughput_min",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/pijs_workload.jsonl]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "policy_eval_p99",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/ext_policy/evaluate]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "binary_size_release",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust/codex/perf/release/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/release/pi, /Users/gwizz/CascadeProjects/pi_agent_rust/target/perf/pi]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "protocol_parse_p99",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]",
+      "detail": "missing artifacts; expected one of [/Users/gwizz/CascadeProjects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": null,
       "contract_id": "missing_or_stale_e2e_matrix_evidence",
-      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (51.83h old)",
+      "detail": "all candidate artifacts are stale/invalid (>24.00h): /Users/gwizz/CascadeProjects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (46.24h old)",
       "remediation": "Generate fresh extension_benchmark_stratification.json in the current perf run."
-    },
-    {
-      "budget_name": null,
-      "contract_id": "missing_or_stale_phase1_matrix_validation_evidence",
-      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/results/phase1_matrix_validation.json, /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json]",
-      "remediation": "Generate fresh phase1_matrix_validation.json in the current perf run."
     }
   ],
-  "generated_at": "2026-02-19T06:55:32.603526827+00:00",
-  "no_data": 3,
+  "generated_at": "2026-02-22T06:28:55.701897+00:00",
+  "no_data": 10,
   "pass": 3,
   "schema": "pi.perf.budget_summary.v1",
   "total_budgets": 13

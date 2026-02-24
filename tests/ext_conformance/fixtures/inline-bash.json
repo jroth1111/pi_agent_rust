@@ -119,8 +119,28 @@
       "id": "scn-inline-bash-neg-001",
       "kind": "event",
       "summary": "Negative: bash expansion fails on malformed expression",
+      "event_name": "input",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": false
+        },
+        "event": {
+          "text": "Run !{echo",
+          "images": []
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

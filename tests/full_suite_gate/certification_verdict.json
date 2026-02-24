@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
-  "generated_at": "2026-02-17T08:44:46.054Z",
+  "generated_at": "2026-02-22T23:30:15.225Z",
   "verdict": "pass",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
@@ -54,8 +54,8 @@
       "name": "Cross-platform matrix validation",
       "bead": "bd-1f42.6.7",
       "status": "pass",
-      "blocking": true,
-      "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
+      "blocking": false,
+      "artifact_path": "tests/cross_platform_reports/macos/platform_report.json",
       "reproduce_command": "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"
     },
     {
@@ -177,6 +177,15 @@
       "reproduce_command": "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact"
     },
     {
+      "id": "reliability_hard_mode",
+      "name": "Reliability hard-mode rollout + enforcement",
+      "bead": "bd-jt3.16",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/full_suite_gate/reliability_hard_mode_gate.json",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- full_suite_gate --nocapture --exact"
+    },
+    {
       "id": "waiver_lifecycle",
       "name": "Waiver lifecycle compliance",
       "bead": "bd-1f42.8.8.1",
@@ -188,7 +197,7 @@
   ],
   "waiver_audit": {
     "schema": "pi.ci.waiver_audit.v1",
-    "generated_at": "2026-02-17T08:44:45.910Z",
+    "generated_at": "2026-02-22T23:30:15.225Z",
     "total_waivers": 0,
     "active": 0,
     "expired": 0,
@@ -199,8 +208,8 @@
   },
   "waivers_applied": [],
   "summary": {
-    "total_gates": 20,
-    "passed": 20,
+    "total_gates": 21,
+    "passed": 21,
     "failed": 0,
     "warned": 0,
     "skipped": 0,

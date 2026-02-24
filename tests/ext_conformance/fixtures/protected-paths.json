@@ -127,8 +127,30 @@
       "id": "scn-protected-paths-neg-001",
       "kind": "event",
       "summary": "Negative: protected paths handler errors on malformed path pattern",
+      "event_name": "tool_call",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": false
+        },
+        "event": {
+          "toolName": "write",
+          "input": {
+            "path": null
+          }
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

@@ -1,6 +1,6 @@
 # Full Certification Report
 
-> Generated: 2026-02-17T08:44:46Z
+> Generated: 2026-02-22T23:30:15Z
 > Lane: **full**
 > Verdict: **PASS**
 
@@ -8,8 +8,8 @@
 
 | Metric | Value |
 |--------|-------|
-| Total gates | 20 |
-| Passed | 20 |
+| Total gates | 21 |
+| Passed | 21 |
 | Failed | 0 |
 | Warned | 0 |
 | Skipped | 0 |
@@ -26,7 +26,7 @@
 | Extension must-pass gate (208 extensions) | bd-1f42.4.4 | YES | PASS | - | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
 | Extension provider compatibility matrix | bd-1f42.4.6 | no | PASS | - | `tests/ext_conformance/reports/provider_compat/provider_compat_report.json` |
 | Unified evidence bundle | bd-1f42.6.8 | no | PASS | - | `tests/evidence_bundle/index.json` |
-| Cross-platform matrix validation | bd-1f42.6.7 | YES | PASS | - | `tests/cross_platform_reports/linux/platform_report.json` |
+| Cross-platform matrix validation | bd-1f42.6.7 | no | PASS | - | `tests/cross_platform_reports/macos/platform_report.json` |
 | Conformance regression gate | bd-1f42.4 | YES | PASS | - | `tests/ext_conformance/reports/regression_verdict.json` |
 | Conformance pass rate >= 80% | bd-1f42.4 | YES | PASS | - | `tests/ext_conformance/reports/conformance_summary.json` |
 | Suite classification guard | bd-1f42.6.1 | YES | PASS | - | `tests/suite_classification.toml` |
@@ -40,6 +40,7 @@
 | Opportunity matrix artifact integrity | bd-3ar8v.6.1 | YES | PASS | - | `tests/perf/reports/opportunity_matrix.json` |
 | Parameter sweeps artifact integrity | bd-3ar8v.6.2 | YES | PASS | - | `tests/perf/reports/parameter_sweeps.json` |
 | Conformance+stress lineage coherence | bd-3ar8v.6.3 | YES | PASS | - | `tests/ext_conformance/reports/conformance_summary.json` |
+| Reliability hard-mode rollout + enforcement | bd-jt3.16 | YES | PASS | - | `tests/full_suite_gate/reliability_hard_mode_gate.json` |
 | Waiver lifecycle compliance | bd-1f42.8.8.1 | YES | PASS | - | `tests/full_suite_gate/waiver_audit.json` |
 
 ## Rerun Commands

@@ -95,8 +95,27 @@
       "id": "scn-dynamic-resources-neg-001",
       "kind": "event",
       "summary": "Negative: event handler errors on unsupported event type",
+      "event_name": "resources_discover",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": false
+        },
+        "event": {
+          "type": "unsupported_event"
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

@@ -92,8 +92,25 @@
       "id": "scn-doom-overlay-neg-001",
       "kind": "command",
       "summary": "Negative: command fails with unsupported argument",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": "doom-overlay",
+      "provider_id": null,
+      "input": {
+        "args": "--invalid-mode",
+        "ctx": {
+          "has_ui": false
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]

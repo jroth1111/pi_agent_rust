@@ -112,8 +112,24 @@
       "id": "scn-with-deps-neg-001",
       "kind": "tool",
       "summary": "Negative: parse_duration tool fails with invalid duration string",
+      "event_name": null,
+      "tool_name": "parse_duration",
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "arguments": {
+          "duration": "not-a-duration"
+        }
+      },
+      "setup": null,
+      "steps": [],
       "expect": {
         "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {},
+        "capture_log_normalized_jsonl": []
       }
     }
   ]
