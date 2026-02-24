@@ -3,13 +3,13 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1401,
+    "total_files": 1403,
     "entry_points": 401,
-    "sub_modules": 875,
+    "sub_modules": 877,
     "non_extensions": 119,
     "unknown": 6,
     "by_confidence": {
-      "high": 1297,
+      "high": 1299,
       "low": 14,
       "medium": 90
     },
@@ -20,9 +20,9 @@
         "sub_modules": 2
       },
       "community": {
-        "total_files": 147,
+        "total_files": 149,
         "entry_points": 60,
-        "sub_modules": 80
+        "sub_modules": 82
       },
       "non-conformance": {
         "total_files": 97,
@@ -1432,6 +1432,14 @@
       ]
     },
     {
+      "path": "community/qualisero-background-notify/shared.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
       "path": "community/qualisero-compact-config/compact-config.ts",
       "classification": "entry_point",
       "confidence": "high",
@@ -1561,6 +1569,14 @@
         "registerCommand",
         "event_hook",
         "ui_api"
+      ]
+    },
+    {
+      "path": "community/qualisero-safe-git/shared.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
       ]
     },
     {

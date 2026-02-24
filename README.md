@@ -1632,6 +1632,24 @@ Beyond simple API keys, Pi supports OAuth, AWS credential chains, service key ex
 
 Google CLI-style OAuth providers carry project metadata with the token payload. Pi preserves and refreshes that payload and can resolve project IDs from `GOOGLE_CLOUD_PROJECT` or local `gcloud` config when needed.
 
+**OAuth pool rotation (v2):**
+
+Pi supports provider-scoped OAuth account pools with per-account health and policy controls:
+
+1. Candidate planning is model-aware (`allowed_models` / `excluded_models`) and skips relogin-required or cooled-down accounts.
+2. Rotation attempts are bounded and emit a structured trace (`provider`, `account_id`, `class`, `reason`, `success`).
+3. Failure handling applies deterministic policies:
+   - `401/403` auth failures: same-account retry lane, then relogin mark + rotate.
+   - `429` rate-limit failures: Retry-After parsing (seconds or HTTP-date) drives cooldown.
+   - transport failures: one same-account retry lane before rotation.
+   - non-replayable requests: no unsafe retries/rotations.
+
+**Refresh dedupe and worker tick:**
+
+- Startup and background refresh reuse the same refresh pipeline.
+- In-flight per-account refresh slots dedupe concurrent refresh triggers (`provider:account` key).
+- `run_background_refresh_tick` executes one scheduler-safe refresh pass without duplicating account mutations.
+
 **Credential status reporting**: `pi config` shows the status of each configured provider's credentials: `Missing`, `ApiKey`, `OAuthValid` (with time until expiry), `OAuthExpired` (with time since expiry), `AwsCredentials`, or `BearerToken`.
 
 **Diagnostic codes**: Auth failures produce specific diagnostic codes (`MissingApiKey`, `InvalidApiKey`, `QuotaExceeded`, `OAuthTokenRefreshFailed`, `MissingAzureDeployment`, `MissingRegion`, etc.) with context-specific error hints rather than generic messages.
@@ -2146,6 +2164,43 @@ back to `safe`, and re-run `pi --explain-extension-policy` to confirm deny decis
 
 See [EXTENSIONS.md](EXTENSIONS.md) for the full architecture, runtime contract,
 and conformance results.
+
+## Reliability Rollout (Observe -> Soft -> Hard)
+
+Reliability controls are configured under `reliability` in `settings.json`.
+Default mode is additive and non-blocking (`observe`), then progressively
+enforced (`soft`, then `hard`) after evidence proves stability.
+
+### Phase A (Observe)
+
+- Set `reliability.enforcementMode` to `observe`.
+- Keep `requireEvidenceForClose=true` and `allowOpenEndedDefer=false`.
+- Monitor RPC/session evidence for:
+  - close payload traceability (`trace_parent`, acceptance/evidence IDs)
+  - lease correctness (single active lease, no fence mismatch)
+  - defer correctness (must be `Until` or `DependsOn`)
+
+### Phase B (Soft)
+
+- Set `reliability.enforcementMode` to `soft`.
+- Treat reliability violations as warnings that must be triaged before promotion.
+- Run hardening checks in CI via the full-suite gate:
+  - `cargo test --test ci_full_suite_gate -- full_suite_gate --nocapture --exact`
+
+### Phase C (Hard)
+
+- Set `reliability.enforcementMode` to `hard`.
+- Enforce:
+  - evidence-required close approvals
+  - close trace-chain integrity (no synthetic parent trace IDs)
+  - lease and fence validity
+  - no open-ended defer when policy disables it
+- Required CI verification:
+  - `cargo test --test ci_full_suite_gate -- --nocapture`
+
+Roll back by returning `reliability.enforcementMode` to `soft` or `observe`,
+then re-running the full-suite gate to capture updated diagnostics:
+`tests/full_suite_gate/reliability_hard_mode_gate.json`.
 
 ### Unsafe Forbidden
 

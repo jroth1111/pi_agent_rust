@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.inclusion_list.v1",
-  "generated_at": "2026-02-10T03:57:23.948756405+00:00",
+  "generated_at": "2026-02-22T14:16:32.850803+00:00",
   "summary": {
     "tier1_count": 179,
     "tier1_review_count": 29,
@@ -638,7 +638,7 @@
       "source_tier": "community",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "aa2baf20eddb875e8b923063384b3d86a8856cba835395f63eccc4c01db7c30a",
+        "checksum_sha256": "7390445b8024d0218c49da095dd72bcaf3c5390bfc5c63260df960898a0c1b05",
         "source_type": "git",
         "source_repo": "https://github.com/badlogic/pi-mono",
         "source_path": "packages/coding-agent/community/mitsuhiko/uv.ts"
@@ -704,7 +704,7 @@
       "source_tier": "community",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "c3589f0daacbf63f54da18e4483efc8d93d98e5ed65fd9f5fd1c6a27db5a53cc",
+        "checksum_sha256": "a85347eb41b662d24349fc058992df25b80103b80b5d5f4831b616d8a76f6b85",
         "source_type": "git",
         "source_repo": "https://github.com/badlogic/pi-mono",
         "source_path": "packages/coding-agent/community/nicobailon/index.ts"
@@ -717,7 +717,7 @@
         "ui_header"
       ],
       "category": "tool",
-      "risk_level": "minimal",
+      "risk_level": "medium",
       "inclusion_rationale": "Community extension (MIT license); broadens coverage of real-world patterns"
     },
     {
@@ -961,7 +961,7 @@
       "source_tier": "community",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "c9ad30c099446cd31a5ae46ef1b96e12ff0cec1739af0c49cc0cb5ce990bb84b",
+        "checksum_sha256": "55e911e7742c67d26cfdd81f3a3451a98af02a328300607fdf0f3b31c1391c1c",
         "source_type": "git",
         "source_repo": "https://github.com/badlogic/pi-mono",
         "source_path": "packages/coding-agent/community/qualisero/index.ts"
@@ -1023,7 +1023,7 @@
       "source_tier": "community",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "011a8bcaa77ccddcccc8dfba59cf9593242e5718401fc88592677d6623b64f26",
+        "checksum_sha256": "8591ad4674b466e4d09a4ff538151295c8a4a2151b3513d8c6bb767a7c9f20ad",
         "source_type": "git",
         "source_repo": "https://github.com/badlogic/pi-mono",
         "source_path": "packages/coding-agent/community/qualisero/index.ts"
@@ -2100,7 +2100,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "604fdc741ab17d3f482737615532e86d39a0d95a0e4254135139a9b645f2c803",
+        "checksum_sha256": "101dc9871cb4edb92a70a150a448dbc9a9b725e1a3e71fcdabc8ff7353c04258",
         "source_type": "npm",
         "npm_package": "ogulcancelik-pi-sketch",
         "npm_version": "0.1.1"
@@ -4252,7 +4252,7 @@
       "license": "UNKNOWN",
       "score": 38.0,
       "provenance": {
-        "checksum_sha256": "893ecf1c25c7c23b5b2a65c1b9812144fbd4b42a87a838b11b93f538c8e98568",
+        "checksum_sha256": "64060313b1939dbb9a51446473701929fc18e1e7a15abb47a48671e75a801528",
         "source_type": "url"
       },
       "capabilities": [

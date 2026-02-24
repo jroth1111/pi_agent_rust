@@ -288,13 +288,19 @@ fi
 
 if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
   if ! command -v rch >/dev/null 2>&1; then
-    die "PERF_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
+    if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+      die "PERF_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
+    fi
+    log_warn "rch requested but unavailable; falling back to local cargo."
+  elif ! rch check --quiet >/dev/null 2>&1; then
+    if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+      die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+    fi
+    log_warn "rch requested but unhealthy; falling back to local cargo."
+  else
+    CARGO_RUNNER_MODE="rch"
+    CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
   fi
-  if ! rch check --quiet >/dev/null 2>&1; then
-    die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
-  fi
-  CARGO_RUNNER_MODE="rch"
-  CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
 elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
   if rch check --quiet >/dev/null 2>&1; then
     CARGO_RUNNER_MODE="rch"
