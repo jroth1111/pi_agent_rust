@@ -171,6 +171,10 @@ impl RunStore {
         serde_json::from_slice(&bytes).map_err(|err| Error::Json(Box::new(err)))
     }
 
+    pub fn exists(&self, run_id: &str) -> bool {
+        self.run_path(run_id).exists()
+    }
+
     pub fn save(&self, status: &RunStatus) -> Result<()> {
         fs::create_dir_all(&self.root).map_err(|err| Error::Io(Box::new(err)))?;
         let encoded =
@@ -230,5 +234,16 @@ mod tests {
         assert_eq!(loaded.run_id, "run-2");
         assert_eq!(loaded.lifecycle, RunLifecycle::Running);
         assert_eq!(loaded.latest_run_verify_summary.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn run_store_exists_reflects_persisted_runs() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = RunStore::new(temp_dir.path().to_path_buf());
+        let run = RunStatus::new("run-3", "Exists", ExecutionTier::Inline);
+
+        assert!(!store.exists("run-3"));
+        store.save(&run).expect("save");
+        assert!(store.exists("run-3"));
     }
 }

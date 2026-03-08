@@ -1294,6 +1294,19 @@ async fn persist_run_status(
     Ok(())
 }
 
+fn ensure_run_id_available(
+    orchestration: &RpcOrchestrationState,
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<()> {
+    if orchestration.get_run(run_id).is_some() || run_store.exists(run_id) {
+        return Err(Error::validation(format!(
+            "orchestration run already exists: {run_id}"
+        )));
+    }
+    Ok(())
+}
+
 fn orchestration_dag_depth(tasks: &[TaskContract]) -> usize {
     fn visit(
         task_id: &str,
@@ -1666,6 +1679,46 @@ async fn sync_task_runs(
         persist_run_status(cx, session, run_store, run).await?;
     }
     Ok(updated_runs)
+}
+
+async fn refresh_run_if_live(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    mut run: RunStatus,
+) -> Result<RunStatus> {
+    let original = run.clone();
+    let has_live_tasks = {
+        let reliability = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        let has_live_tasks = !run.task_ids.is_empty()
+            && run
+                .task_ids
+                .iter()
+                .all(|task_id| reliability.tasks.contains_key(task_id));
+        if has_live_tasks {
+            refresh_run_from_reliability(&reliability, &mut run);
+        }
+        has_live_tasks
+    };
+
+    {
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.update_run(run.clone());
+    }
+
+    if has_live_tasks && run != original {
+        persist_run_status(cx, session, run_store, &run).await?;
+    }
+
+    Ok(run)
 }
 
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
@@ -2338,6 +2391,19 @@ pub async fn run(
                 }
 
                 let run_id = next_run_id(req.run_id.as_deref());
+                {
+                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("orchestration lock failed: {err}"))
+                    })?;
+                    if let Err(err) = ensure_run_id_available(&orchestration, &run_store, &run_id) {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.start_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                }
                 let selected_tier = select_execution_tier(&req.tasks);
                 let task_ids = req
                     .tasks
@@ -2425,13 +2491,26 @@ pub async fn run(
 
                 match cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
                     Some(run) => {
+                        let run = match refresh_run_if_live(
+                            &cx,
+                            &session,
+                            &reliability_state,
+                            &orchestration_state,
+                            &run_store,
+                            run,
+                        )
+                        .await
                         {
-                            let mut orchestration =
-                                orchestration_state.lock(&cx).await.map_err(|err| {
-                                    Error::session(format!("orchestration lock failed: {err}"))
-                                })?;
-                            orchestration.register_run(run.clone());
-                        }
+                            Ok(run) => run,
+                            Err(err) => {
+                                let _ = out_tx.send(response_error_with_hints(
+                                    id,
+                                    "orchestration.get_run",
+                                    &err,
+                                ));
+                                continue;
+                            }
+                        };
                         let _ = out_tx.send(response_ok(
                             id,
                             "orchestration.get_run",
@@ -6425,6 +6504,28 @@ mod tests {
             orchestration.run_ids_for_task("task-b"),
             vec!["run-1".to_string()]
         );
+    }
+
+    #[test]
+    fn orchestration_run_id_availability_rejects_cached_and_persisted_runs() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = RunStore::new(temp_dir.path().to_path_buf());
+        let mut orchestration = RpcOrchestrationState::default();
+        let cached_run = RunStatus::new("run-cached", "Cached", ExecutionTier::Inline);
+        orchestration.register_run(cached_run);
+
+        let persisted_run = RunStatus::new("run-persisted", "Persisted", ExecutionTier::Inline);
+        store.save(&persisted_run).expect("save persisted run");
+
+        let cached_err = ensure_run_id_available(&orchestration, &store, "run-cached")
+            .expect_err("cached run should conflict");
+        assert!(cached_err.to_string().contains("already exists"));
+
+        let persisted_err = ensure_run_id_available(&orchestration, &store, "run-persisted")
+            .expect_err("persisted run should conflict");
+        assert!(persisted_err.to_string().contains("already exists"));
+
+        assert!(ensure_run_id_available(&orchestration, &store, "run-new").is_ok());
     }
 
     #[test]
