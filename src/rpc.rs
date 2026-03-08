@@ -8734,14 +8734,7 @@ mod tests {
             .await
             .expect("execute inline task");
 
-            assert_eq!(
-                updated_run.lifecycle,
-                RunLifecycle::Succeeded,
-                "run verify={:?}, lib={:?}, extra={:?}",
-                updated_run.latest_run_verify,
-                fs::read_to_string(repo_path.join("src/lib.rs")),
-                fs::read_to_string(repo_path.join("src/extra.rs"))
-            );
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
             assert!(
                 updated_run
                     .latest_run_verify
@@ -8852,6 +8845,105 @@ mod tests {
                     .get(&contract.task_id)
                     .map(|task| &task.runtime.state),
                 Some(reliability::RuntimeState::Ready)
+            ));
+        });
+    }
+
+    #[test]
+    fn orchestration_inline_execution_substrate_applies_created_file_and_closes_task() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract = reliability_contract("task-inline-create", Vec::new());
+            contract.input_snapshot = Some(head);
+            contract.verify_command = "test -f src/new_file.rs".to_string();
+            contract.planned_touches = vec!["src/new_file.rs".to_string()];
+
+            let grant = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.request_dispatch(&contract, "worker", 120)
+                    .expect("dispatch inline create task")
+            };
+
+            let mut run = RunStatus::new(
+                "run-inline-create",
+                "Inline execution create-file fixture",
+                ExecutionTier::Inline,
+            );
+            run.task_ids = vec![contract.task_id.clone()];
+            run.run_verify_command = "test -f src/new_file.rs".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = FixtureInlineWorker {
+                target: "src/new_file.rs".to_string(),
+                contents: "pub fn created_fixture() {}\n".to_string(),
+                summary: "Created a new fixture file".to_string(),
+            };
+            let updated_run = execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-inline-create",
+                &grant,
+                &worker,
+            )
+            .await
+            .expect("execute inline create task");
+
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert!(
+                updated_run
+                    .latest_run_verify
+                    .as_ref()
+                    .is_some_and(|verify| verify.ok)
+            );
+            assert_eq!(
+                updated_run
+                    .task_reports
+                    .get(&contract.task_id)
+                    .expect("task report")
+                    .verify_exit_code,
+                0
+            );
+
+            let created_contents =
+                fs::read_to_string(repo_path.join("src/new_file.rs")).expect("read created file");
+            assert!(created_contents.contains("created_fixture"));
+
+            let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+            assert!(matches!(
+                rel.tasks
+                    .get(&contract.task_id)
+                    .map(|task| &task.runtime.state),
+                Some(reliability::RuntimeState::Terminal(
+                    reliability::TerminalState::Succeeded { .. }
+                ))
             ));
         });
     }
