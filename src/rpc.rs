@@ -11,7 +11,7 @@
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::agent::{AbortHandle, AgentEvent, AgentSession, QueueMode};
+use crate::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode};
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
@@ -22,32 +22,37 @@ use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
 use crate::model::{
-    ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent,
+    UserMessage,
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind, RunVerifyStatus,
-    SubrunPlan, TaskReport, WaveStatus,
+    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind,
+    RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus,
 };
+use crate::provider::Provider;
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
 use crate::reliability::ArtifactStore;
 use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
-use crate::session::SessionMessage;
+use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
+use async_trait::async_trait;
 use memchr::memchr_iter;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -2073,6 +2078,569 @@ fn dispatch_run_wave(
 
     refresh_run_from_reliability(reliability, run);
     Ok(grants)
+}
+
+const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+#[derive(Debug)]
+struct TaskVerificationOutcome {
+    command: String,
+    exit_code: i32,
+    output: String,
+    timed_out: bool,
+    passed: bool,
+}
+
+#[allow(dead_code)]
+#[async_trait]
+trait OrchestrationInlineWorker: Send + Sync {
+    async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String>;
+}
+
+#[allow(dead_code)]
+struct RpcSessionInlineWorker {
+    provider: Arc<dyn Provider>,
+    config: Config,
+}
+
+#[allow(dead_code)]
+impl RpcSessionInlineWorker {
+    fn new(provider: Arc<dyn Provider>, config: Config) -> Self {
+        Self { provider, config }
+    }
+}
+
+#[allow(dead_code)]
+#[async_trait]
+impl OrchestrationInlineWorker for RpcSessionInlineWorker {
+    async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+        let tools = crate::tools::ToolRegistry::new(
+            &INLINE_WORKER_TOOLS,
+            workspace_path,
+            Some(&self.config),
+        );
+        let agent = Agent::new(Arc::clone(&self.provider), tools, AgentConfig::default());
+        let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            workspace_path.to_path_buf(),
+        ))));
+        let mut session = AgentSession::new(
+            agent,
+            inner_session,
+            false,
+            ResolvedCompactionSettings::default(),
+        );
+        let prompt = automation_worker_prompt(task);
+        let message = session.run_text(prompt, |_| {}).await?;
+        Ok(assistant_message_summary(&message))
+    }
+}
+
+#[allow(dead_code)]
+fn assistant_message_summary(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[allow(dead_code)]
+fn automation_worker_prompt(task: &TaskContract) -> String {
+    let invariants = if task.invariants.is_empty() {
+        "none".to_string()
+    } else {
+        task.invariants.join("; ")
+    };
+    let forbidden = if task.forbid_paths.is_empty() {
+        "none".to_string()
+    } else {
+        task.forbid_paths.join(", ")
+    };
+    let planned_touches = if task.planned_touches.is_empty() {
+        "not specified; keep the diff minimal".to_string()
+    } else {
+        task.planned_touches.join(", ")
+    };
+    let acceptance = if task.acceptance_ids.is_empty() {
+        "not specified".to_string()
+    } else {
+        task.acceptance_ids.join(", ")
+    };
+    format!(
+        "You are executing one isolated orchestration task inside a git worktree.\n\
+         Complete only the task below and keep the diff minimal.\n\n\
+         Task ID: {task_id}\n\
+         Objective: {objective}\n\
+         Acceptance IDs: {acceptance}\n\
+         Planned touches: {planned_touches}\n\
+         Invariants: {invariants}\n\
+         Forbidden paths: {forbidden}\n\
+         Verify command: {verify_command}\n\n\
+         Requirements:\n\
+         - Stay inside the task scope.\n\
+         - Prefer the built-in edit/write/bash/read tools.\n\
+         - Run the verify command before finishing if possible.\n\
+         - End with a short plain-language summary of what changed and whether verification passed.\n",
+        task_id = task.task_id,
+        objective = task.objective,
+        acceptance = acceptance,
+        planned_touches = planned_touches,
+        invariants = invariants,
+        forbidden = forbidden,
+        verify_command = task.verify_command,
+    )
+}
+
+#[allow(dead_code)]
+fn patch_digest_for_diff(diff: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(diff.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+#[allow(dead_code)]
+fn changed_files_from_diff(diff: &str) -> Vec<String> {
+    let mut changed = Vec::new();
+    for line in diff.lines() {
+        if !line.starts_with("diff --git ") {
+            continue;
+        }
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 4 {
+            continue;
+        }
+        let path = parts[2].strip_prefix("a/").unwrap_or(parts[2]).to_string();
+        if !changed.contains(&path) {
+            changed.push(path);
+        }
+    }
+    changed
+}
+
+#[allow(dead_code)]
+fn apply_diff_to_repo(repo_root: &Path, diff: &str) -> Result<()> {
+    if diff.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("git")
+        .current_dir(repo_root)
+        .args(["apply", "--reject", "--whitespace=fix"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| Error::Io(Box::new(err)))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(diff.as_bytes())
+            .map_err(|err| Error::Io(Box::new(err)))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(Error::tool(
+        "orchestration",
+        format!(
+            "failed to apply worker diff: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    ))
+}
+
+#[allow(dead_code)]
+fn task_contract_for_runtime_task(
+    reliability: &RpcReliabilityState,
+    task_id: &str,
+) -> Result<TaskContract> {
+    let task = reliability
+        .tasks
+        .get(task_id)
+        .ok_or_else(|| Error::validation(format!("Unknown reliability task: {task_id}")))?;
+    let (verify_command, verify_timeout_sec) = match &task.spec.verify {
+        reliability::VerifyPlan::Standard {
+            command,
+            timeout_sec,
+            ..
+        } => (command.clone(), Some(*timeout_sec)),
+    };
+
+    Ok(TaskContract {
+        task_id: task.id.clone(),
+        objective: task.spec.objective.clone(),
+        parent_goal_trace_id: reliability.parent_goal_trace_by_task.get(task_id).cloned(),
+        invariants: task.spec.constraints.invariants.clone(),
+        max_touched_files: task.spec.constraints.max_touched_files,
+        forbid_paths: task.spec.constraints.forbid_paths.clone(),
+        verify_command,
+        verify_timeout_sec,
+        max_attempts: Some(task.spec.max_attempts),
+        input_snapshot: Some(task.spec.input_snapshot.clone()),
+        acceptance_ids: task.spec.acceptance_ids.clone(),
+        planned_touches: task.spec.planned_touches.clone(),
+        prerequisites: Vec::new(),
+        enforce_symbol_drift_check: reliability
+            .symbol_drift_required_by_task
+            .get(task_id)
+            .copied()
+            .unwrap_or(false),
+    })
+}
+
+#[allow(dead_code)]
+async fn execute_task_verification(
+    workspace_path: &Path,
+    task: &TaskContract,
+) -> TaskVerificationOutcome {
+    let timeout_sec = task.verify_timeout_sec.unwrap_or(60);
+    match Verifier::execute_verify_command(workspace_path, &task.verify_command, timeout_sec).await
+    {
+        Ok(execution) => {
+            let passed = execution.passed();
+            TaskVerificationOutcome {
+                command: execution.command,
+                exit_code: execution.exit_code,
+                output: execution.output,
+                timed_out: execution.cancelled,
+                passed,
+            }
+        }
+        Err(err) => TaskVerificationOutcome {
+            command: task.verify_command.clone(),
+            exit_code: -1,
+            output: err.to_string(),
+            timed_out: false,
+            passed: false,
+        },
+    }
+}
+
+#[allow(dead_code)]
+async fn append_evidence_record(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    req: AppendEvidenceRequest,
+) -> Result<EvidenceRecord> {
+    let evidence = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        rel.append_evidence(req)?
+    };
+
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        inner_session.append_verification_evidence_entry(evidence.clone());
+    }
+    guard.persist_session().await?;
+    Ok(evidence)
+}
+
+#[allow(dead_code)]
+async fn submit_task_and_sync(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    req: SubmitTaskRequest,
+) -> Result<SubmitTaskResponse> {
+    let req_for_report = req.clone();
+    let result = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        rel.submit_task(req)?
+    };
+
+    {
+        let mut guard = session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        {
+            let mut inner_session = guard
+                .session
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+            inner_session
+                .append_close_decision_entry(result.close_payload.clone(), result.close.clone());
+            inner_session.append_task_transition_entry(
+                result.task_id.clone(),
+                None,
+                result.state.clone(),
+                None,
+            );
+        }
+        guard.persist_session().await?;
+    }
+
+    let report = {
+        let rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        build_submit_task_report(&rel, &req_for_report, &result)?
+    };
+    sync_task_runs(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        &result.task_id,
+        Some(report),
+    )
+    .await?;
+    Ok(result)
+}
+
+#[allow(dead_code)]
+async fn rollback_dispatch_grant(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    run_id: &str,
+    grant: &DispatchGrant,
+) {
+    let updated_run = {
+        let Ok(mut rel) = reliability_state.lock(cx).await else {
+            return;
+        };
+        let _ = rel.expire_dispatch_grant(grant);
+        rel.refresh_dependency_states();
+        let mut run = {
+            let Ok(orchestration) = orchestration_state.lock(cx).await else {
+                return;
+            };
+            orchestration
+                .get_run(run_id)
+                .or_else(|| run_store.load(run_id).ok())
+        };
+        if let Some(mut run) = run.take() {
+            refresh_run_from_reliability(&rel, &mut run);
+            if let Ok(mut orchestration) = orchestration_state.lock(cx).await {
+                orchestration.update_run(run.clone());
+            }
+            Some(run)
+        } else {
+            None
+        }
+    };
+
+    if let Some(run) = updated_run {
+        let _ = persist_run_status(cx, session, run_store, &run).await;
+    }
+}
+
+#[allow(dead_code)]
+async fn execute_inline_dispatch_grant_with_worker(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    repo_root: &Path,
+    run_id: &str,
+    grant: &DispatchGrant,
+    worker: &dyn OrchestrationInlineWorker,
+) -> Result<RunStatus> {
+    let contract = {
+        let rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        task_contract_for_runtime_task(&rel, &grant.task_id)?
+    };
+    let snapshot = contract
+        .input_snapshot
+        .clone()
+        .ok_or_else(|| Error::validation("inline orchestration task missing input snapshot"))?;
+    let assigned_files = contract
+        .planned_touches
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let mut workspace =
+        FlockWorkspace::spawn_with_snapshot(repo_root, 0, assigned_files, snapshot)?;
+    workspace.prepare()?;
+
+    let summary = match worker.execute(workspace.workspace_path(), &contract).await {
+        Ok(summary) => summary,
+        Err(err) => {
+            let _ = workspace.teardown();
+            rollback_dispatch_grant(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                run_id,
+                grant,
+            )
+            .await;
+            return Err(err);
+        }
+    };
+    let diff = match workspace.get_changes() {
+        Ok(diff) => diff,
+        Err(err) => {
+            let _ = workspace.teardown();
+            rollback_dispatch_grant(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                run_id,
+                grant,
+            )
+            .await;
+            return Err(err);
+        }
+    };
+    let changed_files = changed_files_from_diff(&diff);
+    let patch_digest = patch_digest_for_diff(&diff);
+    let verification = execute_task_verification(workspace.workspace_path(), &contract).await;
+    let evidence = match append_evidence_record(
+        cx,
+        session,
+        reliability_state,
+        AppendEvidenceRequest {
+            task_id: contract.task_id.clone(),
+            command: verification.command.clone(),
+            exit_code: verification.exit_code,
+            stdout: verification.output.clone(),
+            stderr: String::new(),
+            artifact_ids: Vec::new(),
+            env_id: Some("orchestration:inline".to_string()),
+        },
+    )
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(err) => {
+            let _ = workspace.teardown();
+            rollback_dispatch_grant(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                run_id,
+                grant,
+            )
+            .await;
+            return Err(err);
+        }
+    };
+
+    if verification.passed {
+        if let Err(err) = apply_diff_to_repo(repo_root, &diff) {
+            let _ = workspace.teardown();
+            rollback_dispatch_grant(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                run_id,
+                grant,
+            )
+            .await;
+            return Err(err);
+        }
+    }
+
+    let trimmed_summary = summary.trim();
+    let close = verification.passed.then(|| ClosePayload {
+        task_id: contract.task_id.clone(),
+        outcome: if trimmed_summary.is_empty() {
+            format!("Completed {}", contract.objective)
+        } else {
+            trimmed_summary.to_string()
+        },
+        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+        acceptance_ids: contract.acceptance_ids.clone(),
+        evidence_ids: vec![evidence.evidence_id.clone()],
+        trace_parent: contract.parent_goal_trace_id.clone(),
+    });
+    let submit_result = submit_task_and_sync(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        SubmitTaskRequest {
+            task_id: grant.task_id.clone(),
+            lease_id: grant.lease_id.clone(),
+            fence_token: grant.fence_token,
+            patch_digest,
+            verify_run_id: format!("orchestration-inline:{run_id}:{}", grant.task_id),
+            verify_passed: Some(verification.passed),
+            verify_timed_out: verification.timed_out,
+            failure_class: (!verification.passed)
+                .then_some(reliability::FailureClass::VerificationFailed),
+            changed_files,
+            symbol_drift_violations: Vec::new(),
+            close,
+        },
+    )
+    .await;
+    let teardown_result = workspace.teardown();
+    match (submit_result, teardown_result) {
+        (Ok(_), Ok(())) => {}
+        (Err(err), _) => {
+            rollback_dispatch_grant(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                run_id,
+                grant,
+            )
+            .await;
+            return Err(err);
+        }
+        (Ok(_), Err(err)) => return Err(err),
+    }
+
+    if let Some(run) = {
+        let orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.get_run(run_id)
+    } {
+        return Ok(run);
+    }
+    run_store.load(run_id)
 }
 
 fn build_submit_task_report(
@@ -6967,7 +7535,10 @@ mod tests {
     use futures::stream;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
+    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7165,6 +7736,144 @@ mod tests {
             planned_touches: vec![format!("src/{task_id}.rs")],
             prerequisites,
             enforce_symbol_drift_check: false,
+        }
+    }
+
+    fn run_async<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(future)
+    }
+
+    fn run_git(repo_path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo_path)
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(
+            status.success(),
+            "git {:?} failed in {}",
+            args,
+            repo_path.display()
+        );
+    }
+
+    fn git_stdout(repo_path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn setup_inline_execution_repo() -> (tempfile::TempDir, PathBuf, String) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp_dir.path().to_path_buf();
+        run_git(&repo_path, &["init"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        fs::create_dir_all(repo_path.join("src")).expect("mkdir src");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub fn fixture() { println!(\"before\"); }\n",
+        )
+        .expect("write seed file");
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "initial"]);
+        let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
+        (temp_dir, repo_path, head)
+    }
+
+    #[derive(Debug)]
+    struct NoopProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for NoopProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("noop"))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(
+                crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    fn build_test_agent_session(repo_path: &Path) -> Arc<Mutex<AgentSession>> {
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        let tools = crate::tools::ToolRegistry::new(&[], repo_path, None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        Arc::new(Mutex::new(AgentSession::new(
+            agent,
+            session,
+            false,
+            ResolvedCompactionSettings::default(),
+        )))
+    }
+
+    struct FixtureInlineWorker {
+        target: String,
+        contents: String,
+        summary: String,
+    }
+
+    #[async_trait]
+    impl OrchestrationInlineWorker for FixtureInlineWorker {
+        async fn execute(&self, workspace_path: &Path, _task: &TaskContract) -> Result<String> {
+            let target = workspace_path.join(&self.target);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|err| Error::Io(Box::new(err)))?;
+            }
+            fs::write(&target, &self.contents).map_err(|err| Error::Io(Box::new(err)))?;
+            Ok(self.summary.clone())
         }
     }
 
@@ -7650,6 +8359,188 @@ mod tests {
         assert_eq!(task_report.summary, "Implemented orchestration report");
         assert_eq!(task_report.verify_exit_code, 0);
         assert_eq!(task_report.changed_files, vec!["src/rpc.rs".to_string()]);
+    }
+
+    #[test]
+    fn orchestration_inline_execution_substrate_applies_verified_diff_and_closes_task() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract = reliability_contract("task-inline-exec", Vec::new());
+            contract.input_snapshot = Some(head);
+            contract.verify_command = "grep -q updated src/lib.rs".to_string();
+            contract.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let grant = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.request_dispatch(&contract, "worker", 120)
+                    .expect("dispatch inline task")
+            };
+
+            let mut run = RunStatus::new(
+                "run-inline-exec",
+                "Inline execution fixture",
+                ExecutionTier::Inline,
+            );
+            run.task_ids = vec![contract.task_id.clone()];
+            run.run_verify_command = "true".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = FixtureInlineWorker {
+                target: "src/lib.rs".to_string(),
+                contents: "pub fn fixture() { println!(\"updated\"); }\n".to_string(),
+                summary: "Updated the fixture implementation".to_string(),
+            };
+            let updated_run = execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-inline-exec",
+                &grant,
+                &worker,
+            )
+            .await
+            .expect("execute inline task");
+
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert!(
+                updated_run
+                    .latest_run_verify
+                    .as_ref()
+                    .is_some_and(|verify| verify.ok)
+            );
+            assert_eq!(
+                updated_run
+                    .task_reports
+                    .get(&contract.task_id)
+                    .expect("task report")
+                    .verify_exit_code,
+                0
+            );
+
+            let parent_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read parent file");
+            assert!(parent_contents.contains("updated"));
+
+            let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+            assert!(matches!(
+                rel.tasks
+                    .get(&contract.task_id)
+                    .map(|task| &task.runtime.state),
+                Some(reliability::RuntimeState::Terminal(
+                    reliability::TerminalState::Succeeded { .. }
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn orchestration_inline_execution_substrate_keeps_parent_repo_clean_on_verify_failure() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract = reliability_contract("task-inline-fail", Vec::new());
+            contract.input_snapshot = Some(head);
+            contract.verify_command = "grep -q missing src/lib.rs".to_string();
+            contract.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let grant = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.request_dispatch(&contract, "worker", 120)
+                    .expect("dispatch inline task")
+            };
+
+            let mut run = RunStatus::new(
+                "run-inline-fail",
+                "Inline execution verify failure",
+                ExecutionTier::Inline,
+            );
+            run.task_ids = vec![contract.task_id.clone()];
+            run.run_verify_command = "true".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = FixtureInlineWorker {
+                target: "src/lib.rs".to_string(),
+                contents: "pub fn fixture() { println!(\"updated\"); }\n".to_string(),
+                summary: "Attempted inline update".to_string(),
+            };
+            let err = execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-inline-fail",
+                &grant,
+                &worker,
+            )
+            .await
+            .expect_err("hard-mode verify failure should reject close");
+            assert!(err.to_string().contains("close rejected"));
+
+            let parent_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read parent file");
+            assert!(parent_contents.contains("before"));
+            assert!(!parent_contents.contains("updated"));
+
+            let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+            assert!(matches!(
+                rel.tasks
+                    .get(&contract.task_id)
+                    .map(|task| &task.runtime.state),
+                Some(reliability::RuntimeState::Ready)
+            ));
+        });
     }
 
     #[test]
