@@ -83,6 +83,7 @@ pub struct WaveStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunVerifyScopeKind {
+    Run,
     Wave,
     Subrun,
 }
@@ -286,8 +287,8 @@ mod tests {
         run.run_verify_timeout_sec = Some(90);
         run.max_parallelism = 2;
         run.latest_run_verify = Some(RunVerifyStatus {
-            scope_id: "wave-1".to_string(),
-            scope_kind: RunVerifyScopeKind::Wave,
+            scope_id: "run-2".to_string(),
+            scope_kind: RunVerifyScopeKind::Run,
             subrun_id: None,
             command: "cargo test --lib".to_string(),
             timeout_sec: 90,

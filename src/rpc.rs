@@ -1567,41 +1567,10 @@ fn completed_run_verify_scope(
     if run.run_verify_command.trim().is_empty() || !run_terminal_success(reliability, run) {
         return None;
     }
-
-    if run.selected_tier == ExecutionTier::Hierarchical {
-        let subrun_id = run.active_subrun_id.clone()?;
-        let subrun = run
-            .planned_subruns
-            .iter()
-            .find(|subrun| subrun.subrun_id == subrun_id)?;
-        if subrun.task_ids.is_empty()
-            || !subrun
-                .task_ids
-                .iter()
-                .all(|task_id| task_terminal_success(reliability, task_id))
-        {
-            return None;
-        }
-        return Some(CompletedRunVerifyScope {
-            scope_id: subrun.subrun_id.clone(),
-            scope_kind: RunVerifyScopeKind::Subrun,
-            subrun_id: Some(subrun.subrun_id.clone()),
-        });
-    }
-
-    let wave = run.active_wave.as_ref()?;
-    if wave.task_ids.is_empty()
-        || !wave
-            .task_ids
-            .iter()
-            .all(|task_id| task_terminal_success(reliability, task_id))
-    {
-        return None;
-    }
     Some(CompletedRunVerifyScope {
-        scope_id: wave.wave_id.clone(),
-        scope_kind: RunVerifyScopeKind::Wave,
-        subrun_id: run.active_subrun_id.clone(),
+        scope_id: run.run_id.clone(),
+        scope_kind: RunVerifyScopeKind::Run,
+        subrun_id: None,
     })
 }
 
@@ -3240,6 +3209,7 @@ fn run_verify_scope_summary(
     details: impl AsRef<str>,
 ) -> String {
     let scope_label = match scope.scope_kind {
+        RunVerifyScopeKind::Run => "run",
         RunVerifyScopeKind::Wave => "wave",
         RunVerifyScopeKind::Subrun => "subrun",
     };
@@ -9632,7 +9602,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_completed_run_verify_scope_detects_wave_completion() {
+    fn orchestration_completed_run_verify_scope_detects_run_completion() {
         let mut reliability =
             reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
         let contract_a = reliability_contract("task-wave-a", Vec::new());
@@ -9695,9 +9665,9 @@ mod tests {
             completed_at: None,
         });
 
-        let scope = completed_run_verify_scope(&reliability, &run).expect("completed wave scope");
-        assert_eq!(scope.scope_id, "wave-1");
-        assert_eq!(scope.scope_kind, RunVerifyScopeKind::Wave);
+        let scope = completed_run_verify_scope(&reliability, &run).expect("completed run scope");
+        assert_eq!(scope.scope_id, run.run_id);
+        assert_eq!(scope.scope_kind, RunVerifyScopeKind::Run);
         assert_eq!(scope.subrun_id, None);
     }
 
@@ -9926,8 +9896,8 @@ mod tests {
         );
         run.task_ids = vec![contract.task_id.clone()];
         run.latest_run_verify = Some(RunVerifyStatus {
-            scope_id: "wave-1".to_string(),
-            scope_kind: RunVerifyScopeKind::Wave,
+            scope_id: "run-verify-fail-state".to_string(),
+            scope_kind: RunVerifyScopeKind::Run,
             subrun_id: None,
             command: "false".to_string(),
             timeout_sec: 30,
@@ -9959,8 +9929,8 @@ mod tests {
             run.run_verify_command = "true".to_string();
             run.run_verify_timeout_sec = Some(30);
             let scope = CompletedRunVerifyScope {
-                scope_id: "wave-1".to_string(),
-                scope_kind: RunVerifyScopeKind::Wave,
+                scope_id: "run-verify-success".to_string(),
+                scope_kind: RunVerifyScopeKind::Run,
                 subrun_id: None,
             };
 
@@ -9968,7 +9938,7 @@ mod tests {
 
             let verify = run.latest_run_verify.as_ref().expect("verification result");
             assert!(verify.ok);
-            assert_eq!(verify.scope_id, "wave-1");
+            assert_eq!(verify.scope_id, "run-verify-success");
             assert_eq!(run.lifecycle, RunLifecycle::Pending);
         });
     }
@@ -9990,8 +9960,8 @@ mod tests {
             run.run_verify_command = "false".to_string();
             run.run_verify_timeout_sec = Some(30);
             let scope = CompletedRunVerifyScope {
-                scope_id: "wave-1".to_string(),
-                scope_kind: RunVerifyScopeKind::Wave,
+                scope_id: "run-verify-failure".to_string(),
+                scope_kind: RunVerifyScopeKind::Run,
                 subrun_id: None,
             };
 
@@ -9999,7 +9969,7 @@ mod tests {
 
             let verify = run.latest_run_verify.as_ref().expect("verification result");
             assert!(!verify.ok);
-            assert_eq!(verify.scope_id, "wave-1");
+            assert_eq!(verify.scope_id, "run-verify-failure");
             assert_eq!(run.lifecycle, RunLifecycle::Failed);
         });
     }
