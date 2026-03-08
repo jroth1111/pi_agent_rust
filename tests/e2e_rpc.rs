@@ -765,6 +765,101 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
 }
 
 #[test]
+fn rpc_orchestration_dispatch_run_advances_dependency_waves() {
+    let harness = TestHarness::new("rpc_orchestration_dispatch_run_advances_dependency_waves");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-chain-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-chain");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise multi-wave orchestration dispatch",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-chain-a",
+                    "objective": "Complete task A",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-chain-a"],
+                    "plannedTouches": ["task-a.txt"]
+                },
+                {
+                    "taskId": "task-e2e-chain-b",
+                    "objective": "Complete task B",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-chain-b"],
+                    "plannedTouches": ["task-b.txt"],
+                    "prerequisites": [
+                        {
+                            "taskId": "task-e2e-chain-a"
+                        }
+                    ]
+                }
+            ],
+            "runVerifyCommand": "test -f task-a.txt && test -f task-b.txt",
+            "runVerifyTimeoutSec": 30,
+            "maxParallelism": 2
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        let grants = dispatch["data"]["grants"]
+            .as_array()
+            .expect("dispatch grants");
+        assert!(
+            grants.is_empty(),
+            "automated dependency dispatch should not return live leases"
+        );
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 2);
+
+        let get_cmd = json!({
+            "id": "3",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&get, "orchestration.get_run");
+        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 2);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_orchestration_resume_reruns_failed_run_verification() {
     let harness = TestHarness::new("rpc_orchestration_resume_reruns_failed_run_verification");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()

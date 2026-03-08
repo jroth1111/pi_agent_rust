@@ -2705,6 +2705,77 @@ async fn session_workspace_root(
     })
 }
 
+async fn dispatch_run_until_quiescent(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    mut run: RunStatus,
+    agent_id_prefix: &str,
+    lease_ttl_sec: i64,
+) -> Result<(RunStatus, Vec<DispatchGrant>)> {
+    loop {
+        let mut grants = {
+            let mut rel = reliability_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+            let has_live_tasks = !run.task_ids.is_empty()
+                && run
+                    .task_ids
+                    .iter()
+                    .all(|task_id| rel.tasks.contains_key(task_id));
+            if has_live_tasks {
+                dispatch_run_wave(&mut rel, &mut run, agent_id_prefix, lease_ttl_sec)
+            } else {
+                Err(Error::session(format!(
+                    "orchestration run {} is not live in this process",
+                    run.run_id
+                )))
+            }
+        }?;
+
+        {
+            let mut orchestration = orchestration_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+            orchestration.update_run(run.clone());
+        }
+
+        if grants.is_empty() {
+            return Ok((run, grants));
+        }
+
+        append_dispatch_grants_session_entries(cx, session, reliability_state, &grants).await?;
+        run = execute_inline_run_dispatch(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            config,
+            run,
+            &grants,
+        )
+        .await?;
+        grants.clear();
+
+        if matches!(
+            run.lifecycle,
+            RunLifecycle::Canceled
+                | RunLifecycle::Failed
+                | RunLifecycle::Succeeded
+                | RunLifecycle::Blocked
+                | RunLifecycle::AwaitingHuman
+        ) {
+            return Ok((run, grants));
+        }
+    }
+}
+
 fn build_submit_task_report(
     reliability: &RpcReliabilityState,
     req: &SubmitTaskRequest,
@@ -3843,41 +3914,34 @@ pub async fn run(
                     })?;
                     orchestration.get_run(&req.run_id)
                 };
-                let mut run =
-                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.dispatch_run",
-                            &err,
-                        ));
-                        continue;
-                    };
-
-                let dispatch_result = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    let has_live_tasks = !run.task_ids.is_empty()
-                        && run
-                            .task_ids
-                            .iter()
-                            .all(|task_id| rel.tasks.contains_key(task_id));
-                    if has_live_tasks {
-                        dispatch_run_wave(&mut rel, &mut run, agent_id_prefix, lease_ttl_sec)
-                    } else {
-                        Err(Error::session(format!(
-                            "orchestration run {} is not live in this process",
-                            run.run_id
-                        )))
-                    }
+                let run = if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok())
+                {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.dispatch_run",
+                        &err,
+                    ));
+                    continue;
                 };
-                let mut grants = match dispatch_result {
-                    Ok(grants) => grants,
+
+                let (run, grants) = match dispatch_run_until_quiescent(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &options.config,
+                    run,
+                    agent_id_prefix,
+                    lease_ttl_sec,
+                )
+                .await
+                {
+                    Ok(result) => result,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -3887,55 +3951,6 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                {
-                    let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.update_run(run.clone());
-                }
-                if let Err(err) = append_dispatch_grants_session_entries(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &grants,
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                }
-                if !grants.is_empty() {
-                    match execute_inline_run_dispatch(
-                        &cx,
-                        &session,
-                        &reliability_state,
-                        &orchestration_state,
-                        &run_store,
-                        &options.config,
-                        run,
-                        &grants,
-                    )
-                    .await
-                    {
-                        Ok(updated_run) => {
-                            run = updated_run;
-                            grants.clear();
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.dispatch_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    }
-                }
                 if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
