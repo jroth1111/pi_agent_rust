@@ -236,6 +236,16 @@ struct CancelRunRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchRunRequest {
+    run_id: String,
+    #[serde(default)]
+    agent_id_prefix: Option<String>,
+    #[serde(default)]
+    lease_ttl_sec: Option<i64>,
+}
+
 #[derive(Debug)]
 struct RpcReliabilityState {
     enabled: bool,
@@ -694,14 +704,24 @@ impl RpcReliabilityState {
         self.get_or_create_task(contract)?;
         self.reconcile_prerequisites(contract)?;
         self.refresh_dependency_states();
-        let waiting_on = self.project_waiting_on_for_task(&task_id);
+        self.request_dispatch_existing(&task_id, agent_id, ttl_seconds)
+    }
+
+    fn request_dispatch_existing(
+        &mut self,
+        task_id: &str,
+        agent_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<DispatchGrant> {
+        self.ensure_enabled()?;
+        let waiting_on = self.project_waiting_on_for_task(task_id);
         if !waiting_on.is_empty() {
             return Err(Error::validation(format!(
                 "task {task_id} is blocked by prerequisites: {}",
                 waiting_on.join(", ")
             )));
         }
-        if let Some(task) = self.tasks.get(&task_id) {
+        if let Some(task) = self.tasks.get(task_id) {
             if let reliability::RuntimeState::Recoverable { retry_after, .. } = &task.runtime.state
             {
                 let retry_note = retry_after
@@ -715,7 +735,7 @@ impl RpcReliabilityState {
 
         let grant = self
             .leases
-            .issue_lease(&task_id, agent_id, ttl_seconds)
+            .issue_lease(task_id, agent_id, ttl_seconds)
             .map_err(|err| Error::validation(err.to_string()))?;
 
         let event = reliability::TransitionEvent::Dispatch {
@@ -727,7 +747,7 @@ impl RpcReliabilityState {
 
         let mode_blocks = self.mode_blocks();
         let (task_id, state) = {
-            let Some(task) = self.tasks.get_mut(&task_id) else {
+            let Some(task) = self.tasks.get_mut(task_id) else {
                 return Err(Error::validation("task disappeared during dispatch"));
             };
 
@@ -760,6 +780,24 @@ impl RpcReliabilityState {
             expires_at: grant.expires_at,
             state,
         })
+    }
+
+    fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
+        self.ensure_enabled()?;
+        let _ = self.leases.expire_lease(&grant.lease_id);
+        let Some(task) = self.tasks.get_mut(&grant.task_id) else {
+            return Ok(());
+        };
+
+        if matches!(task.runtime.state, reliability::RuntimeState::Leased { .. }) {
+            reliability::apply_transition(
+                &mut task.runtime,
+                &reliability::TransitionEvent::ExpireLease,
+                task.spec.max_attempts,
+            )
+            .map_err(|err| Error::validation(format!("dispatch rollback failed: {err}")))?;
+        }
+        Ok(())
     }
 
     fn append_evidence(&mut self, req: AppendEvidenceRequest) -> Result<EvidenceRecord> {
@@ -1245,6 +1283,7 @@ fn normalize_command_type(command_type: &str) -> &str {
         }
         "orchestration.startRun" | "orchestration_start_run" => "orchestration.start_run",
         "orchestration.getRun" | "orchestration_get_run" => "orchestration.get_run",
+        "orchestration.dispatchRun" | "orchestration_dispatch_run" => "orchestration.dispatch_run",
         "orchestration.cancelRun" | "orchestration_cancel_run" => "orchestration.cancel_run",
         "orchestration.resumeRun" | "orchestration_resume_run" => "orchestration.resume_run",
         _ => command_type,
@@ -1820,6 +1859,65 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
         run.lifecycle = derive_run_lifecycle(reliability, &run.task_ids);
     }
     run.touch();
+}
+
+fn dispatch_run_wave(
+    reliability: &mut RpcReliabilityState,
+    run: &mut RunStatus,
+    agent_id_prefix: &str,
+    lease_ttl_sec: i64,
+) -> Result<Vec<DispatchGrant>> {
+    refresh_run_from_reliability(reliability, run);
+    if matches!(
+        run.lifecycle,
+        RunLifecycle::Canceled | RunLifecycle::Failed | RunLifecycle::Succeeded
+    ) {
+        return Err(Error::validation(format!(
+            "run {} is not dispatchable in lifecycle {:?}",
+            run.run_id, run.lifecycle
+        )));
+    }
+
+    let dispatchable_task_ids = run
+        .active_wave
+        .as_ref()
+        .map(|wave| {
+            wave.task_ids
+                .iter()
+                .filter_map(|task_id| {
+                    let task = reliability.tasks.get(task_id)?;
+                    if matches!(task.runtime.state, reliability::RuntimeState::Ready) {
+                        Some(task_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if dispatchable_task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut grants = Vec::with_capacity(dispatchable_task_ids.len());
+    for task_id in dispatchable_task_ids {
+        let agent_id = format!("{agent_id_prefix}:{task_id}");
+        match reliability.request_dispatch_existing(&task_id, &agent_id, lease_ttl_sec) {
+            Ok(grant) => grants.push(grant),
+            Err(err) => {
+                for grant in &grants {
+                    let _ = reliability.expire_dispatch_grant(grant);
+                }
+                reliability.refresh_dependency_states();
+                refresh_run_from_reliability(reliability, run);
+                return Err(err);
+            }
+        }
+    }
+
+    refresh_run_from_reliability(reliability, run);
+    Ok(grants)
 }
 
 fn build_submit_task_report(
@@ -2834,6 +2932,99 @@ pub async fn run(
                     let _ =
                         out_tx.send(response_error_with_hints(id, "orchestration.get_run", &err));
                 }
+            }
+
+            "orchestration.dispatch_run" => {
+                let req: DispatchRunRequest =
+                    match parse_command_payload(&parsed, "orchestration.dispatch_run") {
+                        Ok(req) => req,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.dispatch_run",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+                let agent_id_prefix = req
+                    .agent_id_prefix
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("run");
+                let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
+
+                let cached_run = {
+                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("orchestration lock failed: {err}"))
+                    })?;
+                    orchestration.get_run(&req.run_id)
+                };
+                let mut run =
+                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
+                        run
+                    } else {
+                        let err =
+                            Error::session(format!("orchestration run not found: {}", req.run_id));
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.dispatch_run",
+                            &err,
+                        ));
+                        continue;
+                    };
+
+                let dispatch_result = {
+                    let mut rel = reliability_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                    let has_live_tasks = !run.task_ids.is_empty()
+                        && run
+                            .task_ids
+                            .iter()
+                            .all(|task_id| rel.tasks.contains_key(task_id));
+                    if has_live_tasks {
+                        dispatch_run_wave(&mut rel, &mut run, agent_id_prefix, lease_ttl_sec)
+                    } else {
+                        Err(Error::session(format!(
+                            "orchestration run {} is not live in this process",
+                            run.run_id
+                        )))
+                    }
+                };
+                let grants = match dispatch_result {
+                    Ok(grants) => grants,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.dispatch_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
+
+                {
+                    let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("orchestration lock failed: {err}"))
+                    })?;
+                    orchestration.update_run(run.clone());
+                }
+                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.dispatch_run",
+                        &err,
+                    ));
+                    continue;
+                }
+
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "orchestration.dispatch_run",
+                    Some(json!({ "run": run, "grants": grants })),
+                ));
             }
 
             "orchestration.cancel_run" => {
@@ -6897,6 +7088,91 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_dispatch_run_leases_active_wave() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_a = reliability_contract("task-a", Vec::new());
+        let contract_b = reliability_contract("task-b", Vec::new());
+        let contract_c = reliability_contract("task-c", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+        reliability
+            .get_or_create_task(&contract_c)
+            .expect("register task c");
+
+        let mut run = RunStatus::new("run-dispatch", "Dispatch wave", ExecutionTier::Wave);
+        run.max_parallelism = 2;
+        run.task_ids = vec![
+            contract_a.task_id.clone(),
+            contract_b.task_id.clone(),
+            contract_c.task_id.clone(),
+        ];
+
+        let grants =
+            dispatch_run_wave(&mut reliability, &mut run, "worker", 120).expect("dispatch run");
+
+        assert_eq!(grants.len(), 2);
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.task_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.agent_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["worker:task-a".to_string(), "worker:task-b".to_string()]
+        );
+        assert_eq!(run.lifecycle, RunLifecycle::Running);
+        assert_eq!(run.task_counts.get("leased"), Some(&2));
+        assert_eq!(run.task_counts.get("ready"), Some(&1));
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_dispatch_run_returns_empty_when_wave_is_in_flight() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_a = reliability_contract("task-a", Vec::new());
+        let contract_b = reliability_contract("task-b", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+
+        let mut run = RunStatus::new("run-dispatch", "Dispatch wave", ExecutionTier::Wave);
+        run.max_parallelism = 2;
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+
+        let first_grants =
+            dispatch_run_wave(&mut reliability, &mut run, "worker", 120).expect("first dispatch");
+        let second_grants = dispatch_run_wave(&mut reliability, &mut run, "worker", 120)
+            .expect("repeat dispatch should be idempotent");
+
+        assert_eq!(first_grants.len(), 2);
+        assert!(second_grants.is_empty());
+        assert_eq!(run.lifecycle, RunLifecycle::Running);
+        assert_eq!(run.task_counts.get("leased"), Some(&2));
+    }
+
+    #[test]
     fn orchestration_refresh_run_serializes_when_task_lacks_planned_touches() {
         let mut reliability =
             reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
@@ -8087,6 +8363,14 @@ mod tests {
         assert_eq!(
             normalize_command_type("orchestration_get_run"),
             "orchestration.get_run"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration.dispatchRun"),
+            "orchestration.dispatch_run"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration_dispatch_run"),
+            "orchestration.dispatch_run"
         );
         assert_eq!(
             normalize_command_type("orchestration.cancelRun"),
