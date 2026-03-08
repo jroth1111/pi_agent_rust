@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2458,18 +2459,31 @@ async fn rollback_dispatch_grant(
     }
 }
 
-#[allow(dead_code)]
-async fn execute_inline_dispatch_grant_with_worker(
+struct CapturedDispatchExecution {
+    grant: DispatchGrant,
+    contract: TaskContract,
+    summary: String,
+    diff: String,
+    changed_files: Vec<String>,
+    patch_digest: String,
+    verification: TaskVerificationOutcome,
+}
+
+fn dispatch_workspace_segment_id(grant: &DispatchGrant) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    grant.task_id.hash(&mut hasher);
+    grant.lease_id.hash(&mut hasher);
+    grant.fence_token.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
+async fn capture_dispatch_grant_execution(
     cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
     repo_root: &Path,
-    run_id: &str,
     grant: &DispatchGrant,
     worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
+) -> Result<CapturedDispatchExecution> {
     let contract = {
         let rel = reliability_state
             .lock(cx)
@@ -2486,151 +2500,52 @@ async fn execute_inline_dispatch_grant_with_worker(
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let mut workspace =
-        FlockWorkspace::spawn_with_snapshot(repo_root, 0, assigned_files, snapshot)?;
+    let mut workspace = FlockWorkspace::spawn_with_snapshot(
+        repo_root,
+        dispatch_workspace_segment_id(grant),
+        assigned_files,
+        snapshot,
+    )?;
     workspace.prepare()?;
 
-    let summary = match worker.execute(workspace.workspace_path(), &contract).await {
-        Ok(summary) => summary,
-        Err(err) => {
-            let _ = workspace.teardown();
-            rollback_dispatch_grant(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                run_id,
-                grant,
-            )
-            .await;
-            return Err(err);
-        }
-    };
-    let diff = match workspace.get_changes() {
-        Ok(diff) => diff,
-        Err(err) => {
-            let _ = workspace.teardown();
-            rollback_dispatch_grant(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                run_id,
-                grant,
-            )
-            .await;
-            return Err(err);
-        }
-    };
-    let changed_files = changed_files_from_diff(&diff);
-    let patch_digest = patch_digest_for_diff(&diff);
+    let summary = worker.execute(workspace.workspace_path(), &contract).await;
+    let diff = workspace.get_changes();
     let verification = execute_task_verification(workspace.workspace_path(), &contract).await;
-    let evidence = match append_evidence_record(
-        cx,
-        session,
-        reliability_state,
-        AppendEvidenceRequest {
-            task_id: contract.task_id.clone(),
-            command: verification.command.clone(),
-            exit_code: verification.exit_code,
-            stdout: verification.output.clone(),
-            stderr: String::new(),
-            artifact_ids: Vec::new(),
-            env_id: Some("orchestration:inline".to_string()),
-        },
-    )
-    .await
-    {
-        Ok(evidence) => evidence,
-        Err(err) => {
-            let _ = workspace.teardown();
-            rollback_dispatch_grant(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                run_id,
-                grant,
-            )
-            .await;
-            return Err(err);
-        }
-    };
-
-    if verification.passed {
-        if let Err(err) = apply_diff_to_repo(repo_root, &diff) {
-            let _ = workspace.teardown();
-            rollback_dispatch_grant(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                run_id,
-                grant,
-            )
-            .await;
-            return Err(err);
-        }
-    }
-
-    let trimmed_summary = summary.trim();
-    let close = verification.passed.then(|| ClosePayload {
-        task_id: contract.task_id.clone(),
-        outcome: if trimmed_summary.is_empty() {
-            format!("Completed {}", contract.objective)
-        } else {
-            trimmed_summary.to_string()
-        },
-        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
-        acceptance_ids: contract.acceptance_ids.clone(),
-        evidence_ids: vec![evidence.evidence_id.clone()],
-        trace_parent: contract.parent_goal_trace_id.clone(),
-    });
-    let submit_result = submit_task_and_sync(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        SubmitTaskRequest {
-            task_id: grant.task_id.clone(),
-            lease_id: grant.lease_id.clone(),
-            fence_token: grant.fence_token,
-            patch_digest,
-            verify_run_id: format!("orchestration-inline:{run_id}:{}", grant.task_id),
-            verify_passed: Some(verification.passed),
-            verify_timed_out: verification.timed_out,
-            failure_class: (!verification.passed)
-                .then_some(reliability::FailureClass::VerificationFailed),
-            changed_files,
-            symbol_drift_violations: Vec::new(),
-            close,
-        },
-    )
-    .await;
     let teardown_result = workspace.teardown();
-    match (submit_result, teardown_result) {
-        (Ok(_), Ok(())) => {}
-        (Err(err), _) => {
-            rollback_dispatch_grant(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                run_id,
-                grant,
-            )
-            .await;
-            return Err(err);
-        }
-        (Ok(_), Err(err)) => return Err(err),
-    }
 
+    let summary = summary?;
+    let diff = diff?;
+    teardown_result?;
+
+    Ok(CapturedDispatchExecution {
+        grant: grant.clone(),
+        contract,
+        summary,
+        changed_files: changed_files_from_diff(&diff),
+        patch_digest: patch_digest_for_diff(&diff),
+        diff,
+        verification,
+    })
+}
+
+fn captured_dispatches_overlap(captures: &[CapturedDispatchExecution]) -> bool {
+    let mut changed_paths = HashSet::new();
+    for capture in captures {
+        for path in &capture.changed_files {
+            if !changed_paths.insert(path.clone()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+async fn current_run_status(
+    cx: &AgentCx,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<RunStatus> {
     if let Some(run) = {
         let orchestration = orchestration_state
             .lock(cx)
@@ -2643,6 +2558,257 @@ async fn execute_inline_dispatch_grant_with_worker(
     run_store.load(run_id)
 }
 
+async fn finalize_captured_dispatch_execution(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    repo_root: &Path,
+    run_id: &str,
+    capture: CapturedDispatchExecution,
+) -> Result<RunStatus> {
+    let evidence = match append_evidence_record(
+        cx,
+        session,
+        reliability_state,
+        AppendEvidenceRequest {
+            task_id: capture.contract.task_id.clone(),
+            command: capture.verification.command.clone(),
+            exit_code: capture.verification.exit_code,
+            stdout: capture.verification.output.clone(),
+            stderr: String::new(),
+            artifact_ids: Vec::new(),
+            env_id: Some("orchestration:auto".to_string()),
+        },
+    )
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(err) => {
+            rollback_dispatch_grant(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                run_id,
+                &capture.grant,
+            )
+            .await;
+            return Err(err);
+        }
+    };
+
+    if capture.verification.passed
+        && let Err(err) = apply_diff_to_repo(repo_root, &capture.diff)
+    {
+        rollback_dispatch_grant(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            run_id,
+            &capture.grant,
+        )
+        .await;
+        return Err(err);
+    }
+
+    let trimmed_summary = capture.summary.trim();
+    let close = capture.verification.passed.then(|| ClosePayload {
+        task_id: capture.contract.task_id.clone(),
+        outcome: if trimmed_summary.is_empty() {
+            format!("Completed {}", capture.contract.objective)
+        } else {
+            trimmed_summary.to_string()
+        },
+        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+        acceptance_ids: capture.contract.acceptance_ids.clone(),
+        evidence_ids: vec![evidence.evidence_id.clone()],
+        trace_parent: capture.contract.parent_goal_trace_id.clone(),
+    });
+    if let Err(err) = submit_task_and_sync(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        SubmitTaskRequest {
+            task_id: capture.grant.task_id.clone(),
+            lease_id: capture.grant.lease_id.clone(),
+            fence_token: capture.grant.fence_token,
+            patch_digest: capture.patch_digest,
+            verify_run_id: format!("orchestration-inline:{run_id}:{}", capture.grant.task_id),
+            verify_passed: Some(capture.verification.passed),
+            verify_timed_out: capture.verification.timed_out,
+            failure_class: (!capture.verification.passed)
+                .then_some(reliability::FailureClass::VerificationFailed),
+            changed_files: capture.changed_files,
+            symbol_drift_violations: Vec::new(),
+            close,
+        },
+    )
+    .await
+    {
+        rollback_dispatch_grant(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            run_id,
+            &capture.grant,
+        )
+        .await;
+        return Err(err);
+    }
+
+    current_run_status(cx, orchestration_state, run_store, run_id).await
+}
+
+#[allow(dead_code)]
+async fn execute_inline_dispatch_grant_with_worker(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    repo_root: &Path,
+    run_id: &str,
+    grant: &DispatchGrant,
+    worker: &dyn OrchestrationInlineWorker,
+) -> Result<RunStatus> {
+    let capture =
+        match capture_dispatch_grant_execution(cx, reliability_state, repo_root, grant, worker)
+            .await
+        {
+            Ok(capture) => capture,
+            Err(err) => {
+                rollback_dispatch_grant(
+                    cx,
+                    session,
+                    reliability_state,
+                    orchestration_state,
+                    run_store,
+                    run_id,
+                    grant,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+    finalize_captured_dispatch_execution(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        repo_root,
+        run_id,
+        capture,
+    )
+    .await
+}
+
+async fn execute_dispatch_grants_with_worker(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    repo_root: &Path,
+    run: RunStatus,
+    grants: &[DispatchGrant],
+    worker: &dyn OrchestrationInlineWorker,
+) -> Result<RunStatus> {
+    if grants.is_empty() {
+        return Ok(run);
+    }
+
+    if grants.len() > 1 {
+        let capture_results = futures::future::join_all(grants.iter().map(|grant| {
+            capture_dispatch_grant_execution(cx, reliability_state, repo_root, grant, worker)
+        }))
+        .await;
+        let mut captures = Vec::with_capacity(capture_results.len());
+        for result in capture_results {
+            match result {
+                Ok(capture) => captures.push(capture),
+                Err(err) => {
+                    for grant in grants {
+                        rollback_dispatch_grant(
+                            cx,
+                            session,
+                            reliability_state,
+                            orchestration_state,
+                            run_store,
+                            &run.run_id,
+                            grant,
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if captured_dispatches_overlap(&captures) {
+            let mut updated_run = run;
+            for grant in grants {
+                updated_run = execute_inline_dispatch_grant_with_worker(
+                    cx,
+                    session,
+                    reliability_state,
+                    orchestration_state,
+                    run_store,
+                    repo_root,
+                    &updated_run.run_id,
+                    grant,
+                    worker,
+                )
+                .await?;
+            }
+            return Ok(updated_run);
+        }
+
+        let mut updated_run = run;
+        for capture in captures {
+            updated_run = finalize_captured_dispatch_execution(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                repo_root,
+                &updated_run.run_id,
+                capture,
+            )
+            .await?;
+        }
+        return Ok(updated_run);
+    }
+
+    let mut updated_run = run;
+    for grant in grants {
+        updated_run = execute_inline_dispatch_grant_with_worker(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            repo_root,
+            &updated_run.run_id,
+            grant,
+            worker,
+        )
+        .await?;
+    }
+    Ok(updated_run)
+}
+
 async fn execute_inline_run_dispatch(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -2653,10 +2819,6 @@ async fn execute_inline_run_dispatch(
     run: RunStatus,
     grants: &[DispatchGrant],
 ) -> Result<RunStatus> {
-    if grants.is_empty() {
-        return Ok(run);
-    }
-
     let repo_root = session_workspace_root(cx, session).await?;
     let provider = {
         let guard = session
@@ -2666,22 +2828,18 @@ async fn execute_inline_run_dispatch(
         guard.agent.provider()
     };
     let worker = RpcSessionInlineWorker::new(provider, config.clone());
-    let mut updated_run = run;
-    for grant in grants {
-        updated_run = execute_inline_dispatch_grant_with_worker(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            repo_root.as_path(),
-            &updated_run.run_id,
-            grant,
-            &worker,
-        )
-        .await?;
-    }
-    Ok(updated_run)
+    execute_dispatch_grants_with_worker(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        repo_root.as_path(),
+        run,
+        grants,
+        &worker,
+    )
+    .await
 }
 
 async fn session_workspace_root(
@@ -7645,6 +7803,7 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -7955,6 +8114,13 @@ mod tests {
         let tools = crate::tools::ToolRegistry::new(&[], repo_path, None);
         let agent = Agent::new(provider, tools, AgentConfig::default());
         let session = Arc::new(Mutex::new(Session::in_memory()));
+        run_async(async {
+            let mut inner = session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("lock session");
+            inner.header.cwd = repo_path.display().to_string();
+        });
         Arc::new(Mutex::new(AgentSession::new(
             agent,
             session,
@@ -7978,6 +8144,42 @@ mod tests {
             }
             fs::write(&target, &self.contents).map_err(|err| Error::Io(Box::new(err)))?;
             Ok(self.summary.clone())
+        }
+    }
+
+    struct ConcurrentFixtureInlineWorker {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        sleep: Duration,
+    }
+
+    #[async_trait]
+    impl OrchestrationInlineWorker for ConcurrentFixtureInlineWorker {
+        async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+
+            let result = async {
+                asupersync::time::sleep(asupersync::time::wall_now(), self.sleep).await;
+                let target_rel = task
+                    .planned_touches
+                    .first()
+                    .ok_or_else(|| Error::validation("missing planned touches"))?;
+                let target = workspace_path.join(target_rel);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|err| Error::Io(Box::new(err)))?;
+                }
+                fs::write(
+                    &target,
+                    format!("pub fn {}() {{}}\n", task.task_id.replace('-', "_")),
+                )
+                .map_err(|err| Error::Io(Box::new(err)))?;
+                Ok(format!("Updated {}", task.task_id))
+            }
+            .await;
+
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
         }
     }
 
@@ -8532,7 +8734,14 @@ mod tests {
             .await
             .expect("execute inline task");
 
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert_eq!(
+                updated_run.lifecycle,
+                RunLifecycle::Succeeded,
+                "run verify={:?}, lib={:?}, extra={:?}",
+                updated_run.latest_run_verify,
+                fs::read_to_string(repo_path.join("src/lib.rs")),
+                fs::read_to_string(repo_path.join("src/extra.rs"))
+            );
             assert!(
                 updated_run
                     .latest_run_verify
@@ -8645,6 +8854,137 @@ mod tests {
                 Some(reliability::RuntimeState::Ready)
             ));
         });
+    }
+
+    #[test]
+    fn orchestration_parallel_wave_capture_executes_workers_concurrently() {
+        let (temp_dir, repo_path, _) = setup_inline_execution_repo();
+        fs::write(
+            repo_path.join("src/extra.rs"),
+            "pub fn extra_fixture() { println!(\"before-extra\"); }\n",
+        )
+        .expect("write extra tracked file");
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "add extra tracked file"]);
+        let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract_a = reliability_contract("task-parallel-a", Vec::new());
+            contract_a.input_snapshot = Some(head.clone());
+            contract_a.verify_command = "true".to_string();
+            contract_a.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let mut contract_b = reliability_contract("task-parallel-b", Vec::new());
+            contract_b.input_snapshot = Some(head);
+            contract_b.verify_command = "true".to_string();
+            contract_b.planned_touches = vec!["src/extra.rs".to_string()];
+
+            let grants = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                vec![
+                    rel.request_dispatch(&contract_a, "worker-a", 120)
+                        .expect("dispatch parallel task a"),
+                    rel.request_dispatch(&contract_b, "worker-b", 120)
+                        .expect("dispatch parallel task b"),
+                ]
+            };
+
+            let mut run = RunStatus::new(
+                "run-parallel-wave",
+                "Parallel wave execution fixture",
+                ExecutionTier::Wave,
+            );
+            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+            run.run_verify_command =
+                "grep -q task_parallel_a src/lib.rs && grep -q task_parallel_b src/extra.rs"
+                    .to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let max_in_flight = Arc::new(AtomicUsize::new(0));
+            let worker = ConcurrentFixtureInlineWorker {
+                in_flight: Arc::clone(&in_flight),
+                max_in_flight: Arc::clone(&max_in_flight),
+                sleep: Duration::from_millis(50),
+            };
+
+            let updated_run = execute_dispatch_grants_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                run,
+                &grants,
+                &worker,
+            )
+            .await
+            .expect("execute parallel wave");
+
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert!(
+                updated_run
+                    .latest_run_verify
+                    .as_ref()
+                    .is_some_and(|verify| verify.ok)
+            );
+            assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+            let lib_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
+            let extra_contents = fs::read_to_string(repo_path.join("src/extra.rs"))
+                .expect("read updated extra file");
+            assert!(lib_contents.contains("task_parallel_a"));
+            assert!(extra_contents.contains("task_parallel_b"));
+        });
+    }
+
+    #[test]
+    fn orchestration_dispatch_workspace_segment_id_distinguishes_parallel_grants() {
+        let left = DispatchGrant {
+            task_id: "task-a".to_string(),
+            agent_id: "worker-a".to_string(),
+            lease_id: "lease-a".to_string(),
+            fence_token: 1,
+            expires_at: chrono::Utc::now(),
+            state: "leased".to_string(),
+        };
+        let right = DispatchGrant {
+            task_id: "task-b".to_string(),
+            agent_id: "worker-b".to_string(),
+            lease_id: "lease-b".to_string(),
+            fence_token: 1,
+            expires_at: chrono::Utc::now(),
+            state: "leased".to_string(),
+        };
+
+        assert_ne!(
+            dispatch_workspace_segment_id(&left),
+            dispatch_workspace_segment_id(&right)
+        );
     }
 
     #[test]
