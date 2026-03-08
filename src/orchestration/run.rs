@@ -82,17 +82,33 @@ pub struct WaveStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SubrunPlan {
+    pub subrun_id: String,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RunStatus {
     pub run_id: String,
     pub objective: String,
     pub selected_tier: ExecutionTier,
     pub lifecycle: RunLifecycle,
     #[serde(default)]
+    pub run_verify_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_verify_timeout_sec: Option<u32>,
+    #[serde(default = "RunStatus::default_max_parallelism")]
+    pub max_parallelism: usize,
+    #[serde(default)]
     pub task_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_subrun_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_wave: Option<WaveStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planned_subruns: Vec<SubrunPlan>,
     #[serde(default)]
     pub task_counts: BTreeMap<String, usize>,
     #[serde(default)]
@@ -104,6 +120,12 @@ pub struct RunStatus {
 }
 
 impl RunStatus {
+    pub const DEFAULT_MAX_PARALLELISM: usize = 4;
+
+    const fn default_max_parallelism() -> usize {
+        Self::DEFAULT_MAX_PARALLELISM
+    }
+
     pub fn new(
         run_id: impl Into<String>,
         objective: impl Into<String>,
@@ -115,9 +137,13 @@ impl RunStatus {
             objective: objective.into(),
             selected_tier,
             lifecycle: RunLifecycle::Pending,
+            run_verify_command: String::new(),
+            run_verify_timeout_sec: None,
+            max_parallelism: Self::DEFAULT_MAX_PARALLELISM,
             task_ids: Vec::new(),
             active_subrun_id: None,
             active_wave: None,
+            planned_subruns: Vec::new(),
             task_counts: BTreeMap::new(),
             task_reports: BTreeMap::new(),
             latest_run_verify_summary: None,
@@ -139,6 +165,13 @@ impl RunStatus {
         self.task_reports.insert(report.task_id.clone(), report);
         self.touch();
     }
+
+    pub fn effective_max_parallelism(&self) -> usize {
+        match self.selected_tier {
+            ExecutionTier::Inline => 1,
+            ExecutionTier::Wave | ExecutionTier::Hierarchical => self.max_parallelism.max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +180,7 @@ pub struct RunStore {
 }
 
 impl RunStore {
-    pub fn new(root: PathBuf) -> Self {
+    pub const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
@@ -226,6 +259,9 @@ mod tests {
         let store = RunStore::new(temp_dir.path().to_path_buf());
         let mut run = RunStatus::new("run-2", "Round trip", ExecutionTier::Inline);
         run.lifecycle = RunLifecycle::Running;
+        run.run_verify_command = "cargo test --lib".to_string();
+        run.run_verify_timeout_sec = Some(90);
+        run.max_parallelism = 2;
         run.latest_run_verify_summary = Some("ok".to_string());
 
         store.save(&run).expect("save");
@@ -233,6 +269,9 @@ mod tests {
 
         assert_eq!(loaded.run_id, "run-2");
         assert_eq!(loaded.lifecycle, RunLifecycle::Running);
+        assert_eq!(loaded.run_verify_command, "cargo test --lib");
+        assert_eq!(loaded.run_verify_timeout_sec, Some(90));
+        assert_eq!(loaded.max_parallelism, 2);
         assert_eq!(loaded.latest_run_verify_summary.as_deref(), Some("ok"));
     }
 

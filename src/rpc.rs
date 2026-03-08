@@ -26,7 +26,7 @@ use crate::model::{
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, RunLifecycle, RunStatus, RunStore, TaskReport, WaveStatus,
+    ExecutionTier, RunLifecycle, RunStatus, RunStore, SubrunPlan, TaskReport, WaveStatus,
 };
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
@@ -672,6 +672,17 @@ impl RpcReliabilityState {
         promoted
     }
 
+    fn refresh_dependency_states(&mut self) {
+        self.promote_recoverable_due();
+        self.evaluate_dag_unblock();
+
+        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
+        ordered_ids.sort();
+        for task_id in ordered_ids {
+            self.project_waiting_on_for_task(&task_id);
+        }
+    }
+
     fn request_dispatch(
         &mut self,
         contract: &TaskContract,
@@ -682,8 +693,7 @@ impl RpcReliabilityState {
         let task_id = contract.task_id.clone();
         self.get_or_create_task(contract)?;
         self.reconcile_prerequisites(contract)?;
-        self.promote_recoverable_due();
-        self.evaluate_dag_unblock();
+        self.refresh_dependency_states();
         let waiting_on = self.project_waiting_on_for_task(&task_id);
         if !waiting_on.is_empty() {
             return Err(Error::validation(format!(
@@ -923,7 +933,7 @@ impl RpcReliabilityState {
             Self::state_label(&task.runtime.state).to_string()
         };
         let _ = self.leases.expire_lease(&lease_id_for_release);
-        self.evaluate_dag_unblock();
+        self.refresh_dependency_states();
         if let Some(task) = self.tasks.get(&task_id) {
             state = Self::state_label(&task.runtime.state).to_string();
         }
@@ -1068,9 +1078,7 @@ impl RpcReliabilityState {
             let _ = self.leases.expire_lease(&lease_id_for_release);
         }
 
-        self.promote_recoverable_due();
-        self.evaluate_dag_unblock();
-        self.project_waiting_on_for_task(&report.task_id);
+        self.refresh_dependency_states();
         let Some(task) = self.tasks.get(&report.task_id) else {
             return Err(Error::validation(format!(
                 "Unknown reliability task: {}",
@@ -1102,8 +1110,7 @@ impl RpcReliabilityState {
 
     fn get_state_digest(&mut self, task_id: &str) -> Result<StateDigest> {
         self.ensure_enabled()?;
-        self.promote_recoverable_due();
-        self.evaluate_dag_unblock();
+        self.refresh_dependency_states();
         let Some(task) = self.tasks.get(task_id) else {
             return Err(Error::validation(format!(
                 "Unknown reliability task: {task_id}"
@@ -1361,7 +1368,7 @@ fn select_execution_tier(tasks: &[TaskContract]) -> ExecutionTier {
     }
 }
 
-fn failure_class_label(class: reliability::FailureClass) -> &'static str {
+const fn failure_class_label(class: reliability::FailureClass) -> &'static str {
     match class {
         reliability::FailureClass::VerificationFailed => "verification_failed",
         reliability::FailureClass::ScopeCreepDetected => "scope_creep_detected",
@@ -1446,6 +1453,226 @@ fn next_active_wave(
     })
 }
 
+const MAX_HIERARCHICAL_SUBRUN_TASKS: usize = 12;
+
+fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<String> {
+    let run_task_ids = run.task_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut in_degree = run
+        .task_ids
+        .iter()
+        .cloned()
+        .map(|task_id| (task_id, 0usize))
+        .collect::<HashMap<_, _>>();
+    let mut adjacency = run
+        .task_ids
+        .iter()
+        .cloned()
+        .map(|task_id| (task_id, Vec::new()))
+        .collect::<HashMap<_, Vec<String>>>();
+
+    for edge in &reliability.edges {
+        match &edge.kind {
+            reliability::EdgeKind::Prerequisite { .. }
+                if run_task_ids.contains(&edge.from) && run_task_ids.contains(&edge.to) =>
+            {
+                adjacency
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(edge.to.clone());
+                *in_degree.entry(edge.to.clone()).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut ready = in_degree
+        .iter()
+        .filter_map(|(task_id, degree)| (*degree == 0).then_some(task_id.clone()))
+        .collect::<Vec<_>>();
+    ready.sort();
+
+    let mut ordered = Vec::with_capacity(run.task_ids.len());
+    while let Some(task_id) = ready.first().cloned() {
+        ready.remove(0);
+        ordered.push(task_id.clone());
+
+        let mut neighbors = adjacency.get(&task_id).cloned().unwrap_or_default();
+        neighbors.sort();
+        for neighbor in neighbors {
+            let Some(degree) = in_degree.get_mut(&neighbor) else {
+                continue;
+            };
+            *degree = degree.saturating_sub(1);
+            if *degree == 0 && !ordered.contains(&neighbor) && !ready.contains(&neighbor) {
+                ready.push(neighbor);
+            }
+        }
+        ready.sort();
+    }
+
+    let mut missing = run
+        .task_ids
+        .iter()
+        .filter(|task_id| !ordered.contains(task_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    ordered.extend(missing);
+    ordered
+}
+
+fn planned_subruns(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<SubrunPlan> {
+    if run.selected_tier != ExecutionTier::Hierarchical {
+        return Vec::new();
+    }
+
+    let mut adjacency = run
+        .task_ids
+        .iter()
+        .cloned()
+        .map(|task_id| (task_id, HashSet::new()))
+        .collect::<HashMap<_, HashSet<String>>>();
+    let run_task_ids = run.task_ids.iter().cloned().collect::<HashSet<_>>();
+
+    for edge in &reliability.edges {
+        match &edge.kind {
+            reliability::EdgeKind::Prerequisite { .. }
+                if run_task_ids.contains(&edge.from) && run_task_ids.contains(&edge.to) =>
+            {
+                adjacency
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .insert(edge.to.clone());
+                adjacency
+                    .entry(edge.to.clone())
+                    .or_default()
+                    .insert(edge.from.clone());
+            }
+            _ => {}
+        }
+    }
+
+    for (index, left_id) in run.task_ids.iter().enumerate() {
+        let Some(left_task) = reliability.tasks.get(left_id) else {
+            continue;
+        };
+        for right_id in run.task_ids.iter().skip(index + 1) {
+            let Some(right_task) = reliability.tasks.get(right_id) else {
+                continue;
+            };
+            let overlaps = left_task
+                .spec
+                .planned_touches
+                .iter()
+                .any(|path| right_task.spec.planned_touches.contains(path));
+            if overlaps {
+                adjacency
+                    .entry(left_id.clone())
+                    .or_default()
+                    .insert(right_id.clone());
+                adjacency
+                    .entry(right_id.clone())
+                    .or_default()
+                    .insert(left_id.clone());
+            }
+        }
+    }
+
+    let topological_order = topological_run_task_ids(reliability, run);
+    let order_index = topological_order
+        .iter()
+        .enumerate()
+        .map(|(index, task_id)| (task_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    let mut visited = HashSet::new();
+    let mut components = Vec::new();
+    let mut seeds = run.task_ids.clone();
+    seeds.sort_by_key(|task_id| order_index.get(task_id).copied().unwrap_or(usize::MAX));
+    for seed in seeds {
+        if !visited.insert(seed.clone()) {
+            continue;
+        }
+        let mut component = vec![seed.clone()];
+        let mut stack = vec![seed];
+        while let Some(task_id) = stack.pop() {
+            let mut neighbors = adjacency
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            neighbors
+                .sort_by_key(|neighbor| order_index.get(neighbor).copied().unwrap_or(usize::MAX));
+            for neighbor in neighbors {
+                if visited.insert(neighbor.clone()) {
+                    stack.push(neighbor.clone());
+                    component.push(neighbor);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components.sort_by_key(|component| {
+        component
+            .iter()
+            .filter_map(|task_id| order_index.get(task_id))
+            .min()
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut planned = Vec::new();
+    let mut subrun_index = 1usize;
+    let mut pending_task_ids = Vec::new();
+    for component in components {
+        let component_task_ids = component.into_iter().collect::<HashSet<_>>();
+        let ordered_component = topological_order
+            .iter()
+            .filter(|task_id| component_task_ids.contains(*task_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if ordered_component.len() > MAX_HIERARCHICAL_SUBRUN_TASKS {
+            if !pending_task_ids.is_empty() {
+                planned.push(SubrunPlan {
+                    subrun_id: format!("subrun-{subrun_index:02}"),
+                    task_ids: std::mem::take(&mut pending_task_ids),
+                });
+                subrun_index += 1;
+            }
+            for chunk in ordered_component.chunks(MAX_HIERARCHICAL_SUBRUN_TASKS) {
+                planned.push(SubrunPlan {
+                    subrun_id: format!("subrun-{subrun_index:02}"),
+                    task_ids: chunk.to_vec(),
+                });
+                subrun_index += 1;
+            }
+            continue;
+        }
+
+        if pending_task_ids.len() + ordered_component.len() > MAX_HIERARCHICAL_SUBRUN_TASKS
+            && !pending_task_ids.is_empty()
+        {
+            planned.push(SubrunPlan {
+                subrun_id: format!("subrun-{subrun_index:02}"),
+                task_ids: std::mem::take(&mut pending_task_ids),
+            });
+            subrun_index += 1;
+        }
+        pending_task_ids.extend(ordered_component);
+    }
+
+    if !pending_task_ids.is_empty() {
+        planned.push(SubrunPlan {
+            subrun_id: format!("subrun-{subrun_index:02}"),
+            task_ids: pending_task_ids,
+        });
+    }
+
+    planned
+}
+
 fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) -> RunLifecycle {
     let mut saw_ready = false;
     let mut saw_running = false;
@@ -1466,18 +1693,16 @@ fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) 
             | reliability::RuntimeState::Recoverable { .. } => saw_running = true,
             reliability::RuntimeState::Blocked { .. } => saw_blocked = true,
             reliability::RuntimeState::Ready => saw_ready = true,
-            reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded {
-                ..
-            })
-            | reliability::RuntimeState::Terminal(reliability::TerminalState::Superseded {
-                ..
-            }) => {
+            reliability::RuntimeState::Terminal(
+                reliability::TerminalState::Succeeded { .. }
+                | reliability::TerminalState::Superseded { .. },
+            ) => {
                 saw_terminal_success = true;
             }
-            reliability::RuntimeState::Terminal(reliability::TerminalState::Failed { .. })
-            | reliability::RuntimeState::Terminal(reliability::TerminalState::Canceled {
-                ..
-            }) => {
+            reliability::RuntimeState::Terminal(
+                reliability::TerminalState::Failed { .. }
+                | reliability::TerminalState::Canceled { .. },
+            ) => {
                 saw_terminal_failure = true;
             }
         }
@@ -1500,9 +1725,12 @@ fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) 
     }
 }
 
-fn planned_wave_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<String> {
-    let ready_task_ids = run
-        .task_ids
+fn planned_wave_task_ids(
+    reliability: &RpcReliabilityState,
+    run: &RunStatus,
+    candidate_task_ids: &[String],
+) -> Vec<String> {
+    let ready_task_ids = candidate_task_ids
         .iter()
         .filter_map(|task_id| {
             let task = reliability.tasks.get(task_id)?;
@@ -1516,10 +1744,7 @@ fn planned_wave_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> 
 
     let mut scheduled = Vec::new();
     let mut touched_paths = HashSet::new();
-    let max_tasks = match run.selected_tier {
-        ExecutionTier::Inline => 1,
-        ExecutionTier::Wave | ExecutionTier::Hierarchical => usize::MAX,
-    };
+    let max_tasks = run.effective_max_parallelism();
 
     for task_id in ready_task_ids {
         if scheduled.len() >= max_tasks {
@@ -1556,9 +1781,26 @@ fn planned_wave_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> 
 fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
     let preserve_canceled = matches!(run.lifecycle, RunLifecycle::Canceled);
     run.task_counts = reliability.task_counts_for(&run.task_ids);
+    run.planned_subruns = planned_subruns(reliability, run);
 
-    let mut active_task_ids = run
-        .task_ids
+    let active_scope_task_ids = if run.selected_tier == ExecutionTier::Hierarchical {
+        let active_subrun = run.planned_subruns.iter().find(|subrun| {
+            subrun.task_ids.iter().any(|task_id| {
+                reliability.tasks.get(task_id).is_some_and(|task| {
+                    !matches!(task.runtime.state, reliability::RuntimeState::Terminal(_))
+                })
+            })
+        });
+        run.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
+        active_subrun
+            .map(|subrun| subrun.task_ids.clone())
+            .unwrap_or_default()
+    } else {
+        run.active_subrun_id = None;
+        run.task_ids.clone()
+    };
+
+    let mut active_task_ids = active_scope_task_ids
         .iter()
         .filter_map(|task_id| {
             let task = reliability.tasks.get(task_id)?;
@@ -1570,7 +1812,7 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
         })
         .collect::<Vec<_>>();
     if active_task_ids.is_empty() {
-        active_task_ids = planned_wave_task_ids(reliability, run);
+        active_task_ids = planned_wave_task_ids(reliability, run, &active_scope_task_ids);
     }
     run.active_wave = next_active_wave(run.active_wave.take(), active_task_ids);
 
@@ -1600,10 +1842,8 @@ fn build_submit_task_report(
         .unwrap_or_else(|| {
             if req.verify_timed_out {
                 124
-            } else if req.verify_passed.unwrap_or(result.close.approved) {
-                0
             } else {
-                1
+                i32::from(!req.verify_passed.unwrap_or(result.close.approved))
             }
         });
 
@@ -2445,6 +2685,22 @@ pub async fn run(
                     ));
                     continue;
                 }
+                if matches!(req.run_verify_timeout_sec, Some(0)) {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "orchestration.start_run",
+                        "runVerifyTimeoutSec must be at least 1 when provided".to_string(),
+                    ));
+                    continue;
+                }
+                if matches!(req.max_parallelism, Some(0)) {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "orchestration.start_run",
+                        "maxParallelism must be at least 1 when provided".to_string(),
+                    ));
+                    continue;
+                }
 
                 let run_id = next_run_id(req.run_id.as_deref());
                 {
@@ -2469,6 +2725,14 @@ pub async fn run(
                 let mut status =
                     RunStatus::new(run_id.clone(), req.objective.clone(), selected_tier);
                 status.lifecycle = RunLifecycle::Pending;
+                status.run_verify_command = req.run_verify_command.clone();
+                status.run_verify_timeout_sec = Some(
+                    req.run_verify_timeout_sec
+                        .unwrap_or(options.config.reliability_verify_timeout_sec_default()),
+                );
+                status.max_parallelism = req
+                    .max_parallelism
+                    .unwrap_or(RunStatus::DEFAULT_MAX_PARALLELISM);
                 status.task_ids = task_ids.clone();
 
                 let result = {
@@ -2482,8 +2746,7 @@ pub async fn run(
                     for contract in &req.tasks {
                         rel.reconcile_prerequisites(contract)?;
                     }
-                    rel.promote_recoverable_due();
-                    rel.evaluate_dag_unblock();
+                    rel.refresh_dependency_states();
                     refresh_run_from_reliability(&rel, &mut status);
                     Ok::<(), Error>(())
                 };
@@ -2496,12 +2759,6 @@ pub async fn run(
                     continue;
                 }
 
-                status.latest_run_verify_summary = Some(format!(
-                    "command={} timeout_sec={} max_parallelism={}",
-                    req.run_verify_command,
-                    req.run_verify_timeout_sec.unwrap_or(0),
-                    req.max_parallelism.unwrap_or(4)
-                ));
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
@@ -2545,43 +2802,37 @@ pub async fn run(
                     orchestration.get_run(&req.run_id)
                 };
 
-                match cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                    Some(run) => {
-                        let run = match refresh_run_if_live(
-                            &cx,
-                            &session,
-                            &reliability_state,
-                            &orchestration_state,
-                            &run_store,
-                            run,
-                        )
-                        .await
-                        {
-                            Ok(run) => run,
-                            Err(err) => {
-                                let _ = out_tx.send(response_error_with_hints(
-                                    id,
-                                    "orchestration.get_run",
-                                    &err,
-                                ));
-                                continue;
-                            }
-                        };
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "orchestration.get_run",
-                            Some(json!({ "run": run })),
-                        ));
-                    }
-                    None => {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.get_run",
-                            &err,
-                        ));
-                    }
+                if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
+                    let run = match refresh_run_if_live(
+                        &cx,
+                        &session,
+                        &reliability_state,
+                        &orchestration_state,
+                        &run_store,
+                        run,
+                    )
+                    .await
+                    {
+                        Ok(run) => run,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.get_run",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "orchestration.get_run",
+                        Some(json!({ "run": run })),
+                    ));
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ =
+                        out_tx.send(response_error_with_hints(id, "orchestration.get_run", &err));
                 }
             }
 
@@ -2605,9 +2856,10 @@ pub async fn run(
                     })?;
                     orchestration.get_run(&req.run_id)
                 };
-                let mut run = match cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                    Some(run) => run,
-                    None => {
+                let mut run =
+                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
+                        run
+                    } else {
                         let err =
                             Error::session(format!("orchestration run not found: {}", req.run_id));
                         let _ = out_tx.send(response_error_with_hints(
@@ -2616,8 +2868,7 @@ pub async fn run(
                             &err,
                         ));
                         continue;
-                    }
-                };
+                    };
                 run.lifecycle = RunLifecycle::Canceled;
                 run.latest_run_verify_summary = Some(
                     req.reason
@@ -2666,9 +2917,10 @@ pub async fn run(
                     })?;
                     orchestration.get_run(&req.run_id)
                 };
-                let mut run = match cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                    Some(run) => run,
-                    None => {
+                let mut run =
+                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
+                        run
+                    } else {
                         let err =
                             Error::session(format!("orchestration run not found: {}", req.run_id));
                         let _ = out_tx.send(response_error_with_hints(
@@ -2677,8 +2929,7 @@ pub async fn run(
                             &err,
                         ));
                         continue;
-                    }
-                };
+                    };
                 if matches!(
                     run.lifecycle,
                     RunLifecycle::Canceled | RunLifecycle::Blocked
@@ -6677,6 +6928,117 @@ mod tests {
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
             vec!["task-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_respects_max_parallelism_cap() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let mut task_ids = Vec::new();
+        for index in 0..5 {
+            let task_id = format!("task-cap-{index:02}");
+            let contract = reliability_contract(&task_id, Vec::new());
+            reliability
+                .get_or_create_task(&contract)
+                .expect("register capped task");
+            task_ids.push(task_id);
+        }
+
+        let mut run = RunStatus::new("run-cap", "Capped wave", ExecutionTier::Wave);
+        run.max_parallelism = 2;
+        run.task_ids = task_ids;
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Pending);
+        assert_eq!(run.max_parallelism, 2);
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-cap-00".to_string(), "task-cap-01".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_packs_hierarchical_subruns() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let mut task_ids = Vec::new();
+        for index in 0..13 {
+            let task_id = format!("task-{index:02}");
+            let contract = reliability_contract(&task_id, Vec::new());
+            reliability
+                .get_or_create_task(&contract)
+                .expect("register hierarchical task");
+            task_ids.push(task_id);
+        }
+
+        let mut run = RunStatus::new("run-hier", "Hierarchical", ExecutionTier::Hierarchical);
+        run.max_parallelism = 12;
+        run.task_ids = task_ids.clone();
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.active_subrun_id.as_deref(), Some("subrun-01"));
+        assert_eq!(run.max_parallelism, 12);
+        assert_eq!(run.planned_subruns.len(), 2);
+        assert_eq!(run.planned_subruns[0].task_ids.len(), 12);
+        assert_eq!(run.planned_subruns[1].task_ids.len(), 1);
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            (0..12)
+                .map(|index| format!("task-{index:02}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_hierarchical_scope_respects_dependency_order() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let mut task_ids = Vec::new();
+        let mut previous: Option<String> = None;
+        for index in 0..13 {
+            let task_id = format!("task-chain-{index:02}");
+            let prerequisites: Vec<_> = previous
+                .iter()
+                .map(|prior| TaskPrerequisite {
+                    task_id: prior.clone(),
+                    trigger: reliability::EdgeTrigger::OnSuccess,
+                })
+                .collect();
+            let contract = reliability_contract(&task_id, prerequisites);
+            reliability
+                .get_or_create_task(&contract)
+                .expect("register chain task");
+            reliability
+                .reconcile_prerequisites(&contract)
+                .expect("reconcile prerequisites");
+            previous = Some(task_id.clone());
+            task_ids.push(task_id);
+        }
+        reliability.refresh_dependency_states();
+
+        let mut run = RunStatus::new(
+            "run-hier-chain",
+            "Hierarchical chain",
+            ExecutionTier::Hierarchical,
+        );
+        run.task_ids = task_ids.clone();
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.planned_subruns.len(), 2);
+        assert_eq!(run.active_subrun_id.as_deref(), Some("subrun-01"));
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-chain-00".to_string()]
         );
     }
 

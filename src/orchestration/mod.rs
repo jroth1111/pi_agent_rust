@@ -15,4 +15,6 @@ pub use coordinator::{
     ConflictResolution, FileConflict, FlockCoordinator, MergeResult, MergeStrategy,
 };
 pub use flock::{FlockWorker, FlockWorkspace};
-pub use run::{ExecutionTier, RunLifecycle, RunStatus, RunStore, TaskReport, WaveStatus};
+pub use run::{
+    ExecutionTier, RunLifecycle, RunStatus, RunStore, SubrunPlan, TaskReport, WaveStatus,
+};
