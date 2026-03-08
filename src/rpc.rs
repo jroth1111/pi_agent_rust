@@ -1500,11 +1500,64 @@ fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) 
     }
 }
 
+fn planned_wave_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<String> {
+    let ready_task_ids = run
+        .task_ids
+        .iter()
+        .filter_map(|task_id| {
+            let task = reliability.tasks.get(task_id)?;
+            if matches!(task.runtime.state, reliability::RuntimeState::Ready) {
+                Some(task_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut scheduled = Vec::new();
+    let mut touched_paths = HashSet::new();
+    let max_tasks = match run.selected_tier {
+        ExecutionTier::Inline => 1,
+        ExecutionTier::Wave | ExecutionTier::Hierarchical => usize::MAX,
+    };
+
+    for task_id in ready_task_ids {
+        if scheduled.len() >= max_tasks {
+            break;
+        }
+        let Some(task) = reliability.tasks.get(&task_id) else {
+            continue;
+        };
+        if task.spec.planned_touches.is_empty() {
+            if scheduled.is_empty() {
+                scheduled.push(task_id);
+            }
+            break;
+        }
+
+        let conflicts = task
+            .spec
+            .planned_touches
+            .iter()
+            .any(|path| touched_paths.contains(path));
+        if conflicts {
+            continue;
+        }
+
+        for path in &task.spec.planned_touches {
+            touched_paths.insert(path.clone());
+        }
+        scheduled.push(task_id);
+    }
+
+    scheduled
+}
+
 fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
     let preserve_canceled = matches!(run.lifecycle, RunLifecycle::Canceled);
     run.task_counts = reliability.task_counts_for(&run.task_ids);
 
-    let active_task_ids = run
+    let mut active_task_ids = run
         .task_ids
         .iter()
         .filter_map(|task_id| {
@@ -1516,6 +1569,9 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
             }
         })
         .collect::<Vec<_>>();
+    if active_task_ids.is_empty() {
+        active_task_ids = planned_wave_task_ids(reliability, run);
+    }
     run.active_wave = next_active_wave(run.active_wave.take(), active_task_ids);
 
     if !preserve_canceled {
@@ -6552,6 +6608,69 @@ mod tests {
         assert_eq!(run.lifecycle, RunLifecycle::Running);
         assert_eq!(run.task_counts.get("leased"), Some(&1));
         assert_eq!(run.task_counts.get("ready"), Some(&1));
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_plans_disjoint_ready_wave() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_a = reliability_contract("task-a", Vec::new());
+        let contract_b = reliability_contract("task-b", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+
+        let mut run = RunStatus::new("run-ready", "Ready wave", ExecutionTier::Wave);
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Pending);
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_serializes_when_task_lacks_planned_touches() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_a = reliability_contract("task-a", Vec::new());
+        let contract_b = reliability_contract("task-b", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+        reliability
+            .tasks
+            .get_mut("task-a")
+            .expect("task-a")
+            .spec
+            .planned_touches
+            .clear();
+
+        let mut run = RunStatus::new("run-serialized", "Serialized wave", ExecutionTier::Wave);
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Pending);
         assert_eq!(
             run.active_wave
                 .as_ref()
