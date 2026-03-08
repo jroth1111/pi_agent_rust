@@ -197,6 +197,8 @@ fn setup_inline_repo(prefix: &str) -> (tempfile::TempDir, PathBuf, String) {
         "[package]\nname = \"inline-fixture\"\n",
     )
     .expect("write fixture file");
+    std::fs::write(repo_path.join("task-a.txt"), "a\n").expect("write task-a fixture");
+    std::fs::write(repo_path.join("task-b.txt"), "b\n").expect("write task-b fixture");
     run_git(&repo_path, &["add", "."]);
     run_git(&repo_path, &["commit", "-m", "initial"]);
     let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
@@ -595,15 +597,16 @@ fn rpc_get_available_models_populated() {
 #[test]
 fn rpc_orchestration_start_dispatch_and_get_run() {
     let harness = TestHarness::new("rpc_orchestration_start_dispatch_and_get_run");
-    let cassette_dir = cassette_root();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("build test runtime");
     let handle = runtime.handle();
     let run_id = format!("run-e2e-dispatch-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-wave");
 
     runtime.block_on(async move {
-        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let _repo_guard = repo_guard;
+        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
@@ -620,18 +623,18 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
                 {
                     "taskId": "task-e2e-a",
                     "objective": "Complete task A",
-                    "verifyCommand": "cargo test",
-                    "inputSnapshot": "snapshot-a",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
                     "acceptanceIds": ["ac-a"],
-                    "plannedTouches": ["src/task_e2e_a.rs"]
+                    "plannedTouches": ["task-a.txt"]
                 },
                 {
                     "taskId": "task-e2e-b",
                     "objective": "Complete task B",
-                    "verifyCommand": "cargo test",
-                    "inputSnapshot": "snapshot-b",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
                     "acceptanceIds": ["ac-b"],
-                    "plannedTouches": ["src/task_e2e_b.rs"]
+                    "plannedTouches": ["task-b.txt"]
                 }
             ],
             "runVerifyCommand": "true",
@@ -657,8 +660,11 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
         let grants = dispatch["data"]["grants"]
             .as_array()
             .expect("dispatch grants");
-        assert_eq!(grants.len(), 2);
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "running");
+        assert!(
+            grants.is_empty(),
+            "automated wave dispatch should not return live leases"
+        );
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
 
         let get_cmd = json!({
             "id": "3",
@@ -669,7 +675,7 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
         assert_eq!(get["data"]["run"]["runId"], run_id);
-        assert_eq!(get["data"]["run"]["taskCounts"]["leased"], 2);
+        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 2);
 
         drop(in_tx);
         let result = server.await;

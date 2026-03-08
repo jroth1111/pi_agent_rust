@@ -3900,7 +3900,7 @@ pub async fn run(
                     ));
                     continue;
                 }
-                if run.selected_tier == ExecutionTier::Inline && !grants.is_empty() {
+                if !grants.is_empty() {
                     match execute_inline_run_dispatch(
                         &cx,
                         &session,
