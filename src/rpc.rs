@@ -1342,6 +1342,67 @@ async fn persist_run_status(
     Ok(())
 }
 
+async fn append_dispatch_grants_session_entries(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    grants: &[DispatchGrant],
+) -> Result<()> {
+    if grants.is_empty() {
+        return Ok(());
+    }
+
+    let tasks = {
+        let reliability = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        grants
+            .iter()
+            .filter_map(|grant| {
+                reliability
+                    .tasks
+                    .get(&grant.task_id)
+                    .map(|task| (grant.clone(), task.spec.objective.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        for (grant, objective) in tasks {
+            inner_session.append_task_created_entry(
+                grant.task_id.clone(),
+                objective,
+                Some(grant.agent_id.clone()),
+            );
+            inner_session.append_task_transition_entry(
+                grant.task_id,
+                None,
+                grant.state,
+                Some(json!({
+                    "leaseId": grant.lease_id,
+                    "fenceToken": grant.fence_token,
+                })),
+            );
+        }
+    }
+    guard.persist_session().await?;
+    Ok(())
+}
+
 fn ensure_run_id_available(
     orchestration: &RpcOrchestrationState,
     run_store: &RunStore,
@@ -3202,6 +3263,21 @@ pub async fn run(
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
                     orchestration.update_run(run.clone());
+                }
+                if let Err(err) = append_dispatch_grants_session_entries(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &grants,
+                )
+                .await
+                {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.dispatch_run",
+                        &err,
+                    ));
+                    continue;
                 }
                 if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(
