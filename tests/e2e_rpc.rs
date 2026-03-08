@@ -637,7 +637,7 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
                     "plannedTouches": ["task-b.txt"]
                 }
             ],
-            "runVerifyCommand": "true",
+            "runVerifyCommand": "test -f task-a.txt && test -f task-b.txt",
             "runVerifyTimeoutSec": 30,
             "maxParallelism": 2
         })

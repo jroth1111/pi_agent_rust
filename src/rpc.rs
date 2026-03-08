@@ -2657,25 +2657,13 @@ async fn execute_inline_run_dispatch(
         return Ok(run);
     }
 
-    let (provider, repo_root) = {
+    let repo_root = session_workspace_root(cx, session).await?;
+    let provider = {
         let guard = session
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        let repo_root = {
-            let inner = guard
-                .session
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-            let cwd = inner.header.cwd.trim();
-            if cwd.is_empty() {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            } else {
-                PathBuf::from(cwd)
-            }
-        };
-        (guard.agent.provider(), repo_root)
+        guard.agent.provider()
     };
     let worker = RpcSessionInlineWorker::new(provider, config.clone());
     let mut updated_run = run;
@@ -2694,6 +2682,27 @@ async fn execute_inline_run_dispatch(
         .await?;
     }
     Ok(updated_run)
+}
+
+async fn session_workspace_root(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+) -> Result<PathBuf> {
+    let guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let inner = guard
+        .session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    let cwd = inner.header.cwd.trim();
+    Ok(if cwd.is_empty() {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        PathBuf::from(cwd)
+    })
 }
 
 fn build_submit_task_report(
@@ -2932,7 +2941,7 @@ async fn sync_task_runs(
         )
     };
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = session_workspace_root(cx, session).await?;
     let mut updated_runs = Vec::with_capacity(refreshed_runs.len());
     for (mut run, verify_scope) in refreshed_runs {
         if let Some(scope) = verify_scope {
@@ -4041,7 +4050,7 @@ pub async fn run(
                 }
                 if let Some(status) = run.latest_run_verify.as_ref().filter(|status| !status.ok) {
                     let scope = completed_scope_from_run_verify(status);
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let cwd = session_workspace_root(&cx, &session).await?;
                     execute_run_verification(&cwd, &mut run, &scope).await;
                 }
                 {
