@@ -9784,6 +9784,100 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_completed_run_verify_scope_waits_for_full_hierarchical_completion() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
+        let mut task_ids = Vec::new();
+        let mut previous: Option<String> = None;
+        for index in 0..13 {
+            let task_id = format!("task-hier-chain-{index:02}");
+            let prerequisites: Vec<_> = previous
+                .iter()
+                .map(|prior| TaskPrerequisite {
+                    task_id: prior.clone(),
+                    trigger: reliability::EdgeTrigger::OnSuccess,
+                })
+                .collect();
+            let contract = reliability_contract(&task_id, prerequisites);
+            reliability
+                .get_or_create_task(&contract)
+                .expect("register hierarchical chain task");
+            reliability
+                .reconcile_prerequisites(&contract)
+                .expect("reconcile hierarchical prerequisites");
+            previous = Some(task_id.clone());
+            task_ids.push(task_id);
+        }
+
+        for task_id in task_ids.iter().take(12) {
+            let contract = reliability_contract(task_id, Vec::new());
+            let grant = reliability
+                .request_dispatch_existing(task_id, "agent-a", 60)
+                .expect("dispatch task");
+            let evidence = reliability
+                .append_evidence(AppendEvidenceRequest {
+                    task_id: task_id.clone(),
+                    command: "cargo test".to_string(),
+                    exit_code: 0,
+                    stdout: "ok".to_string(),
+                    stderr: String::new(),
+                    artifact_ids: Vec::new(),
+                    env_id: None,
+                })
+                .expect("append evidence");
+            reliability
+                .submit_task(SubmitTaskRequest {
+                    task_id: task_id.clone(),
+                    lease_id: grant.lease_id,
+                    fence_token: grant.fence_token,
+                    patch_digest: format!("sha256:{task_id}"),
+                    verify_run_id: format!("vr-{task_id}"),
+                    verify_passed: Some(true),
+                    verify_timed_out: false,
+                    failure_class: None,
+                    changed_files: vec![format!("src/{task_id}.rs")],
+                    symbol_drift_violations: Vec::new(),
+                    close: Some(ClosePayload {
+                        task_id: task_id.clone(),
+                        outcome: format!("Completed {task_id}"),
+                        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+                        acceptance_ids: contract.acceptance_ids.clone(),
+                        evidence_ids: vec![evidence.evidence_id],
+                        trace_parent: contract.parent_goal_trace_id.clone(),
+                    }),
+                })
+                .expect("submit success");
+        }
+        reliability.refresh_dependency_states();
+
+        let mut run = RunStatus::new(
+            "run-hier-intermediate",
+            "Run verify waits for terminal hierarchical run",
+            ExecutionTier::Hierarchical,
+        );
+        run.run_verify_command = "true".to_string();
+        run.run_verify_timeout_sec = Some(30);
+        run.task_ids = task_ids.clone();
+        refresh_run_from_reliability(&reliability, &mut run);
+        assert_eq!(run.planned_subruns.len(), 2);
+
+        let first_subrun = run.planned_subruns.first().cloned().expect("first subrun");
+        assert_eq!(first_subrun.task_ids.len(), 12);
+        run.active_subrun_id = Some(first_subrun.subrun_id.clone());
+        run.active_wave = Some(WaveStatus {
+            wave_id: "wave-hier-1".to_string(),
+            task_ids: first_subrun.task_ids.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+        });
+
+        assert!(
+            completed_run_verify_scope(&reliability, &run).is_none(),
+            "hierarchical run verify should wait until all run tasks succeed"
+        );
+    }
+
+    #[test]
     fn orchestration_refresh_run_preserves_failed_run_verification_state() {
         let mut reliability =
             reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
