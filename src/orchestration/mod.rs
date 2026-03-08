@@ -16,5 +16,6 @@ pub use coordinator::{
 };
 pub use flock::{FlockWorker, FlockWorkspace};
 pub use run::{
-    ExecutionTier, RunLifecycle, RunStatus, RunStore, SubrunPlan, TaskReport, WaveStatus,
+    ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind, RunVerifyStatus,
+    SubrunPlan, TaskReport, WaveStatus,
 };

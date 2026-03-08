@@ -80,6 +80,29 @@ pub struct WaveStatus {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunVerifyScopeKind {
+    Wave,
+    Subrun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunVerifyStatus {
+    pub scope_id: String,
+    pub scope_kind: RunVerifyScopeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subrun_id: Option<String>,
+    pub command: String,
+    pub timeout_sec: u32,
+    pub exit_code: i32,
+    pub ok: bool,
+    pub summary: String,
+    pub duration_ms: u64,
+    pub generated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubrunPlan {
@@ -114,7 +137,7 @@ pub struct RunStatus {
     #[serde(default)]
     pub task_reports: BTreeMap<String, TaskReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_run_verify_summary: Option<String>,
+    pub latest_run_verify: Option<RunVerifyStatus>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -146,7 +169,7 @@ impl RunStatus {
             planned_subruns: Vec::new(),
             task_counts: BTreeMap::new(),
             task_reports: BTreeMap::new(),
-            latest_run_verify_summary: None,
+            latest_run_verify: None,
             created_at: now,
             updated_at: now,
         }
@@ -262,7 +285,18 @@ mod tests {
         run.run_verify_command = "cargo test --lib".to_string();
         run.run_verify_timeout_sec = Some(90);
         run.max_parallelism = 2;
-        run.latest_run_verify_summary = Some("ok".to_string());
+        run.latest_run_verify = Some(RunVerifyStatus {
+            scope_id: "wave-1".to_string(),
+            scope_kind: RunVerifyScopeKind::Wave,
+            subrun_id: None,
+            command: "cargo test --lib".to_string(),
+            timeout_sec: 90,
+            exit_code: 0,
+            ok: true,
+            summary: "ok".to_string(),
+            duration_ms: 10,
+            generated_at: Utc::now(),
+        });
 
         store.save(&run).expect("save");
         let loaded = store.load("run-2").expect("load");
@@ -272,7 +306,13 @@ mod tests {
         assert_eq!(loaded.run_verify_command, "cargo test --lib");
         assert_eq!(loaded.run_verify_timeout_sec, Some(90));
         assert_eq!(loaded.max_parallelism, 2);
-        assert_eq!(loaded.latest_run_verify_summary.as_deref(), Some("ok"));
+        assert_eq!(
+            loaded
+                .latest_run_verify
+                .as_ref()
+                .map(|status| status.summary.as_str()),
+            Some("ok")
+        );
     }
 
     #[test]

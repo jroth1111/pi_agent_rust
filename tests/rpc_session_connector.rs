@@ -9,6 +9,7 @@
 //! command returns spec-compliant responses.
 
 #![allow(clippy::similar_names)]
+#![allow(clippy::large_futures)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::type_complexity)]
 

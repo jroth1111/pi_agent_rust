@@ -1,4 +1,5 @@
 #![allow(clippy::similar_names)]
+#![allow(clippy::large_futures)]
 #![allow(clippy::unnecessary_literal_bound)]
 #![allow(clippy::too_many_lines)]
 

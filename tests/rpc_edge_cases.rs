@@ -7,6 +7,7 @@
 //! ```
 
 #![allow(clippy::similar_names)]
+#![allow(clippy::large_futures)]
 #![allow(clippy::too_many_lines)]
 
 mod common;

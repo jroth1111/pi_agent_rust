@@ -26,12 +26,14 @@ use crate::model::{
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, RunLifecycle, RunStatus, RunStore, SubrunPlan, TaskReport, WaveStatus,
+    ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind, RunVerifyStatus,
+    SubrunPlan, TaskReport, WaveStatus,
 };
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
 use crate::reliability::ArtifactStore;
+use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -45,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -1464,6 +1466,97 @@ fn task_report_blockers(state: &reliability::RuntimeState) -> Vec<String> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletedRunVerifyScope {
+    scope_id: String,
+    scope_kind: RunVerifyScopeKind,
+    subrun_id: Option<String>,
+}
+
+fn task_terminal_success(reliability: &RpcReliabilityState, task_id: &str) -> bool {
+    reliability.tasks.get(task_id).is_some_and(|task| {
+        matches!(
+            task.runtime.state,
+            reliability::RuntimeState::Terminal(
+                reliability::TerminalState::Succeeded { .. }
+                    | reliability::TerminalState::Superseded { .. }
+            )
+        )
+    })
+}
+
+fn completed_run_verify_scope(
+    reliability: &RpcReliabilityState,
+    run: &RunStatus,
+) -> Option<CompletedRunVerifyScope> {
+    if run.run_verify_command.trim().is_empty() {
+        return None;
+    }
+
+    if run.selected_tier == ExecutionTier::Hierarchical {
+        let subrun_id = run.active_subrun_id.clone()?;
+        let subrun = run
+            .planned_subruns
+            .iter()
+            .find(|subrun| subrun.subrun_id == subrun_id)?;
+        if subrun.task_ids.is_empty()
+            || !subrun
+                .task_ids
+                .iter()
+                .all(|task_id| task_terminal_success(reliability, task_id))
+        {
+            return None;
+        }
+        return Some(CompletedRunVerifyScope {
+            scope_id: subrun.subrun_id.clone(),
+            scope_kind: RunVerifyScopeKind::Subrun,
+            subrun_id: Some(subrun.subrun_id.clone()),
+        });
+    }
+
+    let wave = run.active_wave.as_ref()?;
+    if wave.task_ids.is_empty()
+        || !wave
+            .task_ids
+            .iter()
+            .all(|task_id| task_terminal_success(reliability, task_id))
+    {
+        return None;
+    }
+    Some(CompletedRunVerifyScope {
+        scope_id: wave.wave_id.clone(),
+        scope_kind: RunVerifyScopeKind::Wave,
+        subrun_id: run.active_subrun_id.clone(),
+    })
+}
+
+fn should_skip_run_verify(run: &RunStatus, scope: &CompletedRunVerifyScope) -> bool {
+    run.latest_run_verify.as_ref().is_some_and(|status| {
+        status.scope_id == scope.scope_id
+            && status.scope_kind == scope.scope_kind
+            && status.subrun_id == scope.subrun_id
+    })
+}
+
+fn completed_scope_from_run_verify(status: &RunVerifyStatus) -> CompletedRunVerifyScope {
+    CompletedRunVerifyScope {
+        scope_id: status.scope_id.clone(),
+        scope_kind: status.scope_kind,
+        subrun_id: status.subrun_id.clone(),
+    }
+}
+
+fn apply_run_verify_lifecycle(run: &mut RunStatus) {
+    if !matches!(run.lifecycle, RunLifecycle::Canceled)
+        && run
+            .latest_run_verify
+            .as_ref()
+            .is_some_and(|status| !status.ok)
+    {
+        run.lifecycle = RunLifecycle::Failed;
+    }
+}
+
 fn next_active_wave(
     existing: Option<WaveStatus>,
     mut active_task_ids: Vec<String>,
@@ -1858,6 +1951,7 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
     if !preserve_canceled {
         run.lifecycle = derive_run_lifecycle(reliability, &run.task_ids);
     }
+    apply_run_verify_lifecycle(run);
     run.touch();
 }
 
@@ -2021,12 +2115,12 @@ fn build_runtime_task_report(
     })
 }
 
-fn refresh_task_runs(
+fn refresh_task_runs_with_verify_scopes(
     reliability: &RpcReliabilityState,
     orchestration: &mut RpcOrchestrationState,
     task_id: &str,
-    report: Option<TaskReport>,
-) -> Vec<RunStatus> {
+    report: Option<&TaskReport>,
+) -> Vec<(RunStatus, Option<CompletedRunVerifyScope>)> {
     let run_ids = orchestration.run_ids_for_task(task_id);
     let mut updated_runs = Vec::new();
 
@@ -2034,18 +2128,100 @@ fn refresh_task_runs(
         let Some(mut run) = orchestration.get_run(&run_id) else {
             continue;
         };
-        if let Some(report) = report
-            .as_ref()
-            .filter(|report| run.task_ids.contains(&report.task_id))
-        {
+        if let Some(report) = report.filter(|report| run.task_ids.contains(&report.task_id)) {
             run.upsert_task_report(report.clone());
         }
+        let verify_scope = completed_run_verify_scope(reliability, &run)
+            .filter(|scope| !should_skip_run_verify(&run, scope));
         refresh_run_from_reliability(reliability, &mut run);
         orchestration.update_run(run.clone());
-        updated_runs.push(run);
+        updated_runs.push((run, verify_scope));
     }
 
     updated_runs
+}
+
+fn refresh_task_runs(
+    reliability: &RpcReliabilityState,
+    orchestration: &mut RpcOrchestrationState,
+    task_id: &str,
+    report: Option<TaskReport>,
+) -> Vec<RunStatus> {
+    refresh_task_runs_with_verify_scopes(reliability, orchestration, task_id, report.as_ref())
+        .into_iter()
+        .map(|(run, _)| run)
+        .collect()
+}
+
+fn run_verify_scope_summary(
+    scope: &CompletedRunVerifyScope,
+    ok: bool,
+    details: impl AsRef<str>,
+) -> String {
+    let scope_label = match scope.scope_kind {
+        RunVerifyScopeKind::Wave => "wave",
+        RunVerifyScopeKind::Subrun => "subrun",
+    };
+    let prefix = if ok {
+        "run verification passed"
+    } else {
+        "run verification failed"
+    };
+    format!(
+        "{prefix} for {scope_label} {}: {}",
+        scope.scope_id,
+        details.as_ref().trim()
+    )
+}
+
+async fn execute_run_verification(
+    cwd: &Path,
+    run: &mut RunStatus,
+    scope: &CompletedRunVerifyScope,
+) {
+    let timeout_sec = run.run_verify_timeout_sec.unwrap_or(60);
+    let verify_status =
+        match Verifier::execute_verify_command(cwd, &run.run_verify_command, timeout_sec).await {
+            Ok(execution) => {
+                let outcome = Verifier::classify_execution(&execution);
+                let details = if outcome.ok {
+                    format!(
+                        "exit_code={}, duration_ms={}",
+                        execution.exit_code, execution.duration_ms
+                    )
+                } else {
+                    outcome.violations.join("; ")
+                };
+                RunVerifyStatus {
+                    scope_id: scope.scope_id.clone(),
+                    scope_kind: scope.scope_kind,
+                    subrun_id: scope.subrun_id.clone(),
+                    command: execution.command,
+                    timeout_sec: execution.timeout_sec,
+                    exit_code: execution.exit_code,
+                    ok: outcome.ok,
+                    summary: run_verify_scope_summary(scope, outcome.ok, details),
+                    duration_ms: execution.duration_ms,
+                    generated_at: chrono::Utc::now(),
+                }
+            }
+            Err(err) => RunVerifyStatus {
+                scope_id: scope.scope_id.clone(),
+                scope_kind: scope.scope_kind,
+                subrun_id: scope.subrun_id.clone(),
+                command: run.run_verify_command.clone(),
+                timeout_sec,
+                exit_code: -1,
+                ok: false,
+                summary: run_verify_scope_summary(scope, false, err.to_string()),
+                duration_ms: 0,
+                generated_at: chrono::Utc::now(),
+            },
+        };
+
+    run.latest_run_verify = Some(verify_status);
+    apply_run_verify_lifecycle(run);
+    run.touch();
 }
 
 async fn sync_task_runs(
@@ -2057,7 +2233,7 @@ async fn sync_task_runs(
     task_id: &str,
     report: Option<TaskReport>,
 ) -> Result<Vec<RunStatus>> {
-    let updated_runs = {
+    let refreshed_runs = {
         let reliability = reliability_state
             .lock(cx)
             .await
@@ -2066,11 +2242,27 @@ async fn sync_task_runs(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        refresh_task_runs(&reliability, &mut orchestration, task_id, report)
+        refresh_task_runs_with_verify_scopes(
+            &reliability,
+            &mut orchestration,
+            task_id,
+            report.as_ref(),
+        )
     };
 
-    for run in &updated_runs {
-        persist_run_status(cx, session, run_store, run).await?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut updated_runs = Vec::with_capacity(refreshed_runs.len());
+    for (mut run, verify_scope) in refreshed_runs {
+        if let Some(scope) = verify_scope {
+            execute_run_verification(&cwd, &mut run, &scope).await;
+            let mut orchestration = orchestration_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+            orchestration.update_run(run.clone());
+        }
+        persist_run_status(cx, session, run_store, &run).await?;
+        updated_runs.push(run);
     }
     Ok(updated_runs)
 }
@@ -2293,7 +2485,7 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
         }
     });
 
-    run(session, options, in_rx, out_tx).await
+    Box::pin(run(session, options, in_rx, out_tx)).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3061,10 +3253,6 @@ pub async fn run(
                         continue;
                     };
                 run.lifecycle = RunLifecycle::Canceled;
-                run.latest_run_verify_summary = Some(
-                    req.reason
-                        .unwrap_or_else(|| "cancelled via orchestration.cancel_run".to_string()),
-                );
                 run.touch();
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
@@ -3123,9 +3311,14 @@ pub async fn run(
                     };
                 if matches!(
                     run.lifecycle,
-                    RunLifecycle::Canceled | RunLifecycle::Blocked
+                    RunLifecycle::Canceled | RunLifecycle::Blocked | RunLifecycle::Failed
                 ) {
                     run.lifecycle = RunLifecycle::Pending;
+                }
+                if let Some(status) = run.latest_run_verify.as_ref().filter(|status| !status.ok) {
+                    let scope = completed_scope_from_run_verify(status);
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    execute_run_verification(&cwd, &mut run, &scope).await;
                 }
                 {
                     let rel = reliability_state
@@ -7434,6 +7627,203 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("Need approval"))
         );
+    }
+
+    #[test]
+    fn orchestration_completed_run_verify_scope_detects_wave_completion() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
+        let contract_a = reliability_contract("task-wave-a", Vec::new());
+        let contract_b = reliability_contract("task-wave-b", Vec::new());
+
+        let grant_a = reliability
+            .request_dispatch(&contract_a, "agent-a", 60)
+            .expect("dispatch task a");
+        let grant_b = reliability
+            .request_dispatch(&contract_b, "agent-b", 60)
+            .expect("dispatch task b");
+
+        for (contract, grant, verify_run_id) in [
+            (&contract_a, grant_a, "vr-wave-a"),
+            (&contract_b, grant_b, "vr-wave-b"),
+        ] {
+            let evidence = reliability
+                .append_evidence(AppendEvidenceRequest {
+                    task_id: contract.task_id.clone(),
+                    command: "cargo test".to_string(),
+                    exit_code: 0,
+                    stdout: "ok".to_string(),
+                    stderr: String::new(),
+                    artifact_ids: Vec::new(),
+                    env_id: None,
+                })
+                .expect("append evidence");
+            reliability
+                .submit_task(SubmitTaskRequest {
+                    task_id: contract.task_id.clone(),
+                    lease_id: grant.lease_id,
+                    fence_token: grant.fence_token,
+                    patch_digest: format!("sha256:{}", contract.task_id),
+                    verify_run_id: verify_run_id.to_string(),
+                    verify_passed: Some(true),
+                    verify_timed_out: false,
+                    failure_class: None,
+                    changed_files: vec![format!("src/{}.rs", contract.task_id)],
+                    symbol_drift_violations: Vec::new(),
+                    close: Some(ClosePayload {
+                        task_id: contract.task_id.clone(),
+                        outcome: format!("Completed {}", contract.task_id),
+                        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+                        acceptance_ids: contract.acceptance_ids.clone(),
+                        evidence_ids: vec![evidence.evidence_id],
+                        trace_parent: contract.parent_goal_trace_id.clone(),
+                    }),
+                })
+                .expect("submit success");
+        }
+
+        let mut run = RunStatus::new("run-wave-verify", "Run verify", ExecutionTier::Wave);
+        run.run_verify_command = "true".to_string();
+        run.run_verify_timeout_sec = Some(30);
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        run.active_wave = Some(WaveStatus {
+            wave_id: "wave-1".to_string(),
+            task_ids: run.task_ids.clone(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+        });
+
+        let scope = completed_run_verify_scope(&reliability, &run).expect("completed wave scope");
+        assert_eq!(scope.scope_id, "wave-1");
+        assert_eq!(scope.scope_kind, RunVerifyScopeKind::Wave);
+        assert_eq!(scope.subrun_id, None);
+    }
+
+    #[test]
+    fn orchestration_refresh_run_preserves_failed_run_verification_state() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
+        let contract = reliability_contract("task-run-verify-fail", Vec::new());
+        let grant = reliability
+            .request_dispatch(&contract, "agent-1", 60)
+            .expect("dispatch");
+        let evidence = reliability
+            .append_evidence(AppendEvidenceRequest {
+                task_id: contract.task_id.clone(),
+                command: "cargo test".to_string(),
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                artifact_ids: Vec::new(),
+                env_id: None,
+            })
+            .expect("append evidence");
+        reliability
+            .submit_task(SubmitTaskRequest {
+                task_id: contract.task_id.clone(),
+                lease_id: grant.lease_id,
+                fence_token: grant.fence_token,
+                patch_digest: "sha256:run-verify-fail".to_string(),
+                verify_run_id: "vr-run-verify-fail".to_string(),
+                verify_passed: Some(true),
+                verify_timed_out: false,
+                failure_class: None,
+                changed_files: vec!["src/rpc.rs".to_string()],
+                symbol_drift_violations: Vec::new(),
+                close: Some(ClosePayload {
+                    task_id: contract.task_id.clone(),
+                    outcome: "Completed run verify failure fixture".to_string(),
+                    outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+                    acceptance_ids: contract.acceptance_ids.clone(),
+                    evidence_ids: vec![evidence.evidence_id],
+                    trace_parent: contract.parent_goal_trace_id.clone(),
+                }),
+            })
+            .expect("submit success");
+
+        let mut run = RunStatus::new(
+            "run-verify-fail-state",
+            "Run verify failed",
+            ExecutionTier::Inline,
+        );
+        run.task_ids = vec![contract.task_id.clone()];
+        run.latest_run_verify = Some(RunVerifyStatus {
+            scope_id: "wave-1".to_string(),
+            scope_kind: RunVerifyScopeKind::Wave,
+            subrun_id: None,
+            command: "false".to_string(),
+            timeout_sec: 30,
+            exit_code: 1,
+            ok: false,
+            summary: "run verification failed".to_string(),
+            duration_ms: 5,
+            generated_at: chrono::Utc::now(),
+        });
+
+        refresh_run_from_reliability(&reliability, &mut run);
+        assert_eq!(run.lifecycle, RunLifecycle::Failed);
+    }
+
+    #[test]
+    fn orchestration_execute_run_verification_records_success() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let mut run = RunStatus::new(
+                "run-verify-success",
+                "Run verify success",
+                ExecutionTier::Wave,
+            );
+            run.run_verify_command = "true".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            let scope = CompletedRunVerifyScope {
+                scope_id: "wave-1".to_string(),
+                scope_kind: RunVerifyScopeKind::Wave,
+                subrun_id: None,
+            };
+
+            execute_run_verification(temp_dir.path(), &mut run, &scope).await;
+
+            let verify = run.latest_run_verify.as_ref().expect("verification result");
+            assert!(verify.ok);
+            assert_eq!(verify.scope_id, "wave-1");
+            assert_eq!(run.lifecycle, RunLifecycle::Pending);
+        });
+    }
+
+    #[test]
+    fn orchestration_execute_run_verification_records_failure() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let mut run = RunStatus::new(
+                "run-verify-failure",
+                "Run verify failure",
+                ExecutionTier::Wave,
+            );
+            run.run_verify_command = "false".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            let scope = CompletedRunVerifyScope {
+                scope_id: "wave-1".to_string(),
+                scope_kind: RunVerifyScopeKind::Wave,
+                subrun_id: None,
+            };
+
+            execute_run_verification(temp_dir.path(), &mut run, &scope).await;
+
+            let verify = run.latest_run_verify.as_ref().expect("verification result");
+            assert!(!verify.ok);
+            assert_eq!(verify.scope_id, "wave-1");
+            assert_eq!(run.lifecycle, RunLifecycle::Failed);
+        });
     }
 
     #[test]
