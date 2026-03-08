@@ -796,12 +796,33 @@ impl PiApp {
     /// Rebuild the conversation viewport after a height change (terminal resize or
     /// input area growth). Preserves mouse-wheel settings and scroll position.
     fn resize_conversation_viewport(&mut self) {
+        let follow_tail = self.follow_stream_tail;
+        let dist_from_bottom = if follow_tail {
+            None
+        } else {
+            let current_content_height = self.conversation_viewport.total_line_count();
+            let current_y_offset = self.conversation_viewport.y_offset();
+            Some(current_content_height.saturating_sub(current_y_offset))
+        };
         let viewport_height = self.conversation_viewport_height();
         let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
         viewport.mouse_wheel_enabled = true;
         viewport.mouse_wheel_delta = 3;
+
+        let content = self.build_conversation_content();
+        let trimmed = content.trim_end();
+        let effective = self.view_effective_conversation_height().max(1);
+        viewport.height = effective;
+        viewport.set_content(trimmed);
+
+        if follow_tail {
+            viewport.goto_bottom();
+        } else if let Some(dist) = dist_from_bottom {
+            let new_content_height = trimmed.lines().count();
+            viewport.set_y_offset(new_content_height.saturating_sub(dist));
+        }
+
         self.conversation_viewport = viewport;
-        self.scroll_to_bottom();
     }
 
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {

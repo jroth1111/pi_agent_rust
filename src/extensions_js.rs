@@ -64,47 +64,16 @@ use uuid::Uuid;
 // ============================================================================
 
 use crate::extensions::{
-    ExecMediationResult, ExtensionPolicy, ExtensionPolicyMode, SecretBrokerPolicy,
+    ExecMediationResult, ExtensionPolicy, PolicyDecision, SecretBrokerPolicy,
     evaluate_exec_mediation,
 };
 
 /// Helper to check `exec` capability for sync execution where we cannot prompt.
 fn check_exec_capability(policy: &ExtensionPolicy, extension_id: Option<&str>) -> bool {
-    let cap = "exec";
-
-    // 1. Per-extension overrides
-    if let Some(id) = extension_id {
-        if let Some(override_config) = policy.per_extension.get(id) {
-            if override_config.deny.iter().any(|c| c == cap) {
-                return false;
-            }
-            if override_config.allow.iter().any(|c| c == cap) {
-                return true;
-            }
-            if let Some(mode) = override_config.mode {
-                return match mode {
-                    ExtensionPolicyMode::Permissive => true,
-                    ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-                };
-            }
-        }
-    }
-
-    // 2. Global deny
-    if policy.deny_caps.iter().any(|c| c == cap) {
-        return false;
-    }
-
-    // 3. Global allow (default_caps)
-    if policy.default_caps.iter().any(|c| c == cap) {
-        return true;
-    }
-
-    // 4. Mode fallback
-    match policy.mode {
-        ExtensionPolicyMode::Permissive => true,
-        ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-    }
+    matches!(
+        policy.evaluate_for("exec", extension_id).decision,
+        PolicyDecision::Allow
+    )
 }
 
 /// Determine whether an environment variable is safe to expose to extensions.
@@ -13549,6 +13518,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
+        #[cfg(target_os = "linux")]
         let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
@@ -14012,7 +13982,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         let policy_for_env = policy.clone();
-                        move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
+                        move |ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
                             // Compat fallback runs BEFORE deny_env so conformance
                             // scanning can inject deterministic dummy keys even when
                             // the policy denies env access (ext-conformance feature
@@ -14025,10 +13995,27 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 );
                                 return Ok(Some(value));
                             }
-                            if deny_env {
+
+                            let extension_id: Option<String> = ctx
+                                .globals()
+                                .get::<_, Option<String>>("__pi_current_extension_id")
+                                .ok()
+                                .flatten()
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+
+                            let env_cap_allowed = policy_for_env.as_ref().map_or(!deny_env, |policy| {
+                                matches!(
+                                    policy.evaluate_for("env", extension_id.as_deref()).decision,
+                                    PolicyDecision::Allow
+                                )
+                            });
+
+                            if !env_cap_allowed {
                                 tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
                                 return Ok(None);
                             }
+
                             // Use the configured policy to check if the key is a secret.
                             // This respects the disclosure_allowlist in config.json.
                             let allowed = policy_for_env
@@ -14176,6 +14163,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let configured_repair_mode = repair_mode;
+                        #[cfg(target_os = "linux")]
                         let repair_events = Arc::clone(&repair_events);
                         move |path: String| -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
@@ -20100,6 +20088,56 @@ export default ConfigLoader;
     }
 
     #[test]
+    fn pijs_env_get_honors_per_extension_env_deny() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let mut policy = crate::extensions::PolicyProfile::Permissive.to_policy();
+            policy.per_extension.insert(
+                "ext.env.denied".to_string(),
+                crate::extensions::ExtensionOverride {
+                    mode: None,
+                    allow: Vec::new(),
+                    deny: vec!["env".to_string()],
+                    quota: None,
+                },
+            );
+
+            let config = PiJsRuntimeConfig {
+                cwd: "/virtual/cwd".to_string(),
+                env: HashMap::from([("HOME".to_string(), "/virtual/home".to_string())]),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                Arc::clone(&clock),
+                config,
+                Some(policy),
+            )
+            .await
+            .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.perExtEnvDeny = { done: false };
+                    __pi_with_extension_async("ext.env.denied", async () => {
+                        globalThis.perExtEnvDeny.home = pi.env.get("HOME");
+                        globalThis.perExtEnvDeny.done = true;
+                    }).catch((err) => {
+                        globalThis.perExtEnvDeny.error = String((err && err.message) || err || '');
+                        globalThis.perExtEnvDeny.done = true;
+                    });
+                    "#,
+                )
+                .await
+                .expect("eval env override deny");
+
+            let result = get_global_json(&runtime, "perExtEnvDeny").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert!(result["home"].is_null(), "env should be denied: {result:?}");
+        });
+    }
+
+    #[test]
     fn pijs_process_path_crypto_time_apis_smoke() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(123));
@@ -23071,6 +23109,70 @@ export default ConfigLoader;
                     .contains("disabled by default"),
                 "unexpected denial message: {}",
                 r["msg"]
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_exec_sync_global_deny_overrides_per_extension_allow() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let mut policy = crate::extensions::PolicyProfile::Standard.to_policy();
+            policy.per_extension.insert(
+                "ext.exec.allowed".to_string(),
+                crate::extensions::ExtensionOverride {
+                    mode: None,
+                    allow: vec!["exec".to_string()],
+                    deny: Vec::new(),
+                    quota: None,
+                },
+            );
+            let config = PiJsRuntimeConfig {
+                allow_unsafe_sync_exec: true,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                Arc::clone(&clock),
+                config,
+                Some(policy),
+            )
+            .await
+            .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.syncPolicyPrecedence = { done: false };
+                    __pi_with_extension_async("ext.exec.allowed", async () => {
+                        const { execSync } = await import('node:child_process');
+                        try {
+                            execSync('echo should-not-run');
+                            globalThis.syncPolicyPrecedence.threw = false;
+                        } catch (e) {
+                            globalThis.syncPolicyPrecedence.threw = true;
+                            globalThis.syncPolicyPrecedence.msg = String((e && e.message) || e || '');
+                        }
+                        globalThis.syncPolicyPrecedence.done = true;
+                    }).catch((err) => {
+                        globalThis.syncPolicyPrecedence.threw = true;
+                        globalThis.syncPolicyPrecedence.msg = String((err && err.message) || err || '');
+                        globalThis.syncPolicyPrecedence.done = true;
+                    });
+                    "#,
+                )
+                .await
+                .expect("eval execSync precedence");
+
+            let result = get_global_json(&runtime, "syncPolicyPrecedence").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["threw"], serde_json::json!(true));
+            assert!(
+                result["msg"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("lacks 'exec' capability"),
+                "unexpected denial message: {}",
+                result["msg"]
             );
         });
     }

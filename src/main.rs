@@ -2616,6 +2616,26 @@ async fn handle_config(
     Ok(())
 }
 
+fn collect_session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
 fn handle_session_migrate(path: &str, dry_run: bool) -> Result<()> {
     let path = std::path::Path::new(path);
     if !path.exists() {
@@ -2624,14 +2644,7 @@ fn handle_session_migrate(path: &str, dry_run: bool) -> Result<()> {
 
     // Collect JSONL files to migrate.
     let jsonl_files: Vec<std::path::PathBuf> = if path.is_dir() {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let p = entry.path();
-            if p.extension().is_some_and(|e| e == "jsonl") {
-                files.push(p);
-            }
-        }
+        let files = collect_session_jsonl_files(path)?;
         if files.is_empty() {
             bail!("No .jsonl session files found in {}", path.display());
         }
@@ -3984,6 +3997,24 @@ mod tests {
             "pkg".to_string(),
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_session_jsonl_files_walks_nested_session_dirs() {
+        let temp = TempDir::new().expect("tempdir");
+        let nested = temp.path().join("--repo--").join("archived");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+
+        let root_file = temp.path().join("top-level.jsonl");
+        let nested_file = nested.join("nested.jsonl");
+        let ignored_file = nested.join("notes.txt");
+
+        std::fs::write(&root_file, "{}").expect("write root session");
+        std::fs::write(&nested_file, "{}").expect("write nested session");
+        std::fs::write(&ignored_file, "ignore").expect("write ignored file");
+
+        let files = collect_session_jsonl_files(temp.path()).expect("collect jsonl files");
+        assert_eq!(files, vec![nested_file, root_file]);
     }
 
     #[test]

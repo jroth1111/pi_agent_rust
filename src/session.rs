@@ -1162,7 +1162,7 @@ impl Session {
         }
 
         let mut v2_message_count_offset = 0;
-        if matches!(mode, V2OpenMode::Tail(_)) {
+        if !matches!(mode, V2OpenMode::Full) {
             if let Ok(Some(manifest)) = store.read_manifest() {
                 let total = manifest.counters.messages_total;
                 let loaded = finalized.message_count;
@@ -3812,6 +3812,8 @@ pub fn create_v2_sidecar_from_jsonl(jsonl_path: &Path) -> Result<SessionStoreV2>
     if header_line.trim().is_empty() {
         return Err(crate::Error::session("Empty JSONL session file"));
     }
+    let header: SessionHeader = serde_json::from_str(header_line.trim())
+        .map_err(|e| crate::Error::session(format!("Invalid header in JSONL: {e}")))?;
 
     let v2_root = session_store_v2::v2_sidecar_path(jsonl_path);
     if v2_root.exists() {
@@ -3830,6 +3832,8 @@ pub fn create_v2_sidecar_from_jsonl(jsonl_path: &Path) -> Result<SessionStoreV2>
             session_store_v2::session_entry_to_frame_args(&entry)?;
         store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
     }
+
+    store.write_manifest(header.id, "jsonl_v3")?;
 
     Ok(store)
 }
@@ -4415,6 +4419,43 @@ mod tests {
             "pending entry appended on partial session must be preserved"
         );
         assert_eq!(reopened_ids.len(), 5);
+    }
+
+    #[test]
+    fn v2_active_path_hydration_tracks_total_message_count_for_incremental_save() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("lazy_hydration_active_path_count.jsonl");
+
+        let mut seed = Session::create();
+        seed.path = Some(path.clone());
+        seed.session_dir = Some(temp_dir.path().to_path_buf());
+        let _id_root = seed.append_message(make_test_message("root"));
+        let id_a = seed.append_message(make_test_message("a"));
+        let _id_b = seed.append_message(make_test_message("main-branch"));
+        assert!(seed.create_branch_from(&id_a));
+        let _id_c = seed.append_message(make_test_message("side-branch"));
+        run_async(async { seed.save().await }).unwrap();
+
+        create_v2_sidecar_from_jsonl(&path).unwrap();
+        let v2_root = crate::session_store_v2::v2_sidecar_path(&path);
+        let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024).unwrap();
+        let (mut loaded, _) =
+            Session::open_from_v2(&store, seed.header.clone(), V2OpenMode::ActivePath).unwrap();
+        loaded.path = Some(path.clone());
+        loaded.session_dir = Some(temp_dir.path().to_path_buf());
+        loaded.v2_sidecar_root = Some(v2_root);
+        loaded.v2_partial_hydration = true;
+        loaded.v2_resume_mode = Some(V2OpenMode::ActivePath);
+
+        assert_eq!(loaded.cached_message_count, 4);
+
+        loaded.append_message(make_test_message("new-on-active-leaf"));
+        run_async(async { loaded.save().await }).unwrap();
+
+        let index = SessionIndex::for_sessions_root(temp_dir.path());
+        let listed = index.list_sessions(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 5);
     }
 
     #[test]

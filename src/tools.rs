@@ -1316,26 +1316,25 @@ impl Tool for ReadTool {
             }
 
             // For images, we must read the whole file to resize/encode.
-            // Since we checked metadata len above, this is safe up to READ_TOOL_MAX_BYTES,
-            // but we double-check against IMAGE_MAX_BYTES using take() to avoid reading
-            // more than necessary into memory.
+            // Since we checked metadata len above, this is safe up to READ_TOOL_MAX_BYTES.
+            // We still bound the read in case the file grows while we're streaming it.
             let mut all_bytes = Vec::with_capacity(initial_read);
             all_bytes.extend_from_slice(initial_bytes);
 
-            let remaining_limit = IMAGE_MAX_BYTES.saturating_sub(initial_read);
-            let mut limiter = file.take((remaining_limit as u64).saturating_add(1));
+            let remaining_limit = READ_TOOL_MAX_BYTES.saturating_sub(initial_read as u64);
+            let mut limiter = file.take(remaining_limit.saturating_add(1));
             limiter
                 .read_to_end(&mut all_bytes)
                 .await
                 .map_err(|e| Error::tool("read", format!("Failed to read image: {e}")))?;
 
-            if all_bytes.len() > IMAGE_MAX_BYTES {
+            if all_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
                 return Err(Error::tool(
                     "read",
                     format!(
-                        "Image is too large ({} bytes). Max allowed is {} bytes.",
+                        "File grew beyond limit during read ({} bytes). Max allowed is {} bytes.",
                         all_bytes.len(),
-                        IMAGE_MAX_BYTES
+                        READ_TOOL_MAX_BYTES
                     ),
                 ));
             }
@@ -4677,6 +4676,68 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, ContentBlock::Image(_)));
             assert!(has_image, "expected image content block for PNG file");
+        });
+    }
+
+    #[cfg(feature = "image-resize")]
+    #[test]
+    fn test_read_large_image_can_resize_under_api_limit() {
+        asupersync::test_utils::run_test(|| async {
+            use image::{ImageEncoder, Rgb, RgbImage};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("large.jpg");
+
+            let img = RgbImage::from_fn(2400, 2400, |x, y| {
+                let seed = x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663);
+                Rgb([
+                    (seed & 0xFF) as u8,
+                    ((seed >> 8) & 0xFF) as u8,
+                    ((seed >> 16) & 0xFF) as u8,
+                ])
+            });
+
+            let mut encoded = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 100)
+                .write_image(
+                    img.as_raw(),
+                    img.width(),
+                    img.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .unwrap();
+
+            assert!(
+                encoded.len() > IMAGE_MAX_BYTES,
+                "expected oversized source image, got {} bytes",
+                encoded.len()
+            );
+
+            let resized = resize_image_if_needed(&encoded, "image/jpeg").unwrap();
+            assert!(
+                resized.bytes.len() <= IMAGE_MAX_BYTES,
+                "expected resized image under limit, got {} bytes",
+                resized.bytes.len()
+            );
+
+            std::fs::write(&path, &encoded).unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                out.content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image(_))),
+                "expected image content block for oversized-but-resizable image"
+            );
         });
     }
 

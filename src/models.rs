@@ -164,14 +164,15 @@ struct LegacyGeneratedModel {
     compat: Option<CompatConfig>,
 }
 
-const LEGACY_MODELS_GENERATED_TS: &str =
-    include_str!("../legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts");
+const LEGACY_MODELS_GENERATED_TS_RELATIVE_PATH: &str =
+    "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts";
 const UPSTREAM_PROVIDER_MODEL_IDS_JSON: &str =
     include_str!("../docs/provider-upstream-model-ids-snapshot.json");
 const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const GOOGLE_GEMINI_CLI_API_URL: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
+static LEGACY_MODELS_GENERATED_TS_CACHE: OnceLock<Option<String>> = OnceLock::new();
 static LEGACY_GENERATED_MODELS_CACHE: OnceLock<Vec<LegacyGeneratedModel>> = OnceLock::new();
 static UPSTREAM_PROVIDER_MODEL_IDS_CACHE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
 static MODEL_AUTOCOMPLETE_CACHE: OnceLock<Vec<ModelAutocompleteCandidate>> = OnceLock::new();
@@ -238,24 +239,55 @@ fn parse_input_types(input: &[String]) -> Vec<InputType> {
         .collect()
 }
 
+fn legacy_models_generated_ts() -> Option<&'static str> {
+    LEGACY_MODELS_GENERATED_TS_CACHE
+        .get_or_init(|| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(LEGACY_MODELS_GENERATED_TS_RELATIVE_PATH);
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => Some(contents),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "Legacy model catalog file not found; continuing without legacy catalog"
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "Failed to read legacy model catalog; continuing without it"
+                    );
+                    None
+                }
+            }
+        })
+        .as_deref()
+}
+
 fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
-    let Some(models_decl_start) = LEGACY_MODELS_GENERATED_TS.find("export const MODELS =") else {
+    let Some(legacy_models_generated_ts) = legacy_models_generated_ts() else {
+        return Vec::new();
+    };
+
+    let Some(models_decl_start) = legacy_models_generated_ts.find("export const MODELS =") else {
         tracing::warn!("Legacy model catalog missing MODELS declaration");
         return Vec::new();
     };
-    let Some(object_start_rel) = LEGACY_MODELS_GENERATED_TS[models_decl_start..].find('{') else {
+    let Some(object_start_rel) = legacy_models_generated_ts[models_decl_start..].find('{') else {
         tracing::warn!("Legacy model catalog missing object start after MODELS declaration");
         return Vec::new();
     };
     let object_start = models_decl_start + object_start_rel;
-    let Some(end_marker_rel) = LEGACY_MODELS_GENERATED_TS[object_start..].rfind("} as const;")
+    let Some(end_marker_rel) = legacy_models_generated_ts[object_start..].rfind("} as const;")
     else {
         tracing::warn!("Legacy model catalog missing end marker");
         return Vec::new();
     };
     let end_marker = object_start + end_marker_rel;
 
-    let mut object_source = LEGACY_MODELS_GENERATED_TS[object_start..=end_marker]
+    let mut object_source = legacy_models_generated_ts[object_start..=end_marker]
         .trim_end_matches(" as const;")
         .to_string();
     let satisfies_re = SATISFIES_RE.get_or_init(|| {
@@ -1297,6 +1329,15 @@ mod tests {
     #[test]
     fn parse_legacy_generated_models_extracts_known_legacy_only_providers() {
         let parsed = parse_legacy_generated_models();
+
+        if legacy_models_generated_ts().is_none() {
+            assert!(
+                parsed.is_empty(),
+                "missing legacy generated catalog should parse as an empty list"
+            );
+            return;
+        }
+
         assert!(
             !parsed.is_empty(),
             "legacy generated model catalog should parse into entries"

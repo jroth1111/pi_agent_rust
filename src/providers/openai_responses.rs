@@ -28,6 +28,63 @@ const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 pub(crate) const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
+type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
+
+fn ndjson_to_sse_bytes(bytes_stream: ByteStream) -> ByteStream {
+    stream::try_unfold(
+        (bytes_stream, Vec::<u8>::new(), false),
+        |(mut bytes_stream, mut buffer, mut finished)| async move {
+            loop {
+                if let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let mut line = buffer.drain(..=line_end).collect::<Vec<_>>();
+                    if matches!(line.last(), Some(b'\n')) {
+                        line.pop();
+                    }
+                    if matches!(line.last(), Some(b'\r')) {
+                        line.pop();
+                    }
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let mut frame = Vec::with_capacity(line.len() + 8);
+                    frame.extend_from_slice(b"data: ");
+                    frame.extend_from_slice(&line);
+                    frame.extend_from_slice(b"\n\n");
+                    return Ok(Some((frame, (bytes_stream, buffer, finished))));
+                }
+
+                if finished {
+                    if buffer.is_empty() {
+                        return Ok(None);
+                    }
+
+                    let mut line = std::mem::take(&mut buffer);
+                    if matches!(line.last(), Some(b'\r')) {
+                        line.pop();
+                    }
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
+
+                    let mut frame = Vec::with_capacity(line.len() + 8);
+                    frame.extend_from_slice(b"data: ");
+                    frame.extend_from_slice(&line);
+                    frame.extend_from_slice(b"\n\n");
+                    return Ok(Some((frame, (bytes_stream, buffer, finished))));
+                }
+
+                match bytes_stream.next().await {
+                    Some(Ok(bytes)) => buffer.extend_from_slice(&bytes),
+                    Some(Err(err)) => return Err(err),
+                    None => finished = true,
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
 // ============================================================================
 // OpenAI Responses Provider
 // ============================================================================
@@ -313,7 +370,15 @@ impl Provider for OpenAIResponsesProvider {
             }
         }
 
-        let event_source = SseStream::new(response.bytes_stream());
+        let response_stream = response.bytes_stream();
+        let event_source = if content_type
+            .as_deref()
+            .is_some_and(|ct| ct.contains("application/x-ndjson"))
+        {
+            SseStream::new(ndjson_to_sse_bytes(response_stream))
+        } else {
+            SseStream::new(response_stream)
+        };
 
         let model = self.model.clone();
         let api = self.api().to_string();
@@ -1480,6 +1545,62 @@ mod tests {
             "",
         ]
         .join("\n")
+    }
+
+    fn success_ndjson_body() -> String {
+        [
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","content_index":0,"delta":"ok"}"#,
+            r#"{"type":"response.completed","response":{"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn test_stream_accepts_ndjson_content_type() {
+        let (base_url, _rx) =
+            spawn_test_server(200, "application/x-ndjson", &success_ndjson_body());
+        let provider = OpenAIResponsesProvider::new("gpt-4o").with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let items = runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item);
+            }
+            items
+        });
+
+        assert!(
+            items.iter().any(
+                |item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "ok")
+            ),
+            "expected NDJSON stream to yield text delta, got {items:?}"
+        );
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    ..
+                })
+            )),
+            "expected NDJSON stream to yield terminal Done, got {items:?}"
+        );
     }
 
     fn spawn_test_server(

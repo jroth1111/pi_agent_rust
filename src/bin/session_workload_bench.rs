@@ -57,6 +57,10 @@ struct Report {
 }
 
 fn parse_args() -> Result<Args> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args> {
     let mut mode = Mode::Workload;
     let mut session_path = PathBuf::from("/tmp/pi_session_bench/rust_large_session.jsonl");
     let mut messages = 5_000usize;
@@ -68,7 +72,6 @@ fn parse_args() -> Result<Args> {
     let mut forks = 0usize;
     let mut exports = 0usize;
 
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--mode" => {
@@ -97,7 +100,7 @@ fn parse_args() -> Result<Args> {
             "--slash-ops" => slash_ops = parse_usize_flag(&mut args, "--slash-ops")?,
             "--forks" => forks = parse_usize_flag(&mut args, "--forks")?,
             "--exports" => exports = parse_usize_flag(&mut args, "--exports")?,
-            _ => {}
+            _ => return Err(pi::Error::session(format!("unknown argument: {arg}"))),
         }
     }
 
@@ -131,6 +134,9 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| pi::Error::session("session path has no parent"))?;
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
     std::fs::create_dir_all(parent)?;
     Ok(())
 }
@@ -484,5 +490,21 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("session_workload_bench error: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_from_rejects_unknown_flags() {
+        let err = parse_args_from(["--bogus".to_string()].into_iter()).expect_err("unknown flag");
+        assert!(err.to_string().contains("unknown argument: --bogus"));
+    }
+
+    #[test]
+    fn ensure_parent_dir_allows_bare_filename() {
+        ensure_parent_dir(Path::new("bench.jsonl")).expect("bare filename should be allowed");
     }
 }

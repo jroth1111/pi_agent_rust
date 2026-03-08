@@ -1,0 +1,3 @@
+#!/bin/sh
+
+exec rustup run nightly rustc "$@"

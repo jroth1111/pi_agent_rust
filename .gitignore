@@ -52,6 +52,7 @@ _tmp_*/
 .cargo-home*/
 
 # Per-agent cargo target directories
+.agent_target/
 .cargo-target*/
 .target-*/
 .target_*/
@@ -63,6 +64,8 @@ _target-*/
 
 # Fuzz build artifacts, corpus data, and run reports
 fuzz/corpus/
+fuzz/crashes/**
+!fuzz/crashes/.gitkeep
 fuzz/target/
 fuzz/reports/
 

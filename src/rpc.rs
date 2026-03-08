@@ -238,6 +238,27 @@ impl RpcSharedState {
     }
 }
 
+async fn sync_agent_queue_modes(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    cx: &AgentCx,
+) -> Result<()> {
+    let (steering_mode, follow_up_mode) = {
+        let state = shared_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+        (state.steering_mode, state.follow_up_mode)
+    };
+
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    guard.agent.set_queue_modes(steering_mode, follow_up_mode);
+    Ok(())
+}
+
 /// Tracks a running bash command so it can be aborted.
 struct RunningBash {
     id: String,
@@ -352,6 +373,10 @@ pub async fn run(
         guard.agent.register_message_fetchers(
             Some(Arc::new(steering_fetcher)),
             Some(Arc::new(follow_fetcher)),
+        );
+        guard.agent.set_queue_modes(
+            options.config.steering_queue_mode(),
+            options.config.follow_up_queue_mode(),
         );
     }
 
@@ -1014,6 +1039,7 @@ pub async fn run(
                     .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                 state.steering_mode = mode;
                 drop(state);
+                sync_agent_queue_modes(&session, &shared_state, &cx).await?;
                 let _ = out_tx.send(response_ok(id, "set_steering_mode", None));
             }
 
@@ -1040,6 +1066,7 @@ pub async fn run(
                     .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                 state.follow_up_mode = mode;
                 drop(state);
+                sync_agent_queue_modes(&session, &shared_state, &cx).await?;
                 let _ = out_tx.send(response_ok(id, "set_follow_up_mode", None));
             }
 
@@ -3772,14 +3799,23 @@ async fn cycle_model_for_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{Agent, AgentConfig, AgentSession};
     use crate::auth::AuthCredential;
+    use crate::compaction::ResolvedCompactionSettings;
     use crate::model::{
-        ContentBlock, ImageContent, TextContent, ThinkingLevel, UserContent, UserMessage,
+        AssistantMessage, ContentBlock, ImageContent, StopReason, StreamEvent, TextContent,
+        ThinkingLevel, Usage, UserContent, UserMessage,
     };
-    use crate::provider::{InputType, Model, ModelCost};
+    use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use async_trait::async_trait;
+    use futures::stream;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -3840,6 +3876,104 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingProvider {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn api(&self) -> &str {
+            "counting"
+        }
+
+        fn model_id(&self) -> &str {
+            "counting-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "reply-{call_index}"
+                )))],
+                api: "counting".to_string(),
+                provider: "counting".to_string(),
+                model: "counting-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 1_700_000_000,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    fn queued_user_message(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 1_700_000_000,
+        })
+    }
+
+    async fn register_rpc_queue_fetchers_for_test(
+        session: &Arc<Mutex<AgentSession>>,
+        shared_state: &Arc<Mutex<RpcSharedState>>,
+        cx: &AgentCx,
+    ) {
+        use futures::future::BoxFuture;
+
+        let steering_state = Arc::clone(shared_state);
+        let follow_state = Arc::clone(shared_state);
+        let steering_cx = cx.clone();
+        let follow_cx = cx.clone();
+
+        let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+            let steering_state = Arc::clone(&steering_state);
+            let steering_cx = steering_cx.clone();
+            Box::pin(async move {
+                steering_state
+                    .lock(&steering_cx)
+                    .await
+                    .map_or_else(|_| Vec::new(), |mut state| state.pop_steering())
+            })
+        };
+        let follow_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+            let follow_state = Arc::clone(&follow_state);
+            let follow_cx = follow_cx.clone();
+            Box::pin(async move {
+                follow_state
+                    .lock(&follow_cx)
+                    .await
+                    .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up())
+            })
+        };
+
+        let mut guard = session.lock(cx).await.expect("session lock");
+        guard.agent.register_message_fetchers(
+            Some(Arc::new(steering_fetcher)),
+            Some(Arc::new(follow_fetcher)),
+        );
+    }
+
     #[test]
     fn line_count_from_newline_count_matches_trailing_newline_semantics() {
         assert_eq!(line_count_from_newline_count(0, 0, false), 0);
@@ -3886,6 +4020,114 @@ mod tests {
         assert!(provider_ids_match("openrouter", "open-router"));
         assert!(provider_ids_match("google-gemini-cli", "gemini-cli"));
         assert!(!provider_ids_match("openai", "anthropic"));
+    }
+
+    #[test]
+    fn sync_agent_queue_modes_applies_steering_mode_to_live_agent() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            });
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let session = Arc::new(Mutex::new(AgentSession::new(
+                agent,
+                inner_session,
+                false,
+                ResolvedCompactionSettings::default(),
+            )));
+            let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&Config::default())));
+            let cx = AgentCx::for_request();
+
+            register_rpc_queue_fetchers_for_test(&session, &shared_state, &cx).await;
+            sync_agent_queue_modes(&session, &shared_state, &cx)
+                .await
+                .expect("initial queue mode sync");
+
+            {
+                let mut state = shared_state.lock(&cx).await.expect("state lock");
+                state.steering_mode = QueueMode::All;
+                state.push_steering(queued_user_message("steer-1"))
+                    .expect("queue steer-1");
+                state.push_steering(queued_user_message("steer-2"))
+                    .expect("queue steer-2");
+            }
+
+            sync_agent_queue_modes(&session, &shared_state, &cx)
+                .await
+                .expect("update queue mode sync");
+
+            {
+                let mut guard = session.lock(&cx).await.expect("session lock");
+                guard.run_text("prompt".to_string(), |_| {}).await.expect("run_text");
+            }
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "steering all-mode should deliver both queued messages in one turn"
+            );
+        });
+    }
+
+    #[test]
+    fn sync_agent_queue_modes_applies_follow_up_mode_to_live_agent() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            });
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let session = Arc::new(Mutex::new(AgentSession::new(
+                agent,
+                inner_session,
+                false,
+                ResolvedCompactionSettings::default(),
+            )));
+            let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&Config::default())));
+            let cx = AgentCx::for_request();
+
+            register_rpc_queue_fetchers_for_test(&session, &shared_state, &cx).await;
+            sync_agent_queue_modes(&session, &shared_state, &cx)
+                .await
+                .expect("initial queue mode sync");
+
+            {
+                let mut state = shared_state.lock(&cx).await.expect("state lock");
+                state.follow_up_mode = QueueMode::All;
+                state.push_follow_up(queued_user_message("follow-1"))
+                    .expect("queue follow-1");
+                state.push_follow_up(queued_user_message("follow-2"))
+                    .expect("queue follow-2");
+            }
+
+            sync_agent_queue_modes(&session, &shared_state, &cx)
+                .await
+                .expect("update queue mode sync");
+
+            {
+                let mut guard = session.lock(&cx).await.expect("session lock");
+                guard.run_text("prompt".to_string(), |_| {}).await.expect("run_text");
+            }
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "follow-up all-mode should batch both queued messages into one idle turn"
+            );
+        });
     }
 
     #[test]

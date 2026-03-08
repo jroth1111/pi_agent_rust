@@ -7782,6 +7782,58 @@ fn tui_scroll_multiple_pageup_then_back_to_bottom() {
 }
 
 #[test]
+fn tui_resize_width_change_preserves_manual_scroll_position() {
+    let harness = TestHarness::new("tui_resize_width_change_preserves_manual_scroll_position");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(80, 20);
+    log_initial_state(&harness, &app);
+
+    let messages = (0..80)
+        .map(|idx| user_msg(&format!("history {idx:03}")))
+        .collect::<Vec<_>>();
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ConversationReset(history)",
+        PiMsg::ConversationReset {
+            messages,
+            usage: Usage::default(),
+            status: None,
+        },
+    );
+
+    for _ in 0..4 {
+        press_pgup(&harness, &mut app);
+    }
+
+    let before_resize = normalize_view(&BubbleteaModel::view(&app));
+    let percent_before = parse_scroll_percent(&before_resize).expect("pct before resize");
+    assert!(
+        percent_before < 100,
+        "expected manual scroll before resize, got {percent_before}%"
+    );
+    let visible_anchor = before_resize
+        .lines()
+        .find(|line| line.contains("history "))
+        .map(str::trim)
+        .expect("expected a visible history anchor before resize")
+        .to_string();
+
+    app.set_terminal_size(100, 20);
+
+    let after_resize = normalize_view(&BubbleteaModel::view(&app));
+    let percent_after = parse_scroll_percent(&after_resize).expect("pct after resize");
+    assert_eq!(
+        percent_after, percent_before,
+        "width-only resize should preserve manual scroll percentage"
+    );
+    assert!(
+        after_resize.contains(&visible_anchor),
+        "width-only resize should keep the same conversation anchor visible: {visible_anchor}"
+    );
+}
+
+#[test]
 fn tui_agent_done_with_thinking_no_stale_thinking_block() {
     // Verify that thinking content is properly finalized and not duplicated.
     let harness = TestHarness::new("tui_agent_done_with_thinking_no_stale_thinking_block");
