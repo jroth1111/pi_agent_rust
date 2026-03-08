@@ -10,7 +10,9 @@
 
 mod common;
 
+use async_trait::async_trait;
 use common::TestHarness;
+use futures::stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::auth::AuthStorage;
 use pi::config::Config;
@@ -28,6 +30,8 @@ use pi::vcr::{VcrMode, VcrRecorder};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::process::Command;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -75,12 +79,57 @@ fn test_entry(id: &str, reasoning: bool) -> ModelEntry {
     }
 }
 
-fn build_agent_session(session: Session, cassette_dir: &Path) -> AgentSession {
-    let model = "gpt-4o-mini".to_string();
-    let recorder = VcrRecorder::new_with("e2e_rpc_noop", VcrMode::Playback, cassette_dir);
-    let client = Client::new().with_vcr(recorder);
-    let provider: Arc<dyn Provider> = Arc::new(OpenAIProvider::new(model).with_client(client));
-    let tools = ToolRegistry::new(&[], &std::env::current_dir().unwrap(), None);
+#[derive(Debug)]
+struct NoopProvider;
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Provider for NoopProvider {
+    fn name(&self) -> &str {
+        "test-provider"
+    }
+
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &pi::provider::Context<'_>,
+        _options: &pi::provider::StreamOptions,
+    ) -> pi::error::Result<
+        Pin<Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>>,
+    > {
+        let message = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("noop"))],
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        Ok(Box::pin(stream::iter(vec![Ok(
+            pi::model::StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            },
+        )])))
+    }
+}
+
+fn build_agent_session_with_provider(
+    mut session: Session,
+    provider: Arc<dyn Provider>,
+    repo_root: &Path,
+) -> AgentSession {
+    session.header.cwd = repo_root.display().to_string();
+    let tools = ToolRegistry::new(&[], repo_root, None);
     let config = AgentConfig::default();
     let agent = Agent::new(provider, tools, config);
     let session = Arc::new(asupersync::sync::Mutex::new(session));
@@ -90,6 +139,68 @@ fn build_agent_session(session: Session, cassette_dir: &Path) -> AgentSession {
         false,
         pi::compaction::ResolvedCompactionSettings::default(),
     )
+}
+
+fn build_agent_session(session: Session, cassette_dir: &Path) -> AgentSession {
+    let model = "gpt-4o-mini".to_string();
+    let recorder = VcrRecorder::new_with("e2e_rpc_noop", VcrMode::Playback, cassette_dir);
+    let client = Client::new().with_vcr(recorder);
+    let provider: Arc<dyn Provider> = Arc::new(OpenAIProvider::new(model).with_client(client));
+    build_agent_session_with_provider(session, provider, Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn build_noop_agent_session(session: Session, repo_root: &Path) -> AgentSession {
+    build_agent_session_with_provider(session, Arc::new(NoopProvider), repo_root)
+}
+
+fn run_git(repo_path: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(repo_path)
+        .args(args)
+        .status()
+        .expect("spawn git");
+    assert!(
+        status.success(),
+        "git {:?} failed in {}",
+        args,
+        repo_path.display()
+    );
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed in {}: {}",
+        args,
+        cwd.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn setup_inline_repo(prefix: &str) -> (tempfile::TempDir, PathBuf, String) {
+    let temp_dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("temp repo");
+    let repo_path = temp_dir.path().to_path_buf();
+    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+    run_git(&repo_path, &["config", "user.name", "Test User"]);
+    std::fs::write(
+        repo_path.join("Cargo.toml"),
+        "[package]\nname = \"inline-fixture\"\n",
+    )
+    .expect("write fixture file");
+    run_git(&repo_path, &["add", "."]);
+    run_git(&repo_path, &["commit", "-m", "initial"]);
+    let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
+    (temp_dir, repo_path, head)
 }
 
 fn build_options(
@@ -567,9 +678,89 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
 }
 
 #[test]
+fn rpc_orchestration_dispatch_run_executes_inline_run() {
+    let harness = TestHarness::new("rpc_orchestration_dispatch_run_executes_inline_run");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-inline-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-inline");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise automated inline orchestration dispatch",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-inline",
+                    "objective": "Complete inline task",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-inline"],
+                    "plannedTouches": ["Cargo.toml"]
+                }
+            ],
+            "runVerifyCommand": "true",
+            "runVerifyTimeoutSec": 30
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        let grants = dispatch["data"]["grants"]
+            .as_array()
+            .expect("dispatch grants");
+        assert!(
+            grants.is_empty(),
+            "inline dispatch should not return live leases"
+        );
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 1);
+
+        let get_cmd = json!({
+            "id": "3",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&get, "orchestration.get_run");
+        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 1);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_orchestration_resume_reruns_failed_run_verification() {
     let harness = TestHarness::new("rpc_orchestration_resume_reruns_failed_run_verification");
-    let cassette_dir = cassette_root();
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("build test runtime");
@@ -577,9 +768,11 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
     let resume_flag = harness.temp_path("run-verify-ok.flag");
     let resume_flag_str = resume_flag.to_string_lossy().to_string();
     let run_id = format!("run-e2e-resume-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-resume");
 
     runtime.block_on(async move {
-        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let _repo_guard = repo_guard;
+        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
         let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
@@ -596,10 +789,10 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
                 {
                     "taskId": "task-e2e-resume",
                     "objective": "Complete resumable task",
-                    "verifyCommand": "cargo test",
-                    "inputSnapshot": "snapshot-resume",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
                     "acceptanceIds": ["ac-resume"],
-                    "plannedTouches": ["src/task_e2e_resume.rs"]
+                    "plannedTouches": ["Cargo.toml"]
                 }
             ],
             "runVerifyCommand": format!("test -f {}", resume_flag_str),
@@ -621,56 +814,18 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         let dispatch =
             send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
         assert_ok(&dispatch, "orchestration.dispatch_run");
-        let grant = dispatch["data"]["grants"][0].clone();
-
-        let evidence_cmd = json!({
-            "id": "3",
-            "type": "reliability.append_evidence",
-            "taskId": "task-e2e-resume",
-            "command": "cargo test",
-            "exitCode": 0,
-            "stdout": "ok",
-            "stderr": ""
-        })
-        .to_string();
-        let evidence = send_recv(
-            &in_tx,
-            &out_rx,
-            &evidence_cmd,
-            "reliability.append_evidence",
-        )
-        .await;
-        assert_ok(&evidence, "reliability.append_evidence");
-        let evidence_id = evidence["data"]["evidence"]["evidence_id"]
-            .as_str()
-            .expect("evidence id");
-
-        let submit_cmd = json!({
-            "id": "4",
-            "type": "reliability.submit_task",
-            "taskId": "task-e2e-resume",
-            "leaseId": grant["leaseId"].as_str().expect("lease id"),
-            "fenceToken": grant["fenceToken"].as_u64().expect("fence token"),
-            "patchDigest": "sha256:resume",
-            "verifyRunId": "vr-resume",
-            "verifyPassed": true,
-            "verifyTimedOut": false,
-            "changedFiles": ["src/task_e2e_resume.rs"],
-            "close": {
-                "task_id": "task-e2e-resume",
-                "outcome": "Completed resumable task",
-                "outcome_kind": "success",
-                "acceptance_ids": ["ac-resume"],
-                "evidence_ids": [evidence_id],
-                "trace_parent": "goal:task-e2e-resume"
-            }
-        })
-        .to_string();
-        let submit = send_recv(&in_tx, &out_rx, &submit_cmd, "reliability.submit_task").await;
-        assert_ok(&submit, "reliability.submit_task");
+        let grants = dispatch["data"]["grants"]
+            .as_array()
+            .expect("dispatch grants");
+        assert!(
+            grants.is_empty(),
+            "inline dispatch should complete in-process without external leases"
+        );
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "failed");
+        assert_eq!(dispatch["data"]["run"]["latestRunVerify"]["ok"], false);
 
         let failed_get_cmd = json!({
-            "id": "5",
+            "id": "3",
             "type": "orchestration.get_run",
             "runId": run_id
         })
@@ -681,7 +836,7 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         assert_eq!(failed_get["data"]["run"]["latestRunVerify"]["ok"], false);
 
         let touch_cmd = json!({
-            "id": "6",
+            "id": "4",
             "type": "bash",
             "command": format!("touch {}", resume_flag_str)
         })
@@ -690,7 +845,7 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         assert_ok(&touch, "bash");
 
         let resume_cmd = json!({
-            "id": "7",
+            "id": "5",
             "type": "orchestration.resume_run",
             "runId": run_id
         })

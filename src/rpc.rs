@@ -2643,6 +2643,59 @@ async fn execute_inline_dispatch_grant_with_worker(
     run_store.load(run_id)
 }
 
+async fn execute_inline_run_dispatch(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    run: RunStatus,
+    grants: &[DispatchGrant],
+) -> Result<RunStatus> {
+    if grants.is_empty() {
+        return Ok(run);
+    }
+
+    let (provider, repo_root) = {
+        let guard = session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        let repo_root = {
+            let inner = guard
+                .session
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+            let cwd = inner.header.cwd.trim();
+            if cwd.is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            } else {
+                PathBuf::from(cwd)
+            }
+        };
+        (guard.agent.provider(), repo_root)
+    };
+    let worker = RpcSessionInlineWorker::new(provider, config.clone());
+    let mut updated_run = run;
+    for grant in grants {
+        updated_run = execute_inline_dispatch_grant_with_worker(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            repo_root.as_path(),
+            &updated_run.run_id,
+            grant,
+            &worker,
+        )
+        .await?;
+    }
+    Ok(updated_run)
+}
+
 fn build_submit_task_report(
     reliability: &RpcReliabilityState,
     req: &SubmitTaskRequest,
@@ -3814,7 +3867,7 @@ pub async fn run(
                         )))
                     }
                 };
-                let grants = match dispatch_result {
+                let mut grants = match dispatch_result {
                     Ok(grants) => grants,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -3846,6 +3899,33 @@ pub async fn run(
                         &err,
                     ));
                     continue;
+                }
+                if run.selected_tier == ExecutionTier::Inline && !grants.is_empty() {
+                    match execute_inline_run_dispatch(
+                        &cx,
+                        &session,
+                        &reliability_state,
+                        &orchestration_state,
+                        &run_store,
+                        &options.config,
+                        run,
+                        &grants,
+                    )
+                    .await
+                    {
+                        Ok(updated_run) => {
+                            run = updated_run;
+                            grants.clear();
+                        }
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.dispatch_run",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(
