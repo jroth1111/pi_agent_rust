@@ -9,6 +9,10 @@ pub struct TaskSpec {
     pub verify: VerifyPlan,
     pub max_attempts: u8,
     pub input_snapshot: String,
+    #[serde(default)]
+    pub acceptance_ids: Vec<String>,
+    #[serde(default)]
+    pub planned_touches: Vec<String>,
 }
 
 impl TaskSpec {
@@ -141,6 +145,8 @@ mod tests {
             },
             max_attempts: 3,
             input_snapshot: "abc1234".to_string(),
+            acceptance_ids: vec!["ac-1".to_string()],
+            planned_touches: vec!["src/reliability/task.rs".to_string()],
         }
     }
 

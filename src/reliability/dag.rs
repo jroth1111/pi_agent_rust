@@ -199,6 +199,8 @@ mod tests {
                 },
                 max_attempts: 3,
                 input_snapshot: "abc".to_string(),
+                acceptance_ids: vec!["ac-1".to_string()],
+                planned_touches: vec!["src/reliability/dag.rs".to_string()],
             },
             runtime: crate::reliability::task::TaskRuntime {
                 state,

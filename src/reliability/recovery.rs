@@ -92,6 +92,8 @@ mod tests {
                 },
                 max_attempts,
                 input_snapshot: "abc123".to_string(),
+                acceptance_ids: vec!["ac-1".to_string()],
+                planned_touches: vec!["src/reliability/recovery.rs".to_string()],
             },
             runtime: TaskRuntime::new(),
             created_at: Utc::now(),
