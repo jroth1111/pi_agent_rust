@@ -171,6 +171,42 @@ impl FlockWorkspace {
         self.verifier.get_diff()
     }
 
+    /// Get the diff against the current worktree HEAD.
+    ///
+    /// Useful when the workspace has already been layered with prior patches and
+    /// the caller only wants the incremental delta from the latest committed base.
+    pub fn get_changes_since_head(&self) -> Result<String> {
+        if !self.prepared {
+            return Err(Error::tool(
+                "flock",
+                "Workspace not prepared. Call prepare() first.",
+            ));
+        }
+        self.verifier.get_diff_from_head()
+    }
+
+    /// Apply a patch inside the prepared workspace.
+    pub fn apply_patch(&self, patch: &str) -> Result<()> {
+        if !self.prepared {
+            return Err(Error::tool(
+                "flock",
+                "Workspace not prepared. Call prepare() first.",
+            ));
+        }
+        self.verifier.apply_patch(patch)
+    }
+
+    /// Commit the current staged workspace state to create a new internal base.
+    pub fn commit_staged_changes(&self, message: &str) -> Result<()> {
+        if !self.prepared {
+            return Err(Error::tool(
+                "flock",
+                "Workspace not prepared. Call prepare() first.",
+            ));
+        }
+        self.verifier.commit_staged_changes(message)
+    }
+
     /// Get the path to this workspace.
     pub fn workspace_path(&self) -> &Path {
         &self.worker.workspace

@@ -170,6 +170,9 @@ impl CleanRoomVerifier {
                 "Worktree not prepared. Call prepare() first.",
             ));
         }
+        if patch.trim().is_empty() {
+            return Ok(());
+        }
 
         // Apply the patch using git apply in the worktree
         let mut child = Command::new("git")
@@ -265,6 +268,64 @@ impl CleanRoomVerifier {
             "cleanroom",
             format!(
                 "Failed to stage worktree changes: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
+
+    fn has_staged_changes(&self) -> Result<bool> {
+        let status = Command::new("git")
+            .current_dir(&self.worktree)
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .map_err(|e| Error::session(format!("git diff --cached --quiet: {e}")))?;
+
+        match status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(Error::tool(
+                "cleanroom",
+                format!("Failed to inspect staged changes: {:?}", status.code()),
+            )),
+        }
+    }
+
+    pub fn commit_staged_changes(&self, message: &str) -> Result<()> {
+        if !self.worktree.exists() {
+            return Err(Error::tool(
+                "cleanroom",
+                "Worktree not prepared. Call prepare() first.",
+            ));
+        }
+
+        self.stage_worktree_changes()?;
+        if !self.has_staged_changes()? {
+            return Ok(());
+        }
+
+        let output = Command::new("git")
+            .current_dir(&self.worktree)
+            .args([
+                "-c",
+                "user.name=PI Agent",
+                "-c",
+                "user.email=pi-agent@example.invalid",
+                "commit",
+                "--no-verify",
+                "-m",
+                message,
+            ])
+            .output()
+            .map_err(|e| Error::session(format!("git commit: {e}")))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        Err(Error::tool(
+            "cleanroom",
+            format!(
+                "Failed to commit staged changes: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         ))
@@ -375,6 +436,25 @@ impl CleanRoomVerifier {
             .args(["diff", "--cached", &self.input_snapshot])
             .output()
             .map_err(|e| Error::session(format!("git diff: {e}")))?;
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    pub fn get_diff_from_head(&self) -> Result<String> {
+        if !self.worktree.exists() {
+            return Err(Error::tool(
+                "cleanroom",
+                "Worktree not prepared. Call prepare() first.",
+            ));
+        }
+
+        self.stage_worktree_changes()?;
+
+        let output = Command::new("git")
+            .current_dir(&self.worktree)
+            .args(["diff", "--cached", "HEAD"])
+            .output()
+            .map_err(|e| Error::session(format!("git diff HEAD: {e}")))?;
 
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }

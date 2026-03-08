@@ -2484,6 +2484,25 @@ async fn capture_dispatch_grant_execution(
     grant: &DispatchGrant,
     worker: &dyn OrchestrationInlineWorker,
 ) -> Result<CapturedDispatchExecution> {
+    capture_dispatch_grant_execution_with_base_patches(
+        cx,
+        reliability_state,
+        repo_root,
+        grant,
+        worker,
+        &[],
+    )
+    .await
+}
+
+async fn capture_dispatch_grant_execution_with_base_patches(
+    cx: &AgentCx,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    repo_root: &Path,
+    grant: &DispatchGrant,
+    worker: &dyn OrchestrationInlineWorker,
+    base_patches: &[String],
+) -> Result<CapturedDispatchExecution> {
     let contract = {
         let rel = reliability_state
             .lock(cx)
@@ -2507,9 +2526,19 @@ async fn capture_dispatch_grant_execution(
         snapshot,
     )?;
     workspace.prepare()?;
+    if !base_patches.is_empty() {
+        for patch in base_patches {
+            workspace.apply_patch(patch)?;
+        }
+        workspace.commit_staged_changes("pi orchestration replay base")?;
+    }
 
     let summary = worker.execute(workspace.workspace_path(), &contract).await;
-    let diff = workspace.get_changes();
+    let diff = if base_patches.is_empty() {
+        workspace.get_changes()
+    } else {
+        workspace.get_changes_since_head()
+    };
     let verification = execute_task_verification(workspace.workspace_path(), &contract).await;
     let teardown_result = workspace.teardown();
 
@@ -2713,6 +2742,68 @@ async fn execute_inline_dispatch_grant_with_worker(
     .await
 }
 
+async fn execute_dispatch_grants_sequentially_with_replay_base(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    repo_root: &Path,
+    run: RunStatus,
+    grants: &[DispatchGrant],
+    worker: &dyn OrchestrationInlineWorker,
+) -> Result<RunStatus> {
+    let mut updated_run = run;
+    let mut replay_base_patches = Vec::new();
+
+    for grant in grants {
+        let capture = match capture_dispatch_grant_execution_with_base_patches(
+            cx,
+            reliability_state,
+            repo_root,
+            grant,
+            worker,
+            &replay_base_patches,
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            Err(err) => {
+                rollback_dispatch_grant(
+                    cx,
+                    session,
+                    reliability_state,
+                    orchestration_state,
+                    run_store,
+                    &updated_run.run_id,
+                    grant,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        let replay_patch = capture.diff.clone();
+        updated_run = finalize_captured_dispatch_execution(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            repo_root,
+            &updated_run.run_id,
+            capture,
+        )
+        .await?;
+
+        if !replay_patch.trim().is_empty() {
+            replay_base_patches.push(replay_patch);
+        }
+    }
+
+    Ok(updated_run)
+}
+
 async fn execute_dispatch_grants_with_worker(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -2756,22 +2847,18 @@ async fn execute_dispatch_grants_with_worker(
         }
 
         if captured_dispatches_overlap(&captures) {
-            let mut updated_run = run;
-            for grant in grants {
-                updated_run = execute_inline_dispatch_grant_with_worker(
-                    cx,
-                    session,
-                    reliability_state,
-                    orchestration_state,
-                    run_store,
-                    repo_root,
-                    &updated_run.run_id,
-                    grant,
-                    worker,
-                )
-                .await?;
-            }
-            return Ok(updated_run);
+            return execute_dispatch_grants_sequentially_with_replay_base(
+                cx,
+                session,
+                reliability_state,
+                orchestration_state,
+                run_store,
+                repo_root,
+                run,
+                grants,
+                worker,
+            )
+            .await;
         }
 
         let mut updated_run = run;
@@ -8183,6 +8270,38 @@ mod tests {
         }
     }
 
+    struct OverlapReplayFixtureWorker {
+        target: String,
+    }
+
+    #[async_trait]
+    impl OrchestrationInlineWorker for OverlapReplayFixtureWorker {
+        async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+            let target = workspace_path.join(&self.target);
+            let mut contents =
+                fs::read_to_string(&target).map_err(|err| Error::Io(Box::new(err)))?;
+
+            match task.task_id.as_str() {
+                "task-overlap-a" => contents.push_str("// alpha\n"),
+                "task-overlap-b" => {
+                    if contents.contains("alpha") {
+                        contents.push_str("// beta-after-alpha\n");
+                    } else {
+                        contents.push_str("// beta-alone\n");
+                    }
+                }
+                other => {
+                    return Err(Error::validation(format!(
+                        "unexpected overlap replay task: {other}"
+                    )));
+                }
+            }
+
+            fs::write(&target, contents).map_err(|err| Error::Io(Box::new(err)))?;
+            Ok(format!("Updated {}", task.task_id))
+        }
+    }
+
     #[test]
     fn reliability_external_lease_provider_conflicts() {
         let provider = Arc::new(reliability::InMemoryExternalLeaseProvider::default());
@@ -9051,6 +9170,98 @@ mod tests {
                 .expect("read updated extra file");
             assert!(lib_contents.contains("task_parallel_a"));
             assert!(extra_contents.contains("task_parallel_b"));
+        });
+    }
+
+    #[test]
+    fn orchestration_overlap_replay_uses_merged_base_state() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract_a = reliability_contract("task-overlap-a", Vec::new());
+            contract_a.input_snapshot = Some(head.clone());
+            contract_a.verify_command = "true".to_string();
+            contract_a.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let mut contract_b = reliability_contract("task-overlap-b", Vec::new());
+            contract_b.input_snapshot = Some(head);
+            contract_b.verify_command = "true".to_string();
+            contract_b.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let grants = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                vec![
+                    rel.request_dispatch(&contract_a, "worker-a", 120)
+                        .expect("dispatch overlap task a"),
+                    rel.request_dispatch(&contract_b, "worker-b", 120)
+                        .expect("dispatch overlap task b"),
+                ]
+            };
+
+            let mut run = RunStatus::new(
+                "run-overlap-replay",
+                "Overlap replay fixture",
+                ExecutionTier::Wave,
+            );
+            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+            run.run_verify_command =
+                "grep -q \"beta-after-alpha\" src/lib.rs && ! grep -q \"beta-alone\" src/lib.rs"
+                    .to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = OverlapReplayFixtureWorker {
+                target: "src/lib.rs".to_string(),
+            };
+            let updated_run = execute_dispatch_grants_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                run,
+                &grants,
+                &worker,
+            )
+            .await
+            .expect("execute overlap replay");
+
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert!(
+                updated_run
+                    .latest_run_verify
+                    .as_ref()
+                    .is_some_and(|verify| verify.ok)
+            );
+
+            let lib_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
+            assert!(lib_contents.contains("// alpha"));
+            assert!(lib_contents.contains("// beta-after-alpha"));
+            assert!(!lib_contents.contains("// beta-alone"));
         });
     }
 
