@@ -18,9 +18,12 @@ use pi::auth::AuthStorage;
 use pi::config::Config;
 use pi::extensions::{ExtensionManager, ExtensionRegion, ExtensionUiRequest};
 use pi::http::client::Client;
-use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
+use pi::model::{
+    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall, Usage,
+    UserContent,
+};
 use pi::models::ModelEntry;
-use pi::provider::{InputType, Model, ModelCost, Provider};
+use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::providers::openai::OpenAIProvider;
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, RpcScopedModel, run};
@@ -32,6 +35,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -120,6 +124,103 @@ impl Provider for NoopProvider {
                 message,
             },
         )])))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScriptedStep {
+    stop_reason: StopReason,
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Debug)]
+struct ScriptedProvider {
+    steps: Vec<ScriptedStep>,
+    call_count: AtomicUsize,
+}
+
+impl ScriptedProvider {
+    fn new(steps: Vec<ScriptedStep>) -> Self {
+        Self {
+            steps,
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn assistant_message(&self, step: &ScriptedStep) -> AssistantMessage {
+        AssistantMessage {
+            content: step.content.clone(),
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            usage: Usage::default(),
+            stop_reason: step.stop_reason,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Provider for ScriptedProvider {
+    fn name(&self) -> &str {
+        "scripted-provider"
+    }
+
+    fn api(&self) -> &str {
+        "scripted-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "scripted-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> pi::error::Result<
+        Pin<Box<dyn futures::Stream<Item = pi::error::Result<StreamEvent>> + Send>>,
+    > {
+        let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let Some(step) = self.steps.get(index) else {
+            return Err(pi::error::Error::api(format!(
+                "scripted provider exhausted its steps at call {index}"
+            )));
+        };
+        let partial = AssistantMessage {
+            content: Vec::new(),
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        let message = self.assistant_message(step);
+        Ok(Box::pin(stream::iter(vec![
+            Ok(StreamEvent::Start { partial }),
+            Ok(StreamEvent::Done {
+                reason: message.stop_reason,
+                message,
+            }),
+        ])))
+    }
+}
+
+fn text_step(text: &str) -> ScriptedStep {
+    ScriptedStep {
+        stop_reason: StopReason::Stop,
+        content: vec![ContentBlock::Text(TextContent::new(text))],
+    }
+}
+
+fn tool_step(tool_call: ToolCall) -> ScriptedStep {
+    ScriptedStep {
+        stop_reason: StopReason::ToolUse,
+        content: vec![ContentBlock::ToolCall(tool_call)],
     }
 }
 
@@ -757,6 +858,107 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
         assert_ok(&get, "orchestration.get_run");
         assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
         assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 1);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_orchestration_dispatch_run_applies_created_file_changes() {
+    let harness = TestHarness::new("rpc_orchestration_dispatch_run_applies_created_file_changes");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-create-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-create");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(vec![
+            tool_step(ToolCall {
+                id: "write-new-file".to_string(),
+                name: "write".to_string(),
+                arguments: json!({
+                    "path": "src/new_file.rs",
+                    "content": "pub fn created_fixture() {}\n"
+                }),
+                thought_signature: None,
+            }),
+            text_step("Created src/new_file.rs and verified the task."),
+        ]));
+        let agent_session =
+            build_agent_session_with_provider(Session::in_memory(), provider, &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise inline orchestration file creation through public RPC",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-create",
+                    "objective": "Create a new source file",
+                    "verifyCommand": "test -f src/new_file.rs",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-create"],
+                    "plannedTouches": ["src/new_file.rs"]
+                }
+            ],
+            "runVerifyCommand": "test -f src/new_file.rs",
+            "runVerifyTimeoutSec": 30
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(
+            dispatch["data"]["run"]["taskReports"]["task-e2e-create"]["changedFiles"],
+            json!(["src/new_file.rs"])
+        );
+        assert_eq!(
+            dispatch["data"]["run"]["taskReports"]["task-e2e-create"]["verifyExitCode"],
+            0
+        );
+
+        let created_contents =
+            std::fs::read_to_string(repo_path.join("src/new_file.rs")).expect("read created file");
+        assert!(created_contents.contains("created_fixture"));
+
+        let get_cmd = json!({
+            "id": "3",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&get, "orchestration.get_run");
+        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(
+            get["data"]["run"]["taskReports"]["task-e2e-create"]["changedFiles"],
+            json!(["src/new_file.rs"])
+        );
 
         drop(in_tx);
         let result = server.await;

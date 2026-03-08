@@ -2261,6 +2261,62 @@ fn apply_diff_to_repo(repo_root: &Path, diff: &str) -> Result<()> {
 }
 
 #[allow(dead_code)]
+fn repo_worktree_diff_against_snapshot(repo_root: &Path, snapshot: &str) -> Result<String> {
+    let temp_dir = tempfile::tempdir().map_err(|err| Error::Io(Box::new(err)))?;
+    let index_path = temp_dir.path().join("orchestration.index");
+
+    let read_tree = Command::new("git")
+        .current_dir(repo_root)
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["read-tree", snapshot])
+        .output()
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    if !read_tree.status.success() {
+        return Err(Error::tool(
+            "orchestration",
+            format!(
+                "failed to seed temporary index from snapshot {snapshot}: {}",
+                String::from_utf8_lossy(&read_tree.stderr).trim()
+            ),
+        ));
+    }
+
+    let add_all = Command::new("git")
+        .current_dir(repo_root)
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["add", "--all"])
+        .output()
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    if !add_all.status.success() {
+        return Err(Error::tool(
+            "orchestration",
+            format!(
+                "failed to capture parent worktree state: {}",
+                String::from_utf8_lossy(&add_all.stderr).trim()
+            ),
+        ));
+    }
+
+    let diff_output = Command::new("git")
+        .current_dir(repo_root)
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["diff", "--cached", "--binary", snapshot])
+        .output()
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    if !diff_output.status.success() {
+        return Err(Error::tool(
+            "orchestration",
+            format!(
+                "failed to diff parent worktree against snapshot {snapshot}: {}",
+                String::from_utf8_lossy(&diff_output.stderr).trim()
+            ),
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&diff_output.stdout).into_owned())
+}
+
+#[allow(dead_code)]
 fn task_contract_for_runtime_task(
     reliability: &RpcReliabilityState,
     task_id: &str,
@@ -2523,21 +2579,31 @@ async fn capture_dispatch_grant_execution_with_base_patches(
         repo_root,
         dispatch_workspace_segment_id(grant),
         assigned_files,
-        snapshot,
+        snapshot.clone(),
     )?;
     workspace.prepare()?;
+    let mut layered_base = false;
     if !base_patches.is_empty() {
         for patch in base_patches {
             workspace.apply_patch(patch)?;
         }
+        layered_base = true;
+    } else {
+        let parent_base_patch = repo_worktree_diff_against_snapshot(repo_root, &snapshot)?;
+        if !parent_base_patch.trim().is_empty() {
+            workspace.apply_patch(&parent_base_patch)?;
+            layered_base = true;
+        }
+    }
+    if layered_base {
         workspace.commit_staged_changes("pi orchestration replay base")?;
     }
 
     let summary = worker.execute(workspace.workspace_path(), &contract).await;
-    let diff = if base_patches.is_empty() {
-        workspace.get_changes()
-    } else {
+    let diff = if layered_base {
         workspace.get_changes_since_head()
+    } else {
+        workspace.get_changes()
     };
     let verification = execute_task_verification(workspace.workspace_path(), &contract).await;
     let teardown_result = workspace.teardown();
@@ -9257,6 +9323,120 @@ mod tests {
                     .is_some_and(|verify| verify.ok)
             );
 
+            let lib_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
+            assert!(lib_contents.contains("// alpha"));
+            assert!(lib_contents.contains("// beta-after-alpha"));
+            assert!(!lib_contents.contains("// beta-alone"));
+        });
+    }
+
+    #[test]
+    fn orchestration_sequential_dispatch_rebases_on_parent_worktree_base() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract_a = reliability_contract("task-overlap-a", Vec::new());
+            contract_a.input_snapshot = Some(head.clone());
+            contract_a.verify_command = "true".to_string();
+            contract_a.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let mut contract_b = reliability_contract("task-overlap-b", Vec::new());
+            contract_b.input_snapshot = Some(head);
+            contract_b.verify_command = "true".to_string();
+            contract_b.planned_touches = vec!["src/lib.rs".to_string()];
+
+            {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.get_or_create_task(&contract_b)
+                    .expect("register second sequential task");
+            }
+
+            let grant_a = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.request_dispatch(&contract_a, "worker-a", 120)
+                    .expect("dispatch first sequential task")
+            };
+
+            let mut run = RunStatus::new(
+                "run-sequential-rebase",
+                "Sequential rebase fixture",
+                ExecutionTier::Wave,
+            );
+            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+            run.run_verify_command = "true".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = OverlapReplayFixtureWorker {
+                target: "src/lib.rs".to_string(),
+            };
+            let after_first = execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-sequential-rebase",
+                &grant_a,
+                &worker,
+            )
+            .await
+            .expect("execute first sequential task");
+            assert!(matches!(
+                after_first.lifecycle,
+                RunLifecycle::Pending | RunLifecycle::Running
+            ));
+
+            let after_first_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read first-wave file");
+            assert!(after_first_contents.contains("// alpha"));
+            assert!(!after_first_contents.contains("// beta-after-alpha"));
+
+            let grant_b = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.request_dispatch(&contract_b, "worker-b", 120)
+                    .expect("dispatch second sequential task")
+            };
+
+            let updated_run = execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-sequential-rebase",
+                &grant_b,
+                &worker,
+            )
+            .await
+            .expect("execute second sequential task");
+
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
             let lib_contents =
                 fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
             assert!(lib_contents.contains("// alpha"));
