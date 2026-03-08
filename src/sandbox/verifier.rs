@@ -250,6 +250,26 @@ impl CleanRoomVerifier {
         })
     }
 
+    fn stage_worktree_changes(&self) -> Result<()> {
+        let output = Command::new("git")
+            .current_dir(&self.worktree)
+            .args(["add", "--all"])
+            .output()
+            .map_err(|e| Error::session(format!("git add --all: {e}")))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        Err(Error::tool(
+            "cleanroom",
+            format!(
+                "Failed to stage worktree changes: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
+
     /// Audit the changes against a constraint set.
     ///
     /// Compares the worktree state against input_snapshot (not HEAD!).
@@ -262,12 +282,14 @@ impl CleanRoomVerifier {
             ));
         }
 
+        self.stage_worktree_changes()?;
+
         let mut violations = Vec::new();
 
         // Get the diff stats against the input snapshot
         let diff_output = Command::new("git")
             .current_dir(&self.worktree)
-            .args(["diff", "--numstat", &self.input_snapshot])
+            .args(["diff", "--cached", "--numstat", &self.input_snapshot])
             .output()
             .map_err(|e| Error::session(format!("git diff numstat: {e}")))?;
 
@@ -346,9 +368,11 @@ impl CleanRoomVerifier {
             ));
         }
 
+        self.stage_worktree_changes()?;
+
         let output = Command::new("git")
             .current_dir(&self.worktree)
-            .args(["diff", &self.input_snapshot])
+            .args(["diff", "--cached", &self.input_snapshot])
             .output()
             .map_err(|e| Error::session(format!("git diff: {e}")))?;
 
@@ -429,6 +453,56 @@ fn path_matches_pattern(path: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn run_git(repo_path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo_path)
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(
+            status.success(),
+            "git {:?} failed in {}",
+            args,
+            repo_path.display()
+        );
+    }
+
+    fn git_stdout(repo_path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn setup_cleanroom_repo() -> (tempfile::TempDir, PathBuf, String) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+        run_git(&repo_path, &["init"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        std::fs::create_dir_all(repo_path.join("src")).expect("mkdir src");
+        std::fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub fn fixture() { println!(\"before\"); }\n",
+        )
+        .expect("write seed file");
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "initial"]);
+        let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
+        (temp_dir, repo_path, head)
+    }
 
     #[test]
     fn test_path_matches_pattern() {
@@ -455,5 +529,50 @@ mod tests {
         assert!(constraints.allowed_paths.is_empty());
         assert!(constraints.forbidden_paths.is_empty());
         assert!(constraints.max_files_changed.is_none());
+    }
+
+    #[test]
+    fn clean_room_get_diff_includes_created_files() {
+        let (temp_dir, repo_path, head) = setup_cleanroom_repo();
+        let verifier =
+            CleanRoomVerifier::new(repo_path, head, temp_dir.path().join("verify-worktree"));
+
+        verifier.prepare().expect("prepare worktree");
+        std::fs::write(
+            verifier.worktree.join("src/new_file.rs"),
+            "pub fn created() {}\n",
+        )
+        .expect("write new file");
+
+        let diff = verifier.get_diff().expect("get diff");
+
+        assert!(diff.contains("new file mode"));
+        assert!(diff.contains("src/new_file.rs"));
+    }
+
+    #[test]
+    fn clean_room_audit_diff_counts_created_files_against_constraints() {
+        let (temp_dir, repo_path, head) = setup_cleanroom_repo();
+        let verifier =
+            CleanRoomVerifier::new(repo_path, head, temp_dir.path().join("verify-worktree"));
+
+        verifier.prepare().expect("prepare worktree");
+        std::fs::write(
+            verifier.worktree.join("src/new_file.rs"),
+            "pub fn created() {}\n",
+        )
+        .expect("write new file");
+
+        let constraints = ConstraintSet {
+            allowed_paths: vec!["src/lib.rs".to_string()],
+            ..ConstraintSet::default()
+        };
+        let violations = verifier.audit_diff(&constraints).expect("audit diff");
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("src/new_file.rs"))
+        );
     }
 }
