@@ -25,7 +25,9 @@ use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
-use crate::orchestration::{ExecutionTier, RunLifecycle, RunStatus, RunStore};
+use crate::orchestration::{
+    ExecutionTier, RunLifecycle, RunStatus, RunStore, TaskReport, WaveStatus,
+};
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
@@ -1346,6 +1348,326 @@ fn select_execution_tier(tasks: &[TaskContract]) -> ExecutionTier {
     }
 }
 
+fn failure_class_label(class: reliability::FailureClass) -> &'static str {
+    match class {
+        reliability::FailureClass::VerificationFailed => "verification_failed",
+        reliability::FailureClass::ScopeCreepDetected => "scope_creep_detected",
+        reliability::FailureClass::MergeConflict => "merge_conflict",
+        reliability::FailureClass::InfraTransient => "infra_transient",
+        reliability::FailureClass::InfraPermanent => "infra_permanent",
+        reliability::FailureClass::HumanBlocker => "human_blocker",
+        reliability::FailureClass::MaxAttemptsExceeded => "max_attempts_exceeded",
+    }
+}
+
+fn runtime_failure_class_label(state: &reliability::RuntimeState) -> Option<String> {
+    match state {
+        reliability::RuntimeState::Recoverable { reason, .. } => {
+            Some(failure_class_label(*reason).to_string())
+        }
+        reliability::RuntimeState::AwaitingHuman { .. } => {
+            Some(failure_class_label(reliability::FailureClass::HumanBlocker).to_string())
+        }
+        reliability::RuntimeState::Terminal(reliability::TerminalState::Failed {
+            class, ..
+        }) => Some(failure_class_label(*class).to_string()),
+        _ => None,
+    }
+}
+
+fn task_report_blockers(state: &reliability::RuntimeState) -> Vec<String> {
+    match state {
+        reliability::RuntimeState::Blocked { waiting_on } => waiting_on.clone(),
+        reliability::RuntimeState::AwaitingHuman {
+            question, context, ..
+        } => {
+            let mut blockers = vec![question.clone()];
+            if !context.trim().is_empty() {
+                blockers.push(context.clone());
+            }
+            blockers
+        }
+        reliability::RuntimeState::Recoverable {
+            handoff_summary,
+            retry_after,
+            ..
+        } => {
+            let mut blockers = Vec::new();
+            if !handoff_summary.trim().is_empty() {
+                blockers.push(handoff_summary.clone());
+            }
+            if let Some(retry_after) = retry_after {
+                blockers.push(format!("retry_after={}", retry_after.to_rfc3339()));
+            }
+            blockers
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn next_active_wave(
+    existing: Option<WaveStatus>,
+    mut active_task_ids: Vec<String>,
+) -> Option<WaveStatus> {
+    active_task_ids.sort();
+    active_task_ids.dedup();
+    if active_task_ids.is_empty() {
+        return None;
+    }
+
+    let now = chrono::Utc::now();
+    if let Some(existing) = existing {
+        let mut existing_task_ids = existing.task_ids.clone();
+        existing_task_ids.sort();
+        existing_task_ids.dedup();
+        if existing.completed_at.is_none() && existing_task_ids == active_task_ids {
+            return Some(existing);
+        }
+    }
+
+    Some(WaveStatus {
+        wave_id: format!("wave-{}", now.timestamp_millis()),
+        task_ids: active_task_ids,
+        started_at: now,
+        completed_at: None,
+    })
+}
+
+fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) -> RunLifecycle {
+    let mut saw_ready = false;
+    let mut saw_running = false;
+    let mut saw_blocked = false;
+    let mut saw_awaiting_human = false;
+    let mut saw_terminal_failure = false;
+    let mut saw_terminal_success = false;
+
+    for task_id in task_ids {
+        let Some(task) = reliability.tasks.get(task_id) else {
+            continue;
+        };
+
+        match &task.runtime.state {
+            reliability::RuntimeState::AwaitingHuman { .. } => saw_awaiting_human = true,
+            reliability::RuntimeState::Leased { .. }
+            | reliability::RuntimeState::Verifying { .. }
+            | reliability::RuntimeState::Recoverable { .. } => saw_running = true,
+            reliability::RuntimeState::Blocked { .. } => saw_blocked = true,
+            reliability::RuntimeState::Ready => saw_ready = true,
+            reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded {
+                ..
+            })
+            | reliability::RuntimeState::Terminal(reliability::TerminalState::Superseded {
+                ..
+            }) => {
+                saw_terminal_success = true;
+            }
+            reliability::RuntimeState::Terminal(reliability::TerminalState::Failed { .. })
+            | reliability::RuntimeState::Terminal(reliability::TerminalState::Canceled {
+                ..
+            }) => {
+                saw_terminal_failure = true;
+            }
+        }
+    }
+
+    if saw_awaiting_human {
+        RunLifecycle::AwaitingHuman
+    } else if saw_running {
+        RunLifecycle::Running
+    } else if saw_blocked && !saw_ready {
+        RunLifecycle::Blocked
+    } else if saw_ready || saw_blocked {
+        RunLifecycle::Pending
+    } else if saw_terminal_failure {
+        RunLifecycle::Failed
+    } else if saw_terminal_success {
+        RunLifecycle::Succeeded
+    } else {
+        RunLifecycle::Pending
+    }
+}
+
+fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
+    let preserve_canceled = matches!(run.lifecycle, RunLifecycle::Canceled);
+    run.task_counts = reliability.task_counts_for(&run.task_ids);
+
+    let active_task_ids = run
+        .task_ids
+        .iter()
+        .filter_map(|task_id| {
+            let task = reliability.tasks.get(task_id)?;
+            match &task.runtime.state {
+                reliability::RuntimeState::Leased { .. }
+                | reliability::RuntimeState::Verifying { .. } => Some(task_id.clone()),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    run.active_wave = next_active_wave(run.active_wave.take(), active_task_ids);
+
+    if !preserve_canceled {
+        run.lifecycle = derive_run_lifecycle(reliability, &run.task_ids);
+    }
+    run.touch();
+}
+
+fn build_submit_task_report(
+    reliability: &RpcReliabilityState,
+    req: &SubmitTaskRequest,
+    result: &SubmitTaskResponse,
+) -> Result<TaskReport> {
+    let task = reliability.tasks.get(&result.task_id).ok_or_else(|| {
+        Error::validation(format!("Unknown reliability task: {}", result.task_id))
+    })?;
+
+    let evidence = reliability
+        .evidence_by_task
+        .get(&result.task_id)
+        .cloned()
+        .unwrap_or_default();
+    let verify_exit_code = evidence
+        .last()
+        .map(|record| record.exit_code)
+        .unwrap_or_else(|| {
+            if req.verify_timed_out {
+                124
+            } else if req.verify_passed.unwrap_or(result.close.approved) {
+                0
+            } else {
+                1
+            }
+        });
+
+    let attempt = match &task.runtime.state {
+        reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded { .. }) => {
+            task.runtime.attempt.saturating_add(1).max(1)
+        }
+        _ => task.runtime.attempt.max(1),
+    };
+    let summary = if result.close.approved {
+        result.close_payload.outcome.clone()
+    } else if result.close.violations.is_empty() {
+        format!("task {} closed without approval", result.task_id)
+    } else {
+        result.close.violations.join("; ")
+    };
+
+    let verify_command = match &task.spec.verify {
+        reliability::VerifyPlan::Standard { command, .. } => command.clone(),
+    };
+
+    Ok(TaskReport {
+        task_id: result.task_id.clone(),
+        attempt,
+        summary,
+        changed_files: req.changed_files.clone(),
+        patch_digest: req.patch_digest.clone(),
+        evidence_ids: result.close_payload.evidence_ids.clone(),
+        acceptance_ids: if result.close_payload.acceptance_ids.is_empty() {
+            task.spec.acceptance_ids.clone()
+        } else {
+            result.close_payload.acceptance_ids.clone()
+        },
+        verify_command,
+        verify_exit_code,
+        failure_class: runtime_failure_class_label(&task.runtime.state).or_else(|| {
+            req.failure_class
+                .map(|class| failure_class_label(class).to_string())
+        }),
+        blockers: task_report_blockers(&task.runtime.state),
+        workspace_snapshot: task.spec.input_snapshot.clone(),
+        generated_at: chrono::Utc::now(),
+    })
+}
+
+fn build_runtime_task_report(
+    reliability: &RpcReliabilityState,
+    task_id: &str,
+    summary: String,
+) -> Option<TaskReport> {
+    let task = reliability.tasks.get(task_id)?;
+    let evidence = reliability
+        .evidence_by_task
+        .get(task_id)
+        .cloned()
+        .unwrap_or_default();
+    let verify_command = match &task.spec.verify {
+        reliability::VerifyPlan::Standard { command, .. } => command.clone(),
+    };
+    Some(TaskReport {
+        task_id: task_id.to_string(),
+        attempt: task.runtime.attempt.max(1),
+        summary,
+        changed_files: Vec::new(),
+        patch_digest: String::new(),
+        evidence_ids: evidence
+            .iter()
+            .map(|record| record.evidence_id.clone())
+            .collect(),
+        acceptance_ids: task.spec.acceptance_ids.clone(),
+        verify_command,
+        verify_exit_code: evidence.last().map(|record| record.exit_code).unwrap_or(0),
+        failure_class: runtime_failure_class_label(&task.runtime.state),
+        blockers: task_report_blockers(&task.runtime.state),
+        workspace_snapshot: task.spec.input_snapshot.clone(),
+        generated_at: chrono::Utc::now(),
+    })
+}
+
+fn refresh_task_runs(
+    reliability: &RpcReliabilityState,
+    orchestration: &mut RpcOrchestrationState,
+    task_id: &str,
+    report: Option<TaskReport>,
+) -> Vec<RunStatus> {
+    let run_ids = orchestration.run_ids_for_task(task_id);
+    let mut updated_runs = Vec::new();
+
+    for run_id in run_ids {
+        let Some(mut run) = orchestration.get_run(&run_id) else {
+            continue;
+        };
+        if let Some(report) = report
+            .as_ref()
+            .filter(|report| run.task_ids.contains(&report.task_id))
+        {
+            run.upsert_task_report(report.clone());
+        }
+        refresh_run_from_reliability(reliability, &mut run);
+        orchestration.update_run(run.clone());
+        updated_runs.push(run);
+    }
+
+    updated_runs
+}
+
+async fn sync_task_runs(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    task_id: &str,
+    report: Option<TaskReport>,
+) -> Result<Vec<RunStatus>> {
+    let updated_runs = {
+        let reliability = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        refresh_task_runs(&reliability, &mut orchestration, task_id, report)
+    };
+
+    for run in &updated_runs {
+        persist_run_status(cx, session, run_store, run).await?;
+    }
+    Ok(updated_runs)
+}
+
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
     if images.is_empty() {
@@ -2040,7 +2362,7 @@ pub async fn run(
                     }
                     rel.promote_recoverable_due();
                     rel.evaluate_dag_unblock();
-                    status.task_counts = rel.task_counts_for(&task_ids);
+                    refresh_run_from_reliability(&rel, &mut status);
                     Ok::<(), Error>(())
                 };
                 if let Err(err) = result {
@@ -2228,6 +2550,13 @@ pub async fn run(
                 ) {
                     run.lifecycle = RunLifecycle::Pending;
                 }
+                {
+                    let rel = reliability_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                    refresh_run_from_reliability(&rel, &mut run);
+                }
                 run.touch();
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
@@ -2324,6 +2653,25 @@ pub async fn run(
                     guard.persist_session().await?;
                 }
 
+                if let Err(err) = sync_task_runs(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &grant.task_id,
+                    None,
+                )
+                .await
+                {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "reliability.request_dispatch",
+                        &err,
+                    ));
+                    continue;
+                }
+
                 let _ = out_tx.send(response_ok(
                     id,
                     "reliability.request_dispatch",
@@ -2399,6 +2747,7 @@ pub async fn run(
                         }
                     };
 
+                let req_for_report = req.clone();
                 let result = {
                     let mut rel = reliability_state
                         .lock(&cx)
@@ -2439,6 +2788,43 @@ pub async fn run(
                         );
                     }
                     guard.persist_session().await?;
+                }
+
+                let report = {
+                    let rel = reliability_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                    build_submit_task_report(&rel, &req_for_report, &result)
+                };
+                let report = match report {
+                    Ok(report) => report,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "reliability.submit_task",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
+                if let Err(err) = sync_task_runs(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &result.task_id,
+                    Some(report),
+                )
+                .await
+                {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "reliability.submit_task",
+                        &err,
+                    ));
+                    continue;
                 }
 
                 let _ = out_tx.send(response_ok(
@@ -2493,18 +2879,49 @@ pub async fn run(
                         })?;
                         if raised {
                             inner_session.append_human_blocker_raised_entry(
-                                task_id_for_note,
+                                task_id_for_note.clone(),
                                 "raised via rpc.resolve_blocker".to_string(),
                                 format!("state={state}"),
                             );
                         } else {
                             inner_session.append_human_blocker_resolved_entry(
-                                task_id_for_note,
+                                task_id_for_note.clone(),
                                 format!("state={state}"),
                             );
                         }
                     }
                     guard.persist_session().await?;
+                }
+
+                let report = {
+                    let rel = reliability_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                    let summary = if raised {
+                        format!("Human blocker raised: state={state}")
+                    } else {
+                        format!("Blocker resolved: state={state}")
+                    };
+                    build_runtime_task_report(&rel, &task_id_for_note, summary)
+                };
+                if let Err(err) = sync_task_runs(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &task_id_for_note,
+                    report,
+                )
+                .await
+                {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "reliability.resolve_blocker",
+                        &err,
+                    ));
+                    continue;
                 }
 
                 let _ = out_tx.send(response_ok(
@@ -5967,10 +6384,10 @@ mod tests {
     #[test]
     fn orchestration_tier_selection_prefers_hierarchical_for_deep_graphs() {
         let mut tasks = Vec::new();
-        let mut previous = None;
+        let mut previous: Option<String> = None;
         for index in 0..5 {
             let task_id = format!("task-{index}");
-            let prerequisites = previous
+            let prerequisites: Vec<_> = previous
                 .iter()
                 .map(|prior| TaskPrerequisite {
                     task_id: prior.clone(),
@@ -6007,6 +6424,157 @@ mod tests {
         assert_eq!(
             orchestration.run_ids_for_task("task-b"),
             vec!["run-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_tracks_active_wave_for_running_tasks() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_a = reliability_contract("task-a", Vec::new());
+        let contract_b = reliability_contract("task-b", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+        reliability
+            .request_dispatch(&contract_a, "agent-1", 60)
+            .expect("dispatch task a");
+
+        let mut run = RunStatus::new("run-wave", "Wave", ExecutionTier::Wave);
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Running);
+        assert_eq!(run.task_counts.get("leased"), Some(&1));
+        assert_eq!(run.task_counts.get("ready"), Some(&1));
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_submit_rollup_marks_success_and_captures_task_report() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
+        let contract = reliability_contract("task-success", Vec::new());
+        let grant = reliability
+            .request_dispatch(&contract, "agent-1", 60)
+            .expect("dispatch");
+        let evidence = reliability
+            .append_evidence(AppendEvidenceRequest {
+                task_id: contract.task_id.clone(),
+                command: "cargo test".to_string(),
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                artifact_ids: Vec::new(),
+                env_id: None,
+            })
+            .expect("evidence");
+        let req = SubmitTaskRequest {
+            task_id: contract.task_id.clone(),
+            lease_id: grant.lease_id,
+            fence_token: grant.fence_token,
+            patch_digest: "sha256:success".to_string(),
+            verify_run_id: "vr-success".to_string(),
+            verify_passed: Some(true),
+            verify_timed_out: false,
+            failure_class: None,
+            changed_files: vec!["src/rpc.rs".to_string()],
+            symbol_drift_violations: Vec::new(),
+            close: Some(ClosePayload {
+                task_id: contract.task_id.clone(),
+                outcome: "Implemented orchestration report".to_string(),
+                outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+                acceptance_ids: contract.acceptance_ids.clone(),
+                evidence_ids: vec![evidence.evidence_id.clone()],
+                trace_parent: contract.parent_goal_trace_id.clone(),
+            }),
+        };
+        let result = reliability.submit_task(req.clone()).expect("submit");
+        let report = build_submit_task_report(&reliability, &req, &result).expect("task report");
+
+        let mut orchestration = RpcOrchestrationState::default();
+        let mut run = RunStatus::new("run-success", "Run success", ExecutionTier::Inline);
+        run.task_ids = vec![contract.task_id.clone()];
+        orchestration.register_run(run);
+
+        let updated = refresh_task_runs(
+            &reliability,
+            &mut orchestration,
+            &contract.task_id,
+            Some(report),
+        );
+        let run = updated.first().expect("updated run");
+        let task_report = run
+            .task_reports
+            .get(&contract.task_id)
+            .expect("persisted task report");
+
+        assert_eq!(run.lifecycle, RunLifecycle::Succeeded);
+        assert_eq!(task_report.summary, "Implemented orchestration report");
+        assert_eq!(task_report.verify_exit_code, 0);
+        assert_eq!(task_report.changed_files, vec!["src/rpc.rs".to_string()]);
+    }
+
+    #[test]
+    fn orchestration_blocker_rollup_marks_awaiting_human() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract = reliability_contract("task-blocker", Vec::new());
+        let grant = reliability
+            .request_dispatch(&contract, "agent-1", 60)
+            .expect("dispatch");
+        let state = reliability
+            .resolve_blocker(BlockerReport {
+                task_id: contract.task_id.clone(),
+                lease_id: grant.lease_id,
+                fence_token: grant.fence_token,
+                reason: "Need approval".to_string(),
+                context: "Waiting on API credentials".to_string(),
+                defer_trigger: None,
+                resolved: false,
+            })
+            .expect("blocker");
+        let report = build_runtime_task_report(
+            &reliability,
+            &contract.task_id,
+            format!("Human blocker raised: state={state}"),
+        )
+        .expect("runtime report");
+
+        let mut orchestration = RpcOrchestrationState::default();
+        let mut run = RunStatus::new("run-blocked", "Run blocked", ExecutionTier::Inline);
+        run.task_ids = vec![contract.task_id.clone()];
+        orchestration.register_run(run);
+
+        let updated = refresh_task_runs(
+            &reliability,
+            &mut orchestration,
+            &contract.task_id,
+            Some(report),
+        );
+        let run = updated.first().expect("updated run");
+        let task_report = run
+            .task_reports
+            .get(&contract.task_id)
+            .expect("persisted task report");
+
+        assert_eq!(run.lifecycle, RunLifecycle::AwaitingHuman);
+        assert_eq!(task_report.failure_class.as_deref(), Some("human_blocker"));
+        assert!(
+            task_report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("Need approval"))
         );
     }
 
