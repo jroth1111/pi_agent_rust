@@ -1552,11 +1552,19 @@ fn task_terminal_success(reliability: &RpcReliabilityState, task_id: &str) -> bo
     })
 }
 
+fn run_terminal_success(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
+    !run.task_ids.is_empty()
+        && run
+            .task_ids
+            .iter()
+            .all(|task_id| task_terminal_success(reliability, task_id))
+}
+
 fn completed_run_verify_scope(
     reliability: &RpcReliabilityState,
     run: &RunStatus,
 ) -> Option<CompletedRunVerifyScope> {
-    if run.run_verify_command.trim().is_empty() {
+    if run.run_verify_command.trim().is_empty() || !run_terminal_success(reliability, run) {
         return None;
     }
 
@@ -9691,6 +9699,88 @@ mod tests {
         assert_eq!(scope.scope_id, "wave-1");
         assert_eq!(scope.scope_kind, RunVerifyScopeKind::Wave);
         assert_eq!(scope.subrun_id, None);
+    }
+
+    #[test]
+    fn orchestration_completed_run_verify_scope_waits_for_full_run_completion() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, true, true);
+        let contract_a = reliability_contract("task-wave-a", Vec::new());
+        let contract_b = reliability_contract(
+            "task-wave-b",
+            vec![TaskPrerequisite {
+                task_id: contract_a.task_id.clone(),
+                trigger: reliability::EdgeTrigger::OnSuccess,
+            }],
+        );
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+        reliability
+            .reconcile_prerequisites(&contract_b)
+            .expect("reconcile prerequisite");
+
+        let grant_a = reliability
+            .request_dispatch_existing(&contract_a.task_id, "agent-a", 60)
+            .expect("dispatch task a");
+        let evidence = reliability
+            .append_evidence(AppendEvidenceRequest {
+                task_id: contract_a.task_id.clone(),
+                command: "cargo test".to_string(),
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                artifact_ids: Vec::new(),
+                env_id: None,
+            })
+            .expect("append evidence");
+        reliability
+            .submit_task(SubmitTaskRequest {
+                task_id: contract_a.task_id.clone(),
+                lease_id: grant_a.lease_id,
+                fence_token: grant_a.fence_token,
+                patch_digest: "sha256:task-wave-a".to_string(),
+                verify_run_id: "vr-wave-a".to_string(),
+                verify_passed: Some(true),
+                verify_timed_out: false,
+                failure_class: None,
+                changed_files: vec!["src/task-wave-a.rs".to_string()],
+                symbol_drift_violations: Vec::new(),
+                close: Some(ClosePayload {
+                    task_id: contract_a.task_id.clone(),
+                    outcome: format!("Completed {}", contract_a.task_id),
+                    outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+                    acceptance_ids: contract_a.acceptance_ids.clone(),
+                    evidence_ids: vec![evidence.evidence_id],
+                    trace_parent: contract_a.parent_goal_trace_id.clone(),
+                }),
+            })
+            .expect("submit success");
+        reliability.refresh_dependency_states();
+
+        let mut run = RunStatus::new(
+            "run-wave-intermediate",
+            "Run verify waits for terminal run",
+            ExecutionTier::Wave,
+        );
+        run.run_verify_command = "true".to_string();
+        run.run_verify_timeout_sec = Some(30);
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        run.active_wave = Some(WaveStatus {
+            wave_id: "wave-1".to_string(),
+            task_ids: vec![contract_a.task_id.clone()],
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+        });
+
+        assert!(
+            completed_run_verify_scope(&reliability, &run).is_none(),
+            "run verify should wait until all run tasks succeed"
+        );
     }
 
     #[test]

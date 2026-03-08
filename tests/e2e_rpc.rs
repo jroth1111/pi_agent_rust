@@ -1062,6 +1062,150 @@ fn rpc_orchestration_dispatch_run_advances_dependency_waves() {
 }
 
 #[test]
+fn rpc_orchestration_dispatch_run_rebases_same_touch_dependency_chain() {
+    let harness =
+        TestHarness::new("rpc_orchestration_dispatch_run_rebases_same_touch_dependency_chain");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-overlap-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-overlap");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(vec![
+            tool_step(ToolCall {
+                id: "write-alpha".to_string(),
+                name: "write".to_string(),
+                arguments: json!({
+                    "path": "shared.txt",
+                    "content": "alpha\n"
+                }),
+                thought_signature: None,
+            }),
+            text_step("Created shared.txt with alpha."),
+            tool_step(ToolCall {
+                id: "write-beta".to_string(),
+                name: "edit".to_string(),
+                arguments: json!({
+                    "path": "shared.txt",
+                    "oldText": "alpha\n",
+                    "newText": "alpha\nbeta-after-alpha\n"
+                }),
+                thought_signature: None,
+            }),
+            text_step("Updated shared.txt after replaying the alpha base."),
+        ]));
+        let agent_session =
+            build_agent_session_with_provider(Session::in_memory(), provider, &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise same-touch dependency replay",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-overlap-a",
+                    "objective": "Create the alpha base file",
+                    "verifyCommand": "grep -q '^alpha$' shared.txt",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-overlap-a"],
+                    "plannedTouches": ["shared.txt"]
+                },
+                {
+                    "taskId": "task-e2e-overlap-b",
+                    "objective": "Extend the shared file using the rebased alpha state",
+                    "verifyCommand": "grep -q 'beta-after-alpha' shared.txt",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-overlap-b"],
+                    "plannedTouches": ["shared.txt"],
+                    "prerequisites": [
+                        {
+                            "taskId": "task-e2e-overlap-a"
+                        }
+                    ]
+                }
+            ],
+            "runVerifyCommand": "grep -q '^alpha$' shared.txt && grep -q 'beta-after-alpha' shared.txt",
+            "runVerifyTimeoutSec": 30,
+            "maxParallelism": 2
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        let grants = dispatch["data"]["grants"]
+            .as_array()
+            .expect("dispatch grants");
+        assert!(
+            grants.is_empty(),
+            "automated same-touch dependency dispatch should not return live leases"
+        );
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(
+            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-a"]["verifyExitCode"],
+            0
+        );
+        assert_eq!(
+            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-b"]["verifyExitCode"],
+            0
+        );
+        assert_eq!(
+            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-a"]["changedFiles"],
+            json!(["shared.txt"])
+        );
+        assert_eq!(
+            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-b"]["changedFiles"],
+            json!(["shared.txt"])
+        );
+
+        let shared_contents =
+            std::fs::read_to_string(repo_path.join("shared.txt")).expect("read shared file");
+        assert!(shared_contents.contains("alpha"));
+        assert!(shared_contents.contains("beta-after-alpha"));
+        assert!(!shared_contents.contains("beta-alone"));
+
+        let get_cmd = json!({
+            "id": "3",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&get, "orchestration.get_run");
+        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(
+            get["data"]["run"]["taskReports"]["task-e2e-overlap-b"]["verifyExitCode"],
+            0
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_orchestration_resume_reruns_failed_run_verification() {
     let harness = TestHarness::new("rpc_orchestration_resume_reruns_failed_run_verification");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
