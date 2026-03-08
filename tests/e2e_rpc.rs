@@ -1309,6 +1309,114 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
 }
 
 #[test]
+fn rpc_orchestration_resume_run_redispatches_due_recoverable_task() {
+    let harness =
+        TestHarness::new("rpc_orchestration_resume_run_redispatches_due_recoverable_task");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-recoverable-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-recoverable");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let task_contract = json!({
+            "taskId": "task-e2e-recoverable",
+            "objective": "Complete recoverable task after defer",
+            "verifyCommand": "true",
+            "inputSnapshot": head,
+            "acceptanceIds": ["ac-recoverable"],
+            "plannedTouches": ["Cargo.toml"]
+        });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise orchestration recoverable resume",
+            "tasks": [task_contract.clone()],
+            "runVerifyCommand": "true"
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+
+        let request_dispatch_cmd = json!({
+            "id": "2",
+            "type": "reliability.request_dispatch",
+            "contract": task_contract,
+            "agentId": "manual-recoverable",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch = send_recv(
+            &in_tx,
+            &out_rx,
+            &request_dispatch_cmd,
+            "reliability.request_dispatch",
+        )
+        .await;
+        assert_ok(&dispatch, "reliability.request_dispatch");
+
+        let defer_until = chrono::Utc::now() + chrono::Duration::milliseconds(250);
+        let resolve_blocker_cmd = json!({
+            "id": "3",
+            "type": "reliability.resolve_blocker",
+            "taskId": "task-e2e-recoverable",
+            "leaseId": dispatch["data"]["grant"]["leaseId"],
+            "fenceToken": dispatch["data"]["grant"]["fenceToken"],
+            "reason": "defer",
+            "context": "retry after a short delay",
+            "deferTrigger": {
+                "trigger": "until",
+                "until": defer_until.to_rfc3339()
+            },
+            "resolved": false
+        })
+        .to_string();
+        let blocked = send_recv(
+            &in_tx,
+            &out_rx,
+            &resolve_blocker_cmd,
+            "reliability.resolve_blocker",
+        )
+        .await;
+        assert_ok(&blocked, "reliability.resolve_blocker");
+        assert_eq!(blocked["data"]["state"], "recoverable");
+
+        std::thread::sleep(Duration::from_millis(350));
+
+        let resume_cmd = json!({
+            "id": "4",
+            "type": "orchestration.resume_run",
+            "runId": run_id
+        })
+        .to_string();
+        let resumed = send_recv(&in_tx, &out_rx, &resume_cmd, "orchestration.resume_run").await;
+        assert_ok(&resumed, "orchestration.resume_run");
+        assert_eq!(resumed["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(
+            resumed["data"]["run"]["taskReports"]["task-e2e-recoverable"]["verifyExitCode"],
+            0
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_orchestration_dispatch_run_executes_hierarchical_run() {
     let harness = TestHarness::new("rpc_orchestration_dispatch_run_executes_hierarchical_run");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()

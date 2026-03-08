@@ -1102,7 +1102,7 @@ impl RpcReliabilityState {
             if !report.resolved && is_defer {
                 if let Some(trigger) = &report.defer_trigger {
                     match trigger {
-                        reliability::DeferTrigger::Until(until) => {
+                        reliability::DeferTrigger::Until { until } => {
                             task.runtime.state = reliability::RuntimeState::Recoverable {
                                 reason: reliability::FailureClass::HumanBlocker,
                                 failure_artifact: None,
@@ -1110,9 +1110,9 @@ impl RpcReliabilityState {
                                 retry_after: Some(*until),
                             };
                         }
-                        reliability::DeferTrigger::DependsOn(dep) => {
+                        reliability::DeferTrigger::DependsOn { task_id } => {
                             task.runtime.state = reliability::RuntimeState::Blocked {
-                                waiting_on: vec![dep.clone()],
+                                waiting_on: vec![task_id.clone()],
                             };
                         }
                     }
@@ -1954,6 +1954,26 @@ fn planned_wave_task_ids(
     scheduled
 }
 
+fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
+    !run.task_ids.is_empty()
+        && run
+            .task_ids
+            .iter()
+            .all(|task_id| reliability.tasks.contains_key(task_id))
+}
+
+fn refresh_live_run_from_reliability(
+    reliability: &mut RpcReliabilityState,
+    run: &mut RunStatus,
+) -> bool {
+    let has_live_tasks = run_has_live_tasks(reliability, run);
+    if has_live_tasks {
+        reliability.refresh_dependency_states();
+        refresh_run_from_reliability(reliability, run);
+    }
+    has_live_tasks
+}
+
 fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
     let preserve_canceled = matches!(run.lifecycle, RunLifecycle::Canceled);
     run.task_counts = reliability.task_counts_for(&run.task_ids);
@@ -2005,7 +2025,7 @@ fn dispatch_run_wave(
     agent_id_prefix: &str,
     lease_ttl_sec: i64,
 ) -> Result<Vec<DispatchGrant>> {
-    refresh_run_from_reliability(reliability, run);
+    refresh_live_run_from_reliability(reliability, run);
     if matches!(
         run.lifecycle,
         RunLifecycle::Canceled | RunLifecycle::Failed | RunLifecycle::Succeeded
@@ -3328,19 +3348,11 @@ async fn refresh_run_if_live(
 ) -> Result<RunStatus> {
     let original = run.clone();
     let has_live_tasks = {
-        let reliability = reliability_state
+        let mut reliability = reliability_state
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        let has_live_tasks = !run.task_ids.is_empty()
-            && run
-                .task_ids
-                .iter()
-                .all(|task_id| reliability.tasks.contains_key(task_id));
-        if has_live_tasks {
-            refresh_run_from_reliability(&reliability, &mut run);
-        }
-        has_live_tasks
+        refresh_live_run_from_reliability(&mut reliability, &mut run)
     };
 
     {
@@ -4357,19 +4369,56 @@ pub async fn run(
                     let cwd = session_workspace_root(&cx, &session).await?;
                     execute_run_verification(&cwd, &mut run, &scope).await;
                 }
-                {
-                    let rel = reliability_state
+                let has_live_tasks = {
+                    let mut rel = reliability_state
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    refresh_run_from_reliability(&rel, &mut run);
-                }
-                run.touch();
+                    refresh_live_run_from_reliability(&mut rel, &mut run)
+                };
+                if has_live_tasks
+                    && !matches!(
+                        run.lifecycle,
+                        RunLifecycle::Canceled
+                            | RunLifecycle::Failed
+                            | RunLifecycle::Succeeded
+                            | RunLifecycle::Blocked
+                            | RunLifecycle::AwaitingHuman
+                    )
                 {
-                    let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.update_run(run.clone());
+                    let (updated_run, _) = match dispatch_run_until_quiescent(
+                        &cx,
+                        &session,
+                        &reliability_state,
+                        &orchestration_state,
+                        &run_store,
+                        &options.config,
+                        run,
+                        "resume",
+                        3600,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.resume_run",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+                    run = updated_run;
+                } else {
+                    run.touch();
+                    {
+                        let mut orchestration =
+                            orchestration_state.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("orchestration lock failed: {err}"))
+                            })?;
+                        orchestration.update_run(run.clone());
+                    }
                 }
                 if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(

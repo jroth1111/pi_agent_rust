@@ -87,8 +87,13 @@ impl FailureClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "trigger", rename_all = "snake_case")]
 pub enum DeferTrigger {
-    Until(DateTime<Utc>),
-    DependsOn(String),
+    Until {
+        until: DateTime<Utc>,
+    },
+    DependsOn {
+        #[serde(rename = "taskId")]
+        task_id: String,
+    },
 }
 
 /// Requirements for planning before execution
@@ -176,5 +181,29 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let deser: PlanRequirement = serde_json::from_str(&json).unwrap();
         assert_eq!(req, deser);
+    }
+
+    #[test]
+    fn defer_trigger_until_serialization_roundtrip() {
+        let trigger = DeferTrigger::Until { until: Utc::now() };
+        let json = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(json["trigger"], "until");
+        assert!(json["until"].is_string());
+
+        let back: DeferTrigger = serde_json::from_value(json).unwrap();
+        assert_eq!(trigger, back);
+    }
+
+    #[test]
+    fn defer_trigger_depends_on_serialization_roundtrip() {
+        let trigger = DeferTrigger::DependsOn {
+            task_id: "task-a".to_string(),
+        };
+        let json = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(json["trigger"], "depends_on");
+        assert_eq!(json["taskId"], "task-a");
+
+        let back: DeferTrigger = serde_json::from_value(json).unwrap();
+        assert_eq!(trigger, back);
     }
 }

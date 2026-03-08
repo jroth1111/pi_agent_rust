@@ -204,11 +204,11 @@ pub fn defer_trigger_to_task(
     reason: String,
 ) -> DeferredTask {
     match trigger {
-        DeferTrigger::Until(datetime) => {
-            let ts = datetime.timestamp() as u64;
+        DeferTrigger::Until { until } => {
+            let ts = until.timestamp() as u64;
             DeferredTask::until_time(task_id, ts, reason)
         }
-        DeferTrigger::DependsOn(blocker) => {
+        DeferTrigger::DependsOn { task_id: blocker } => {
             DeferredTask::until_dependency(task_id, blocker.clone(), reason)
         }
     }
