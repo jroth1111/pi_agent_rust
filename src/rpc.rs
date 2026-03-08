@@ -9446,6 +9446,106 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_dispatch_wave_advances_same_touch_prerequisite_chain() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let contract_a = TaskContract {
+                input_snapshot: Some(head.clone()),
+                verify_command: "true".to_string(),
+                planned_touches: vec!["src/lib.rs".to_string()],
+                ..reliability_contract("task-overlap-a", Vec::new())
+            };
+            let contract_b = TaskContract {
+                input_snapshot: Some(head),
+                verify_command: "true".to_string(),
+                planned_touches: vec!["src/lib.rs".to_string()],
+                prerequisites: vec![TaskPrerequisite {
+                    task_id: "task-overlap-a".to_string(),
+                    trigger: reliability::EdgeTrigger::OnSuccess,
+                }],
+                ..reliability_contract("task-overlap-b", Vec::new())
+            };
+
+            let mut run = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.get_or_create_task(&contract_a)
+                    .expect("register first chain task");
+                rel.get_or_create_task(&contract_b)
+                    .expect("register second chain task");
+                rel.reconcile_prerequisites(&contract_b)
+                    .expect("reconcile prerequisite");
+
+                let mut run = RunStatus::new(
+                    "run-chain-wave",
+                    "Same-touch prerequisite chain",
+                    ExecutionTier::Wave,
+                );
+                run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+                refresh_run_from_reliability(&rel, &mut run);
+                run
+            };
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let first_grant = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                dispatch_run_wave(&mut rel, &mut run, "worker", 120)
+                    .expect("dispatch first wave")
+                    .into_iter()
+                    .next()
+                    .expect("first wave grant")
+            };
+
+            let worker = OverlapReplayFixtureWorker {
+                target: "src/lib.rs".to_string(),
+            };
+            execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-chain-wave",
+                &first_grant,
+                &worker,
+            )
+            .await
+            .expect("execute first wave");
+
+            let mut run =
+                current_run_status(&cx, &orchestration_state, &run_store, "run-chain-wave")
+                    .await
+                    .expect("load updated run");
+            let second_grants = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                dispatch_run_wave(&mut rel, &mut run, "worker", 120).expect("dispatch second wave")
+            };
+
+            assert_eq!(second_grants.len(), 1);
+            assert_eq!(second_grants[0].task_id, "task-overlap-b");
+        });
+    }
+
+    #[test]
     fn orchestration_dispatch_workspace_segment_id_distinguishes_parallel_grants() {
         let left = DispatchGrant {
             task_id: "task-a".to_string(),
