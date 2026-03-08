@@ -482,6 +482,231 @@ fn rpc_get_available_models_populated() {
 }
 
 #[test]
+fn rpc_orchestration_start_dispatch_and_get_run() {
+    let harness = TestHarness::new("rpc_orchestration_start_dispatch_and_get_run");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-dispatch-{}", uuid::Uuid::new_v4().simple());
+
+    runtime.block_on(async move {
+        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise orchestration dispatch",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-a",
+                    "objective": "Complete task A",
+                    "verifyCommand": "cargo test",
+                    "inputSnapshot": "snapshot-a",
+                    "acceptanceIds": ["ac-a"],
+                    "plannedTouches": ["src/task_e2e_a.rs"]
+                },
+                {
+                    "taskId": "task-e2e-b",
+                    "objective": "Complete task B",
+                    "verifyCommand": "cargo test",
+                    "inputSnapshot": "snapshot-b",
+                    "acceptanceIds": ["ac-b"],
+                    "plannedTouches": ["src/task_e2e_b.rs"]
+                }
+            ],
+            "runVerifyCommand": "true",
+            "runVerifyTimeoutSec": 30,
+            "maxParallelism": 2
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        let grants = dispatch["data"]["grants"]
+            .as_array()
+            .expect("dispatch grants");
+        assert_eq!(grants.len(), 2);
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "running");
+
+        let get_cmd = json!({
+            "id": "3",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&get, "orchestration.get_run");
+        assert_eq!(get["data"]["run"]["runId"], run_id);
+        assert_eq!(get["data"]["run"]["taskCounts"]["leased"], 2);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_orchestration_resume_reruns_failed_run_verification() {
+    let harness = TestHarness::new("rpc_orchestration_resume_reruns_failed_run_verification");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let resume_flag = harness.temp_path("run-verify-ok.flag");
+    let resume_flag_str = resume_flag.to_string_lossy().to_string();
+    let run_id = format!("run-e2e-resume-{}", uuid::Uuid::new_v4().simple());
+
+    runtime.block_on(async move {
+        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise run verification resume",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-resume",
+                    "objective": "Complete resumable task",
+                    "verifyCommand": "cargo test",
+                    "inputSnapshot": "snapshot-resume",
+                    "acceptanceIds": ["ac-resume"],
+                    "plannedTouches": ["src/task_e2e_resume.rs"]
+                }
+            ],
+            "runVerifyCommand": format!("test -f {}", resume_flag_str),
+            "runVerifyTimeoutSec": 30
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        let grant = dispatch["data"]["grants"][0].clone();
+
+        let evidence_cmd = json!({
+            "id": "3",
+            "type": "reliability.append_evidence",
+            "taskId": "task-e2e-resume",
+            "command": "cargo test",
+            "exitCode": 0,
+            "stdout": "ok",
+            "stderr": ""
+        })
+        .to_string();
+        let evidence = send_recv(
+            &in_tx,
+            &out_rx,
+            &evidence_cmd,
+            "reliability.append_evidence",
+        )
+        .await;
+        assert_ok(&evidence, "reliability.append_evidence");
+        let evidence_id = evidence["data"]["evidence"]["evidence_id"]
+            .as_str()
+            .expect("evidence id");
+
+        let submit_cmd = json!({
+            "id": "4",
+            "type": "reliability.submit_task",
+            "taskId": "task-e2e-resume",
+            "leaseId": grant["leaseId"].as_str().expect("lease id"),
+            "fenceToken": grant["fenceToken"].as_u64().expect("fence token"),
+            "patchDigest": "sha256:resume",
+            "verifyRunId": "vr-resume",
+            "verifyPassed": true,
+            "verifyTimedOut": false,
+            "changedFiles": ["src/task_e2e_resume.rs"],
+            "close": {
+                "task_id": "task-e2e-resume",
+                "outcome": "Completed resumable task",
+                "outcome_kind": "success",
+                "acceptance_ids": ["ac-resume"],
+                "evidence_ids": [evidence_id],
+                "trace_parent": "goal:task-e2e-resume"
+            }
+        })
+        .to_string();
+        let submit = send_recv(&in_tx, &out_rx, &submit_cmd, "reliability.submit_task").await;
+        assert_ok(&submit, "reliability.submit_task");
+
+        let failed_get_cmd = json!({
+            "id": "5",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let failed_get = send_recv(&in_tx, &out_rx, &failed_get_cmd, "orchestration.get_run").await;
+        assert_ok(&failed_get, "orchestration.get_run");
+        assert_eq!(failed_get["data"]["run"]["lifecycle"], "failed");
+        assert_eq!(failed_get["data"]["run"]["latestRunVerify"]["ok"], false);
+
+        let touch_cmd = json!({
+            "id": "6",
+            "type": "bash",
+            "command": format!("touch {}", resume_flag_str)
+        })
+        .to_string();
+        let touch = send_recv(&in_tx, &out_rx, &touch_cmd, "bash(touch resume flag)").await;
+        assert_ok(&touch, "bash");
+
+        let resume_cmd = json!({
+            "id": "7",
+            "type": "orchestration.resume_run",
+            "runId": run_id
+        })
+        .to_string();
+        let resumed = send_recv(&in_tx, &out_rx, &resume_cmd, "orchestration.resume_run").await;
+        assert_ok(&resumed, "orchestration.resume_run");
+        assert_eq!(resumed["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(resumed["data"]["run"]["latestRunVerify"]["ok"], true);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_set_thinking_level_success() {
     let harness = TestHarness::new("rpc_set_thinking_level_success");
     let cassette_dir = cassette_root();
