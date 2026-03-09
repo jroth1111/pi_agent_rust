@@ -2079,6 +2079,43 @@ fn dispatch_run_wave(
     Ok(grants)
 }
 
+fn cancel_live_run_tasks(reliability: &mut RpcReliabilityState, run: &mut RunStatus) {
+    let leased_grants = run
+        .task_ids
+        .iter()
+        .filter_map(|task_id| {
+            let task = reliability.tasks.get(task_id)?;
+            match &task.runtime.state {
+                reliability::RuntimeState::Leased {
+                    lease_id,
+                    agent_id,
+                    fence_token,
+                    expires_at,
+                } => Some(DispatchGrant {
+                    task_id: task_id.clone(),
+                    agent_id: agent_id.clone(),
+                    lease_id: lease_id.clone(),
+                    fence_token: *fence_token,
+                    expires_at: *expires_at,
+                    state: "leased".to_string(),
+                }),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for grant in &leased_grants {
+        let _ = reliability.expire_dispatch_grant(grant);
+    }
+
+    reliability.refresh_dependency_states();
+    refresh_run_from_reliability(reliability, run);
+    run.lifecycle = RunLifecycle::Canceled;
+    run.active_wave = None;
+    run.active_subrun_id = None;
+    run.touch();
+}
+
 const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const MAX_AUTOMATED_RECOVERABLE_WAIT: Duration = Duration::from_secs(60);
 
@@ -4341,8 +4378,20 @@ pub async fn run(
                         ));
                         continue;
                     };
-                run.lifecycle = RunLifecycle::Canceled;
-                run.touch();
+                {
+                    let mut rel = reliability_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                    if run_has_live_tasks(&rel, &run) {
+                        cancel_live_run_tasks(&mut rel, &mut run);
+                    } else {
+                        run.lifecycle = RunLifecycle::Canceled;
+                        run.active_wave = None;
+                        run.active_subrun_id = None;
+                        run.touch();
+                    }
+                }
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
@@ -8790,6 +8839,53 @@ mod tests {
         assert!(second_grants.is_empty());
         assert_eq!(run.lifecycle, RunLifecycle::Running);
         assert_eq!(run.task_counts.get("leased"), Some(&2));
+    }
+
+    #[test]
+    fn orchestration_cancel_live_run_tasks_expires_leases_and_clears_active_wave() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_a = reliability_contract("task-a", Vec::new());
+        let contract_b = reliability_contract("task-b", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_a)
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&contract_b)
+            .expect("register task b");
+
+        let mut run = RunStatus::new("run-cancel", "Cancel run", ExecutionTier::Wave);
+        run.max_parallelism = 2;
+        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+
+        let grants =
+            dispatch_run_wave(&mut reliability, &mut run, "worker", 120).expect("dispatch run");
+
+        assert_eq!(grants.len(), 2);
+        assert_eq!(run.lifecycle, RunLifecycle::Running);
+        assert!(run.active_wave.is_some());
+
+        cancel_live_run_tasks(&mut reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Canceled);
+        assert!(run.active_wave.is_none());
+        assert!(run.active_subrun_id.is_none());
+        assert_eq!(run.task_counts.get("ready"), Some(&2));
+        assert!(matches!(
+            reliability
+                .tasks
+                .get("task-a")
+                .map(|task| &task.runtime.state),
+            Some(reliability::RuntimeState::Ready)
+        ));
+        assert!(matches!(
+            reliability
+                .tasks
+                .get("task-b")
+                .map(|task| &task.runtime.state),
+            Some(reliability::RuntimeState::Ready)
+        ));
     }
 
     #[test]
