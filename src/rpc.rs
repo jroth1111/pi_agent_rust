@@ -2329,6 +2329,7 @@ async fn cancel_live_run_tasks_and_sync(
 
 const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const MAX_AUTOMATED_RECOVERABLE_WAIT: Duration = Duration::from_secs(60);
+const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn next_recoverable_retry_delay(
     reliability: &RpcReliabilityState,
@@ -2347,6 +2348,53 @@ fn next_recoverable_retry_delay(
             _ => None,
         })
         .min()
+}
+
+fn apply_dispatch_rollback_recovery(
+    reliability: &mut RpcReliabilityState,
+    grant: &DispatchGrant,
+    failure_summary: Option<&str>,
+) -> String {
+    let _ = reliability.expire_dispatch_grant(grant);
+
+    let fallback_state = "ready".to_string();
+    let rollback_state = {
+        let Some(task) = reliability.tasks.get_mut(&grant.task_id) else {
+            return fallback_state;
+        };
+
+        if let Some(summary) = failure_summary {
+            let failed_at = chrono::Utc::now();
+            task.runtime.attempt = task.runtime.attempt.saturating_add(1);
+            task.runtime.last_transition_at = failed_at;
+            if task.runtime.attempt < task.spec.max_attempts {
+                let retry_after =
+                    chrono::Duration::from_std(ORCHESTRATION_ROLLBACK_RETRY_DELAY).ok();
+                task.runtime.state = reliability::RuntimeState::Recoverable {
+                    reason: reliability::FailureClass::InfraTransient,
+                    failure_artifact: None,
+                    handoff_summary: summary.to_string(),
+                    retry_after: retry_after.map(|delay| failed_at + delay),
+                };
+            } else {
+                task.runtime.state =
+                    reliability::RuntimeState::Terminal(reliability::TerminalState::Failed {
+                        class: reliability::FailureClass::MaxAttemptsExceeded,
+                        verify_run_id: None,
+                        failed_at,
+                    });
+            }
+        }
+
+        RpcReliabilityState::state_label(&task.runtime.state).to_string()
+    };
+
+    reliability.refresh_dependency_states();
+    reliability
+        .tasks
+        .get(&grant.task_id)
+        .map(|task| RpcReliabilityState::state_label(&task.runtime.state).to_string())
+        .unwrap_or(rollback_state)
 }
 
 #[derive(Debug)]
@@ -2756,13 +2804,8 @@ async fn rollback_dispatch_grant(
         let Ok(mut rel) = reliability_state.lock(cx).await else {
             return;
         };
-        let _ = rel.expire_dispatch_grant(grant);
-        rel.refresh_dependency_states();
-        let rolled_back_state = rel
-            .tasks
-            .get(&grant.task_id)
-            .map(|task| RpcReliabilityState::state_label(&task.runtime.state).to_string())
-            .unwrap_or_else(|| "ready".to_string());
+        let rolled_back_state =
+            apply_dispatch_rollback_recovery(&mut rel, grant, failure_summary.as_deref());
         let rollback_report = failure_summary.as_ref().and_then(|summary| {
             build_dispatch_rollback_task_report(
                 &rel,
@@ -3221,7 +3264,6 @@ async fn execute_dispatch_grants_with_worker(
         .await;
         let mut captures = Vec::with_capacity(capture_results.len());
         let mut rollback_summaries = Vec::new();
-        let mut first_failure_message = None::<String>;
         for (grant, result) in grants.iter().zip(capture_results) {
             match result {
                 Ok(capture) => captures.push(capture),
@@ -3230,9 +3272,6 @@ async fn execute_dispatch_grants_with_worker(
                         "parallel wave worker execution failed for {}: {err}",
                         grant.task_id
                     );
-                    if first_failure_message.is_none() {
-                        first_failure_message = Some(failure_message.clone());
-                    }
                     rollback_summaries.push((grant.clone(), failure_message));
                 }
             }
@@ -3254,13 +3293,13 @@ async fn execute_dispatch_grants_with_worker(
             }
 
             let salvaged_count = captures.len();
-            if salvaged_count > 0 {
+            let updated_run = if salvaged_count > 0 {
                 if captured_dispatches_overlap(&captures) {
                     let success_grants = captures
                         .iter()
                         .map(|capture| capture.grant.clone())
                         .collect::<Vec<_>>();
-                    let _ = execute_dispatch_grants_sequentially_with_replay_base(
+                    execute_dispatch_grants_sequentially_with_replay_base(
                         cx,
                         session,
                         reliability_state,
@@ -3271,9 +3310,9 @@ async fn execute_dispatch_grants_with_worker(
                         &success_grants,
                         worker,
                     )
-                    .await?;
+                    .await?
                 } else {
-                    let _ = finalize_captured_dispatches(
+                    finalize_captured_dispatches(
                         cx,
                         session,
                         reliability_state,
@@ -3283,22 +3322,12 @@ async fn execute_dispatch_grants_with_worker(
                         run,
                         captures,
                     )
-                    .await?;
+                    .await?
                 }
-            }
-
-            let failure_message = first_failure_message.unwrap_or_else(|| {
-                "parallel wave worker execution failed before merge".to_string()
-            });
-            let salvage_note = if salvaged_count == 0 {
-                "no sibling work was salvaged".to_string()
             } else {
-                format!("salvaged {salvaged_count} sibling task(s)")
+                current_run_status(cx, orchestration_state, run_store, &run.run_id).await?
             };
-            return Err(Error::tool(
-                "orchestration",
-                format!("{failure_message}; {salvage_note}"),
-            ));
+            return Ok(updated_run);
         }
 
         if captured_dispatches_overlap(&captures) {
@@ -3465,7 +3494,8 @@ async fn dispatch_run_until_quiescent(
         }
 
         append_dispatch_grants_session_entries(cx, session, reliability_state, &grants).await?;
-        run = execute_inline_run_dispatch(
+        let run_id = run.run_id.clone();
+        run = match execute_inline_run_dispatch(
             cx,
             session,
             reliability_state,
@@ -3475,7 +3505,25 @@ async fn dispatch_run_until_quiescent(
             run,
             &grants,
         )
-        .await?;
+        .await
+        {
+            Ok(updated_run) => updated_run,
+            Err(err) if grants.len() == 1 => {
+                let recovered_run =
+                    current_run_status(cx, orchestration_state, run_store, &run_id).await?;
+                if matches!(
+                    recovered_run.lifecycle,
+                    RunLifecycle::Pending | RunLifecycle::Running
+                ) {
+                    grants.clear();
+                    run = recovered_run;
+                    continue;
+                }
+                drop(err);
+                recovered_run
+            }
+            Err(err) => return Err(err),
+        };
         grants.clear();
 
         if matches!(
@@ -9807,7 +9855,11 @@ mod tests {
                 rel.tasks
                     .get(&contract.task_id)
                     .map(|task| &task.runtime.state),
-                Some(reliability::RuntimeState::Ready)
+                Some(reliability::RuntimeState::Recoverable {
+                    reason: reliability::FailureClass::InfraTransient,
+                    retry_after: Some(_),
+                    ..
+                })
             ));
         });
     }
@@ -9904,7 +9956,11 @@ mod tests {
                 rel.tasks
                     .get(&contract.task_id)
                     .map(|task| &task.runtime.state),
-                Some(reliability::RuntimeState::Ready)
+                Some(reliability::RuntimeState::Recoverable {
+                    reason: reliability::FailureClass::InfraTransient,
+                    retry_after: Some(_),
+                    ..
+                })
             ));
 
             let snapshot = {
@@ -9923,7 +9979,7 @@ mod tests {
             assert!(transitions.iter().any(|entry| {
                 entry.task_id == contract.task_id
                     && entry.from.as_deref() == Some("leased")
-                    && entry.to == "ready"
+                    && entry.to == "recoverable"
                     && entry
                         .details
                         .as_ref()
@@ -10207,7 +10263,7 @@ mod tests {
             let worker = PartialWaveFailureWorker {
                 failing_task_id: "task-partial-b".to_string(),
             };
-            let err = execute_dispatch_grants_with_worker(
+            let updated_run = execute_dispatch_grants_with_worker(
                 &cx,
                 &session,
                 &reliability_state,
@@ -10219,8 +10275,8 @@ mod tests {
                 &worker,
             )
             .await
-            .expect_err("partial wave failure should still return an error");
-            assert!(err.to_string().contains("salvaged 1 sibling task"));
+            .expect("partial wave failure should stay automatable");
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Pending);
 
             let lib_contents =
                 fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
@@ -10268,7 +10324,11 @@ mod tests {
                 rel.tasks
                     .get("task-partial-b")
                     .map(|task| &task.runtime.state),
-                Some(reliability::RuntimeState::Ready)
+                Some(reliability::RuntimeState::Recoverable {
+                    reason: reliability::FailureClass::InfraTransient,
+                    retry_after: Some(_),
+                    ..
+                })
             ));
         });
     }
