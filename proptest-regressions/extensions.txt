@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 597336d89041c1289c372af9120d0db8f3498a9d5cad7145d70e7a968d3c3628 # shrinks to op = "uzbzkdtnzcex", payload = Object {"N5t_ruqe2": Null, "qW1tZ9we": Object {"Mpwc__F": Bool(false), "QA86_3Yzw": Number(5409440890564024474), "eB9xO": Null}}
-cc 5acaeb789be37859aa7551d39ab46baa9b895b459d043518a8737aa7ac8682f5 # shrinks to provider = "", model_id = "F%JȺ&a\u{113bf} ೩2𱋮{"

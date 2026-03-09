@@ -1,2 +1,0 @@
-provider	verdict	status	elapsed_ms	input_tokens	output_tokens	total_tokens	estimated_cost_usd	total_cost_usd	cost_source	artifacts_dir
-openai	FAIL	passed	932	31	3	34	n/a	0.0	no_cost_available	/data/projects/pi_agent_rust/tests/e2e_results/20260206T184855Z/openai
