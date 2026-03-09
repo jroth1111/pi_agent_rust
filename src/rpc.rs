@@ -1851,8 +1851,9 @@ fn planned_subruns(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<Su
 
 fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) -> RunLifecycle {
     let mut saw_ready = false;
-    let mut saw_running = false;
+    let mut saw_in_flight = false;
     let mut saw_blocked = false;
+    let mut saw_recoverable = false;
     let mut saw_awaiting_human = false;
     let mut saw_terminal_failure = false;
     let mut saw_terminal_success = false;
@@ -1865,8 +1866,8 @@ fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) 
         match &task.runtime.state {
             reliability::RuntimeState::AwaitingHuman { .. } => saw_awaiting_human = true,
             reliability::RuntimeState::Leased { .. }
-            | reliability::RuntimeState::Verifying { .. }
-            | reliability::RuntimeState::Recoverable { .. } => saw_running = true,
+            | reliability::RuntimeState::Verifying { .. } => saw_in_flight = true,
+            reliability::RuntimeState::Recoverable { .. } => saw_recoverable = true,
             reliability::RuntimeState::Blocked { .. } => saw_blocked = true,
             reliability::RuntimeState::Ready => saw_ready = true,
             reliability::RuntimeState::Terminal(
@@ -1886,12 +1887,12 @@ fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) 
 
     if saw_awaiting_human {
         RunLifecycle::AwaitingHuman
-    } else if saw_running {
+    } else if saw_in_flight {
         RunLifecycle::Running
-    } else if saw_blocked && !saw_ready {
-        RunLifecycle::Blocked
-    } else if saw_ready || saw_blocked {
+    } else if saw_ready || saw_recoverable {
         RunLifecycle::Pending
+    } else if saw_blocked {
+        RunLifecycle::Blocked
     } else if saw_terminal_failure {
         RunLifecycle::Failed
     } else if saw_terminal_success {
@@ -8619,6 +8620,90 @@ mod tests {
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
             vec!["task-a".to_string(), "task-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn orchestration_refresh_run_treats_future_recoverable_as_pending() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract = reliability_contract("task-recoverable", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract)
+            .expect("register recoverable task");
+        let task = reliability
+            .tasks
+            .get_mut(&contract.task_id)
+            .expect("recoverable task exists");
+        task.runtime.state = reliability::RuntimeState::Recoverable {
+            reason: reliability::FailureClass::VerificationFailed,
+            failure_artifact: None,
+            handoff_summary: "retry later".to_string(),
+            retry_after: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        };
+
+        let mut run = RunStatus::new("run-recoverable", "Recoverable wait", ExecutionTier::Wave);
+        run.task_ids = vec![contract.task_id.clone()];
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Pending);
+        assert_eq!(run.task_counts.get("recoverable"), Some(&1));
+        assert!(run.active_wave.is_none());
+    }
+
+    #[test]
+    fn orchestration_refresh_run_keeps_in_flight_over_recoverable() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        let contract_running = reliability_contract("task-running", Vec::new());
+        let contract_recoverable = reliability_contract("task-recoverable", Vec::new());
+
+        reliability
+            .get_or_create_task(&contract_running)
+            .expect("register running task");
+        reliability
+            .get_or_create_task(&contract_recoverable)
+            .expect("register recoverable task");
+
+        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+        reliability
+            .tasks
+            .get_mut("task-running")
+            .expect("running task")
+            .runtime
+            .state = reliability::RuntimeState::Leased {
+            lease_id: "lease-running".to_string(),
+            agent_id: "agent-running".to_string(),
+            fence_token: 1,
+            expires_at,
+        };
+        reliability
+            .tasks
+            .get_mut("task-recoverable")
+            .expect("recoverable task")
+            .runtime
+            .state = reliability::RuntimeState::Recoverable {
+            reason: reliability::FailureClass::VerificationFailed,
+            failure_artifact: None,
+            handoff_summary: "retry later".to_string(),
+            retry_after: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        };
+
+        let mut run = RunStatus::new("run-mixed", "Mixed run", ExecutionTier::Wave);
+        run.task_ids = vec![
+            contract_running.task_id.clone(),
+            contract_recoverable.task_id.clone(),
+        ];
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Running);
+        assert_eq!(
+            run.active_wave
+                .as_ref()
+                .map(|wave| wave.task_ids.clone())
+                .unwrap_or_default(),
+            vec!["task-running".to_string()]
         );
     }
 
