@@ -1409,6 +1409,68 @@ async fn append_dispatch_grants_session_entries(
     Ok(())
 }
 
+async fn append_canceled_dispatch_grants_session_entries(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    grants: &[DispatchGrant],
+) -> Result<()> {
+    if grants.is_empty() {
+        return Ok(());
+    }
+
+    let transitions = {
+        let reliability = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        grants
+            .iter()
+            .filter_map(|grant| {
+                reliability.tasks.get(&grant.task_id).map(|task| {
+                    (
+                        grant.task_id.clone(),
+                        grant.state.clone(),
+                        RpcReliabilityState::state_label(&task.runtime.state).to_string(),
+                        grant.lease_id.clone(),
+                        grant.fence_token,
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if transitions.is_empty() {
+        return Ok(());
+    }
+
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        for (task_id, from, to, lease_id, fence_token) in transitions {
+            inner_session.append_task_transition_entry(
+                task_id,
+                Some(from),
+                to,
+                Some(json!({
+                    "leaseId": lease_id,
+                    "fenceToken": fence_token,
+                    "reason": "orchestration.cancel_run",
+                })),
+            );
+        }
+    }
+    guard.persist_session().await?;
+    Ok(())
+}
+
 fn ensure_run_id_available(
     orchestration: &RpcOrchestrationState,
     run_store: &RunStore,
@@ -2079,7 +2141,10 @@ fn dispatch_run_wave(
     Ok(grants)
 }
 
-fn cancel_live_run_tasks(reliability: &mut RpcReliabilityState, run: &mut RunStatus) {
+fn cancel_live_run_tasks(
+    reliability: &mut RpcReliabilityState,
+    run: &mut RunStatus,
+) -> Vec<DispatchGrant> {
     let leased_grants = run
         .task_ids
         .iter()
@@ -2114,6 +2179,95 @@ fn cancel_live_run_tasks(reliability: &mut RpcReliabilityState, run: &mut RunSta
     run.active_wave = None;
     run.active_subrun_id = None;
     run.touch();
+    leased_grants
+}
+
+fn build_cancel_run_task_report(
+    reliability: &RpcReliabilityState,
+    run_id: &str,
+    task_id: &str,
+) -> Option<TaskReport> {
+    let task = reliability.tasks.get(task_id)?;
+    let state = RpcReliabilityState::state_label(&task.runtime.state);
+    build_runtime_task_report(
+        reliability,
+        task_id,
+        format!("run {run_id} canceled dispatch for task {task_id}; task returned to {state}"),
+    )
+}
+
+async fn cancel_live_run_tasks_and_sync(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    run: &mut RunStatus,
+) -> Result<()> {
+    let canceled_grants = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        cancel_live_run_tasks(&mut rel, run)
+    };
+
+    {
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.update_run(run.clone());
+    }
+
+    append_canceled_dispatch_grants_session_entries(
+        cx,
+        session,
+        reliability_state,
+        &canceled_grants,
+    )
+    .await?;
+
+    for grant in canceled_grants {
+        let report = {
+            let rel = reliability_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+            build_cancel_run_task_report(&rel, &run.run_id, &grant.task_id)
+        };
+        let updated_runs = sync_task_runs(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            &grant.task_id,
+            report,
+        )
+        .await?;
+        if let Some(updated_run) = updated_runs
+            .into_iter()
+            .find(|updated_run| updated_run.run_id == run.run_id)
+        {
+            *run = updated_run;
+        }
+    }
+
+    run.lifecycle = RunLifecycle::Canceled;
+    run.active_wave = None;
+    run.active_subrun_id = None;
+    run.touch();
+    {
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.update_run(run.clone());
+    }
+    persist_run_status(cx, session, run_store, run).await?;
+
+    Ok(())
 }
 
 const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -4378,19 +4532,36 @@ pub async fn run(
                         ));
                         continue;
                     };
-                {
-                    let mut rel = reliability_state
+                let has_live_tasks = {
+                    let rel = reliability_state
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    if run_has_live_tasks(&rel, &run) {
-                        cancel_live_run_tasks(&mut rel, &mut run);
-                    } else {
-                        run.lifecycle = RunLifecycle::Canceled;
-                        run.active_wave = None;
-                        run.active_subrun_id = None;
-                        run.touch();
+                    run_has_live_tasks(&rel, &run)
+                };
+                if has_live_tasks {
+                    if let Err(err) = cancel_live_run_tasks_and_sync(
+                        &cx,
+                        &session,
+                        &reliability_state,
+                        &orchestration_state,
+                        &run_store,
+                        &mut run,
+                    )
+                    .await
+                    {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.cancel_run",
+                            &err,
+                        ));
+                        continue;
                     }
+                } else {
+                    run.lifecycle = RunLifecycle::Canceled;
+                    run.active_wave = None;
+                    run.active_subrun_id = None;
+                    run.touch();
                 }
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
@@ -8866,12 +9037,13 @@ mod tests {
         assert_eq!(run.lifecycle, RunLifecycle::Running);
         assert!(run.active_wave.is_some());
 
-        cancel_live_run_tasks(&mut reliability, &mut run);
+        let canceled_grants = cancel_live_run_tasks(&mut reliability, &mut run);
 
         assert_eq!(run.lifecycle, RunLifecycle::Canceled);
         assert!(run.active_wave.is_none());
         assert!(run.active_subrun_id.is_none());
         assert_eq!(run.task_counts.get("ready"), Some(&2));
+        assert_eq!(canceled_grants.len(), 2);
         assert!(matches!(
             reliability
                 .tasks
@@ -8886,6 +9058,114 @@ mod tests {
                 .map(|task| &task.runtime.state),
             Some(reliability::RuntimeState::Ready)
         ));
+    }
+
+    #[test]
+    fn orchestration_cancel_live_run_tasks_and_sync_updates_reports_and_session_entries() {
+        let (temp_dir, repo_path, _) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            false,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut run = RunStatus::new(
+                "run-cancel-sync",
+                "Cancel run sync fixture",
+                ExecutionTier::Wave,
+            );
+            run.max_parallelism = 2;
+            run.task_ids = vec!["task-a".to_string(), "task-b".to_string()];
+
+            let grants = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.get_or_create_task(&reliability_contract("task-a", Vec::new()))
+                    .expect("register task a");
+                rel.get_or_create_task(&reliability_contract("task-b", Vec::new()))
+                    .expect("register task b");
+                dispatch_run_wave(&mut rel, &mut run, "worker", 120).expect("dispatch run")
+            };
+
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist run");
+            append_dispatch_grants_session_entries(&cx, &session, &reliability_state, &grants)
+                .await
+                .expect("append dispatch entries");
+
+            cancel_live_run_tasks_and_sync(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &mut run,
+            )
+            .await
+            .expect("cancel live run");
+
+            assert_eq!(run.lifecycle, RunLifecycle::Canceled);
+            assert_eq!(run.task_reports.len(), 2);
+            assert!(run.active_wave.is_none());
+            assert!(
+                run.task_reports
+                    .values()
+                    .all(|report| report.summary.contains("canceled dispatch"))
+            );
+
+            let persisted = run_store.load(&run.run_id).expect("load persisted run");
+            assert_eq!(persisted.lifecycle, RunLifecycle::Canceled);
+            assert_eq!(persisted.task_reports.len(), 2);
+
+            let snapshot = {
+                let guard = session.lock(&cx).await.expect("lock session");
+                let inner = guard.session.lock(&cx).await.expect("lock inner session");
+                inner.export_snapshot()
+            };
+            let transitions = snapshot
+                .entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::TaskTransition(entry) => Some(entry),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert!(transitions.iter().any(|entry| {
+                entry.task_id == "task-a"
+                    && entry.from.as_deref() == Some("leased")
+                    && entry.to == "ready"
+                    && entry
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("orchestration.cancel_run")
+            }));
+            assert!(transitions.iter().any(|entry| {
+                entry.task_id == "task-b"
+                    && entry.from.as_deref() == Some("leased")
+                    && entry.to == "ready"
+                    && entry
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("orchestration.cancel_run")
+            }));
+        });
     }
 
     #[test]
