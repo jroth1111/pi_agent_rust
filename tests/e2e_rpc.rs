@@ -1517,6 +1517,93 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
 }
 
 #[test]
+fn rpc_orchestration_dispatch_run_persists_worker_failure_report() {
+    let harness = TestHarness::new("rpc_orchestration_dispatch_run_persists_worker_failure_report");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-worker-fail-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-worker-fail");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(Vec::new()));
+        let agent_session =
+            build_agent_session_with_provider(Session::in_memory(), provider, &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise orchestration worker failure rollback",
+            "tasks": [
+                {
+                    "taskId": "task-e2e-worker-fail",
+                    "objective": "Attempt a worker execution that fails",
+                    "verifyCommand": "true",
+                    "inputSnapshot": head,
+                    "acceptanceIds": ["ac-worker-fail"],
+                    "plannedTouches": ["Cargo.toml"]
+                }
+            ],
+            "runVerifyCommand": "true"
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+
+        let dispatch_cmd = json!({
+            "id": "2",
+            "type": "orchestration.dispatch_run",
+            "runId": run_id,
+            "agentIdPrefix": "worker",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch =
+            send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
+        assert_err(&dispatch, "orchestration.dispatch_run");
+        assert!(
+            dispatch["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("scripted provider exhausted its steps"))
+        );
+
+        let get_cmd = json!({
+            "id": "3",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let fetched = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&fetched, "orchestration.get_run");
+        assert_eq!(fetched["data"]["run"]["lifecycle"], "pending");
+        assert_eq!(fetched["data"]["run"]["taskCounts"]["ready"], 1);
+        assert_eq!(
+            fetched["data"]["run"]["taskReports"]["task-e2e-worker-fail"]["failureClass"],
+            "orchestration_execution_error"
+        );
+        assert!(
+            fetched["data"]["run"]["taskReports"]["task-e2e-worker-fail"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("scripted provider exhausted its steps"))
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_orchestration_dispatch_run_waits_for_due_recoverable_task() {
     let harness = TestHarness::new("rpc_orchestration_dispatch_run_waits_for_due_recoverable_task");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
