@@ -2079,6 +2079,26 @@ fn dispatch_run_wave(
 }
 
 const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const MAX_AUTOMATED_RECOVERABLE_WAIT: Duration = Duration::from_secs(60);
+
+fn next_recoverable_retry_delay(
+    reliability: &RpcReliabilityState,
+    run: &RunStatus,
+) -> Option<Duration> {
+    let now = chrono::Utc::now();
+
+    run.task_ids
+        .iter()
+        .filter_map(|task_id| reliability.tasks.get(task_id))
+        .filter_map(|task| match &task.runtime.state {
+            reliability::RuntimeState::Recoverable {
+                retry_after: Some(retry_after),
+                ..
+            } if *retry_after > now => (*retry_after - now).to_std().ok(),
+            _ => None,
+        })
+        .min()
+}
 
 #[derive(Debug)]
 struct TaskVerificationOutcome {
@@ -3054,6 +3074,25 @@ async fn dispatch_run_until_quiescent(
         }
 
         if grants.is_empty() {
+            let recoverable_wait = {
+                let rel = reliability_state
+                    .lock(cx)
+                    .await
+                    .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                if run_has_live_tasks(&rel, &run)
+                    && matches!(run.lifecycle, RunLifecycle::Pending | RunLifecycle::Running)
+                {
+                    next_recoverable_retry_delay(&rel, &run)
+                } else {
+                    None
+                }
+            };
+            if let Some(wait_for) =
+                recoverable_wait.filter(|wait_for| *wait_for <= MAX_AUTOMATED_RECOVERABLE_WAIT)
+            {
+                cx.time().sleep(wait_for).await;
+                continue;
+            }
             return Ok((run, grants));
         }
 
