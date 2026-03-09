@@ -3172,6 +3172,33 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
     Ok(updated_run)
 }
 
+async fn finalize_captured_dispatches(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    repo_root: &Path,
+    run: RunStatus,
+    captures: Vec<CapturedDispatchExecution>,
+) -> Result<RunStatus> {
+    let mut updated_run = run;
+    for capture in captures {
+        updated_run = finalize_captured_dispatch_execution(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            repo_root,
+            &updated_run.run_id,
+            capture,
+        )
+        .await?;
+    }
+    Ok(updated_run)
+}
+
 async fn execute_dispatch_grants_with_worker(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -3193,37 +3220,85 @@ async fn execute_dispatch_grants_with_worker(
         }))
         .await;
         let mut captures = Vec::with_capacity(capture_results.len());
+        let mut rollback_summaries = Vec::new();
+        let mut first_failure_message = None::<String>;
         for (grant, result) in grants.iter().zip(capture_results) {
             match result {
                 Ok(capture) => captures.push(capture),
                 Err(err) => {
-                    let failed_task_id = grant.task_id.clone();
-                    let failed_summary = format!(
-                        "parallel wave worker execution failed for {failed_task_id}: {err}"
+                    let failure_message = format!(
+                        "parallel wave worker execution failed for {}: {err}",
+                        grant.task_id
                     );
-                    for rollback_grant in grants {
-                        let summary = if rollback_grant.task_id == failed_task_id {
-                            failed_summary.clone()
-                        } else {
-                            format!(
-                                "parallel wave aborted after {failed_task_id} failed before merge"
-                            )
-                        };
-                        rollback_dispatch_grant(
-                            cx,
-                            session,
-                            reliability_state,
-                            orchestration_state,
-                            run_store,
-                            &run.run_id,
-                            rollback_grant,
-                            Some(summary),
-                        )
-                        .await;
+                    if first_failure_message.is_none() {
+                        first_failure_message = Some(failure_message.clone());
                     }
-                    return Err(err);
+                    rollback_summaries.push((grant.clone(), failure_message));
                 }
             }
+        }
+
+        if !rollback_summaries.is_empty() {
+            for (grant, summary) in rollback_summaries {
+                rollback_dispatch_grant(
+                    cx,
+                    session,
+                    reliability_state,
+                    orchestration_state,
+                    run_store,
+                    &run.run_id,
+                    &grant,
+                    Some(summary),
+                )
+                .await;
+            }
+
+            let salvaged_count = captures.len();
+            if salvaged_count > 0 {
+                if captured_dispatches_overlap(&captures) {
+                    let success_grants = captures
+                        .iter()
+                        .map(|capture| capture.grant.clone())
+                        .collect::<Vec<_>>();
+                    let _ = execute_dispatch_grants_sequentially_with_replay_base(
+                        cx,
+                        session,
+                        reliability_state,
+                        orchestration_state,
+                        run_store,
+                        repo_root,
+                        run,
+                        &success_grants,
+                        worker,
+                    )
+                    .await?;
+                } else {
+                    let _ = finalize_captured_dispatches(
+                        cx,
+                        session,
+                        reliability_state,
+                        orchestration_state,
+                        run_store,
+                        repo_root,
+                        run,
+                        captures,
+                    )
+                    .await?;
+                }
+            }
+
+            let failure_message = first_failure_message.unwrap_or_else(|| {
+                "parallel wave worker execution failed before merge".to_string()
+            });
+            let salvage_note = if salvaged_count == 0 {
+                "no sibling work was salvaged".to_string()
+            } else {
+                format!("salvaged {salvaged_count} sibling task(s)")
+            };
+            return Err(Error::tool(
+                "orchestration",
+                format!("{failure_message}; {salvage_note}"),
+            ));
         }
 
         if captured_dispatches_overlap(&captures) {
@@ -3241,21 +3316,17 @@ async fn execute_dispatch_grants_with_worker(
             .await;
         }
 
-        let mut updated_run = run;
-        for capture in captures {
-            updated_run = finalize_captured_dispatch_execution(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                repo_root,
-                &updated_run.run_id,
-                capture,
-            )
-            .await?;
-        }
-        return Ok(updated_run);
+        return finalize_captured_dispatches(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            repo_root,
+            run,
+            captures,
+        )
+        .await;
     }
 
     let mut updated_run = run;
@@ -8771,6 +8842,37 @@ mod tests {
         }
     }
 
+    struct PartialWaveFailureWorker {
+        failing_task_id: String,
+    }
+
+    #[async_trait]
+    impl OrchestrationInlineWorker for PartialWaveFailureWorker {
+        async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+            if task.task_id == self.failing_task_id {
+                return Err(Error::validation(format!(
+                    "fixture partial wave failure for {}",
+                    task.task_id
+                )));
+            }
+
+            let target_rel = task
+                .planned_touches
+                .first()
+                .ok_or_else(|| Error::validation("missing planned touches"))?;
+            let target = workspace_path.join(target_rel);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|err| Error::Io(Box::new(err)))?;
+            }
+            fs::write(
+                &target,
+                format!("pub fn {}() {{}}\n", task.task_id.replace('-', "_")),
+            )
+            .map_err(|err| Error::Io(Box::new(err)))?;
+            Ok(format!("Updated {}", task.task_id))
+        }
+    }
+
     #[test]
     fn reliability_external_lease_provider_conflicts() {
         let provider = Arc::new(reliability::InMemoryExternalLeaseProvider::default());
@@ -10034,6 +10136,140 @@ mod tests {
                 .expect("read updated extra file");
             assert!(lib_contents.contains("task_parallel_a"));
             assert!(extra_contents.contains("task_parallel_b"));
+        });
+    }
+
+    #[test]
+    fn orchestration_parallel_wave_salvages_successful_captures_after_partial_failure() {
+        let (temp_dir, repo_path, _) = setup_inline_execution_repo();
+        fs::write(
+            repo_path.join("src/extra.rs"),
+            "pub fn extra_fixture() { println!(\"before-extra\"); }\n",
+        )
+        .expect("write extra tracked file");
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "add extra tracked file"]);
+        let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract_a = reliability_contract("task-partial-a", Vec::new());
+            contract_a.input_snapshot = Some(head.clone());
+            contract_a.verify_command = "true".to_string();
+            contract_a.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let mut contract_b = reliability_contract("task-partial-b", Vec::new());
+            contract_b.input_snapshot = Some(head);
+            contract_b.verify_command = "true".to_string();
+            contract_b.planned_touches = vec!["src/extra.rs".to_string()];
+
+            let grants = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                vec![
+                    rel.request_dispatch(&contract_a, "worker-a", 120)
+                        .expect("dispatch partial task a"),
+                    rel.request_dispatch(&contract_b, "worker-b", 120)
+                        .expect("dispatch partial task b"),
+                ]
+            };
+
+            let mut run = RunStatus::new(
+                "run-partial-wave",
+                "Parallel partial failure fixture",
+                ExecutionTier::Wave,
+            );
+            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+            run.run_verify_command = "true".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = PartialWaveFailureWorker {
+                failing_task_id: "task-partial-b".to_string(),
+            };
+            let err = execute_dispatch_grants_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                run,
+                &grants,
+                &worker,
+            )
+            .await
+            .expect_err("partial wave failure should still return an error");
+            assert!(err.to_string().contains("salvaged 1 sibling task"));
+
+            let lib_contents =
+                fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
+            let extra_contents =
+                fs::read_to_string(repo_path.join("src/extra.rs")).expect("read extra file");
+            assert!(lib_contents.contains("task_partial_a"));
+            assert!(!extra_contents.contains("task_partial_b"));
+
+            let updated_run =
+                current_run_status(&cx, &orchestration_state, &run_store, "run-partial-wave")
+                    .await
+                    .expect("load updated run");
+            assert_eq!(updated_run.lifecycle, RunLifecycle::Pending);
+            assert_eq!(
+                updated_run
+                    .task_reports
+                    .get("task-partial-a")
+                    .and_then(|report| report.failure_class.clone()),
+                None
+            );
+            assert_eq!(
+                updated_run
+                    .task_reports
+                    .get("task-partial-b")
+                    .and_then(|report| report.failure_class.as_deref()),
+                Some("orchestration_execution_error")
+            );
+            assert!(
+                updated_run
+                    .task_reports
+                    .get("task-partial-b")
+                    .is_some_and(|report| report.summary.contains("fixture partial wave failure"))
+            );
+
+            let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+            assert!(matches!(
+                rel.tasks
+                    .get("task-partial-a")
+                    .map(|task| &task.runtime.state),
+                Some(reliability::RuntimeState::Terminal(
+                    reliability::TerminalState::Succeeded { .. }
+                ))
+            ));
+            assert!(matches!(
+                rel.tasks
+                    .get("task-partial-b")
+                    .map(|task| &task.runtime.state),
+                Some(reliability::RuntimeState::Ready)
+            ));
         });
     }
 
