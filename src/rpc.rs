@@ -11758,9 +11758,11 @@ mod tests {
             {
                 let mut state = shared_state.lock(&cx).await.expect("state lock");
                 state.steering_mode = QueueMode::All;
-                state.push_steering(queued_user_message("steer-1"))
+                state
+                    .push_steering(queued_user_message("steer-1"))
                     .expect("queue steer-1");
-                state.push_steering(queued_user_message("steer-2"))
+                state
+                    .push_steering(queued_user_message("steer-2"))
                     .expect("queue steer-2");
             }
 
@@ -11770,7 +11772,10 @@ mod tests {
 
             {
                 let mut guard = session.lock(&cx).await.expect("session lock");
-                guard.run_text("prompt".to_string(), |_| {}).await.expect("run_text");
+                guard
+                    .run_text("prompt".to_string(), |_| {})
+                    .await
+                    .expect("run_text");
             }
 
             assert_eq!(
@@ -11812,9 +11817,11 @@ mod tests {
             {
                 let mut state = shared_state.lock(&cx).await.expect("state lock");
                 state.follow_up_mode = QueueMode::All;
-                state.push_follow_up(queued_user_message("follow-1"))
+                state
+                    .push_follow_up(queued_user_message("follow-1"))
                     .expect("queue follow-1");
-                state.push_follow_up(queued_user_message("follow-2"))
+                state
+                    .push_follow_up(queued_user_message("follow-2"))
                     .expect("queue follow-2");
             }
 
@@ -11824,7 +11831,10 @@ mod tests {
 
             {
                 let mut guard = session.lock(&cx).await.expect("session lock");
-                guard.run_text("prompt".to_string(), |_| {}).await.expect("run_text");
+                guard
+                    .run_text("prompt".to_string(), |_| {})
+                    .await
+                    .expect("run_text");
             }
 
             assert_eq!(

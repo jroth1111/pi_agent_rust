@@ -392,8 +392,7 @@ fn regression_verdict_is_generated() {
     let verdict_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/ext_conformance/reports/regression_verdict.json");
     if let Some(parent) = verdict_path.parent() {
-        std::fs::create_dir_all(parent)
-            .expect("create regression_verdict artifact directory");
+        std::fs::create_dir_all(parent).expect("create regression_verdict artifact directory");
     }
     let pretty_json =
         serde_json::to_string_pretty(&verdict_json).expect("serialize regression verdict");

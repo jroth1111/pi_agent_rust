@@ -4951,7 +4951,9 @@ mod tests {
     #[test]
     fn v2_active_path_hydration_tracks_total_message_count_for_incremental_save() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("lazy_hydration_active_path_count.jsonl");
+        let path = temp_dir
+            .path()
+            .join("lazy_hydration_active_path_count.jsonl");
 
         let mut seed = Session::create();
         seed.path = Some(path.clone());

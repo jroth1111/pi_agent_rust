@@ -13518,8 +13518,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
-        #[cfg(target_os = "linux")]
-        let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
         let policy = self.policy.clone();
@@ -14164,8 +14162,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let configured_repair_mode = repair_mode;
-                        #[cfg(target_os = "linux")]
-                        let repair_events = Arc::clone(&repair_events);
+                        let repair_events = Arc::clone(&self.repair_events);
                         move |path: String| -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
 
