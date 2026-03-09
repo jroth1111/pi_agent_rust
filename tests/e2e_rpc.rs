@@ -1636,6 +1636,7 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
                     "taskId": "task-e2e-partial-a",
                     "objective": "Attempt worker A",
                     "verifyCommand": "true",
+                    "maxAttempts": 2,
                     "inputSnapshot": head,
                     "acceptanceIds": ["ac-partial-a"],
                     "plannedTouches": ["task-a.txt"]
@@ -1644,6 +1645,7 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
                     "taskId": "task-e2e-partial-b",
                     "objective": "Attempt worker B",
                     "verifyCommand": "true",
+                    "maxAttempts": 2,
                     "inputSnapshot": head,
                     "acceptanceIds": ["ac-partial-b"],
                     "plannedTouches": ["task-b.txt"]
@@ -1667,12 +1669,9 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
         .to_string();
         let dispatch =
             send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
-        assert_err(&dispatch, "orchestration.dispatch_run");
-        assert!(
-            dispatch["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("salvaged 1 sibling task"))
-        );
+        assert_ok(&dispatch, "orchestration.dispatch_run");
+        assert_eq!(dispatch["data"]["run"]["lifecycle"], "failed");
+        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 2);
 
         let get_cmd = json!({
             "id": "3",
@@ -1682,9 +1681,8 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
         .to_string();
         let fetched = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&fetched, "orchestration.get_run");
-        assert_eq!(fetched["data"]["run"]["lifecycle"], "pending");
-        assert_eq!(fetched["data"]["run"]["taskCounts"]["terminal"], 1);
-        assert_eq!(fetched["data"]["run"]["taskCounts"]["ready"], 1);
+        assert_eq!(fetched["data"]["run"]["lifecycle"], "failed");
+        assert_eq!(fetched["data"]["run"]["taskCounts"]["terminal"], 2);
 
         let reports = fetched["data"]["run"]["taskReports"]
             .as_object()
