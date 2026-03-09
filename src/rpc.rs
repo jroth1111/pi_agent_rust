@@ -2042,38 +2042,43 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
     run.task_counts = reliability.task_counts_for(&run.task_ids);
     run.planned_subruns = planned_subruns(reliability, run);
 
-    let active_scope_task_ids = if run.selected_tier == ExecutionTier::Hierarchical {
-        let active_subrun = run.planned_subruns.iter().find(|subrun| {
-            subrun.task_ids.iter().any(|task_id| {
-                reliability.tasks.get(task_id).is_some_and(|task| {
-                    !matches!(task.runtime.state, reliability::RuntimeState::Terminal(_))
-                })
-            })
-        });
-        run.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
-        active_subrun
-            .map(|subrun| subrun.task_ids.clone())
-            .unwrap_or_default()
-    } else {
+    if preserve_canceled {
         run.active_subrun_id = None;
-        run.task_ids.clone()
-    };
+        run.active_wave = None;
+    } else {
+        let active_scope_task_ids = if run.selected_tier == ExecutionTier::Hierarchical {
+            let active_subrun = run.planned_subruns.iter().find(|subrun| {
+                subrun.task_ids.iter().any(|task_id| {
+                    reliability.tasks.get(task_id).is_some_and(|task| {
+                        !matches!(task.runtime.state, reliability::RuntimeState::Terminal(_))
+                    })
+                })
+            });
+            run.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
+            active_subrun
+                .map(|subrun| subrun.task_ids.clone())
+                .unwrap_or_default()
+        } else {
+            run.active_subrun_id = None;
+            run.task_ids.clone()
+        };
 
-    let mut active_task_ids = active_scope_task_ids
-        .iter()
-        .filter_map(|task_id| {
-            let task = reliability.tasks.get(task_id)?;
-            match &task.runtime.state {
-                reliability::RuntimeState::Leased { .. }
-                | reliability::RuntimeState::Verifying { .. } => Some(task_id.clone()),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
-    if active_task_ids.is_empty() {
-        active_task_ids = planned_wave_task_ids(reliability, run, &active_scope_task_ids);
+        let mut active_task_ids = active_scope_task_ids
+            .iter()
+            .filter_map(|task_id| {
+                let task = reliability.tasks.get(task_id)?;
+                match &task.runtime.state {
+                    reliability::RuntimeState::Leased { .. }
+                    | reliability::RuntimeState::Verifying { .. } => Some(task_id.clone()),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if active_task_ids.is_empty() {
+            active_task_ids = planned_wave_task_ids(reliability, run, &active_scope_task_ids);
+        }
+        run.active_wave = next_active_wave(run.active_wave.take(), active_task_ids);
     }
-    run.active_wave = next_active_wave(run.active_wave.take(), active_task_ids);
 
     if !preserve_canceled {
         run.lifecycle = derive_run_lifecycle(reliability, &run.task_ids);
@@ -9166,6 +9171,39 @@ mod tests {
                         == Some("orchestration.cancel_run")
             }));
         });
+    }
+
+    #[test]
+    fn orchestration_refresh_run_keeps_canceled_wave_cleared() {
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Hard, false, true);
+        reliability
+            .get_or_create_task(&reliability_contract("task-a", Vec::new()))
+            .expect("register task a");
+        reliability
+            .get_or_create_task(&reliability_contract("task-b", Vec::new()))
+            .expect("register task b");
+
+        let mut run = RunStatus::new(
+            "run-canceled-refresh",
+            "Canceled refresh fixture",
+            ExecutionTier::Wave,
+        );
+        run.task_ids = vec!["task-a".to_string(), "task-b".to_string()];
+        run.lifecycle = RunLifecycle::Canceled;
+        run.active_wave = Some(WaveStatus {
+            wave_id: "wave-stale".to_string(),
+            task_ids: vec!["task-a".to_string()],
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+        });
+        run.active_subrun_id = Some("subrun-stale".to_string());
+
+        refresh_run_from_reliability(&reliability, &mut run);
+
+        assert_eq!(run.lifecycle, RunLifecycle::Canceled);
+        assert!(run.active_wave.is_none());
+        assert!(run.active_subrun_id.is_none());
     }
 
     #[test]

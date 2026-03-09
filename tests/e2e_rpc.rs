@@ -1417,6 +1417,106 @@ fn rpc_orchestration_resume_run_redispatches_due_recoverable_task() {
 }
 
 #[test]
+fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
+    let harness = TestHarness::new(
+        "rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports",
+    );
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+    let run_id = format!("run-e2e-cancel-{}", uuid::Uuid::new_v4().simple());
+    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-cancel");
+
+    runtime.block_on(async move {
+        let _repo_guard = repo_guard;
+        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let task_contract = json!({
+            "taskId": "task-e2e-cancel",
+            "objective": "Lease then cancel the task",
+            "verifyCommand": "true",
+            "inputSnapshot": head,
+            "acceptanceIds": ["ac-cancel"],
+            "plannedTouches": ["Cargo.toml"]
+        });
+
+        let start_cmd = json!({
+            "id": "1",
+            "type": "orchestration.start_run",
+            "runId": run_id,
+            "objective": "Exercise orchestration cancel flow",
+            "tasks": [task_contract.clone()],
+            "runVerifyCommand": "true"
+        })
+        .to_string();
+        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
+        assert_ok(&start, "orchestration.start_run");
+        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+
+        let request_dispatch_cmd = json!({
+            "id": "2",
+            "type": "reliability.request_dispatch",
+            "contract": task_contract,
+            "agentId": "manual-cancel",
+            "leaseTtlSec": 120
+        })
+        .to_string();
+        let dispatch = send_recv(
+            &in_tx,
+            &out_rx,
+            &request_dispatch_cmd,
+            "reliability.request_dispatch",
+        )
+        .await;
+        assert_ok(&dispatch, "reliability.request_dispatch");
+        assert_eq!(dispatch["data"]["grant"]["state"], "leased");
+
+        let cancel_cmd = json!({
+            "id": "3",
+            "type": "orchestration.cancel_run",
+            "runId": run_id
+        })
+        .to_string();
+        let canceled = send_recv(&in_tx, &out_rx, &cancel_cmd, "orchestration.cancel_run").await;
+        assert_ok(&canceled, "orchestration.cancel_run");
+        assert_eq!(canceled["data"]["run"]["lifecycle"], "canceled");
+        assert!(canceled["data"]["run"]["activeWave"].is_null());
+        assert!(
+            canceled["data"]["run"]["taskReports"]["task-e2e-cancel"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("canceled dispatch"))
+        );
+
+        let get_cmd = json!({
+            "id": "4",
+            "type": "orchestration.get_run",
+            "runId": run_id
+        })
+        .to_string();
+        let fetched = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
+        assert_ok(&fetched, "orchestration.get_run");
+        assert_eq!(fetched["data"]["run"]["lifecycle"], "canceled");
+        assert!(fetched["data"]["run"]["activeWave"].is_null());
+        assert!(
+            fetched["data"]["run"]["taskReports"]["task-e2e-cancel"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("canceled dispatch"))
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_orchestration_dispatch_run_waits_for_due_recoverable_task() {
     let harness = TestHarness::new("rpc_orchestration_dispatch_run_waits_for_due_recoverable_task");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
