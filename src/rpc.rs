@@ -1471,6 +1471,39 @@ async fn append_canceled_dispatch_grants_session_entries(
     Ok(())
 }
 
+async fn append_dispatch_rollback_session_entry(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    grant: &DispatchGrant,
+    to_state: &str,
+    summary: &str,
+) -> Result<()> {
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        inner_session.append_task_transition_entry(
+            grant.task_id.clone(),
+            Some(grant.state.clone()),
+            to_state.to_string(),
+            Some(json!({
+                "leaseId": grant.lease_id,
+                "fenceToken": grant.fence_token,
+                "reason": "orchestration.rollback_dispatch_grant",
+                "summary": summary,
+            })),
+        );
+    }
+    guard.persist_session().await?;
+    Ok(())
+}
+
 fn ensure_run_id_available(
     orchestration: &RpcOrchestrationState,
     run_store: &RunStore,
@@ -2201,6 +2234,25 @@ fn build_cancel_run_task_report(
     )
 }
 
+fn build_dispatch_rollback_task_report(
+    reliability: &RpcReliabilityState,
+    task_id: &str,
+    summary: &str,
+    failure_class: &str,
+) -> Option<TaskReport> {
+    let mut report = build_runtime_task_report(reliability, task_id, summary.to_string())?;
+    report.summary = summary.to_string();
+    report.failure_class = Some(failure_class.to_string());
+    if reliability
+        .evidence_by_task
+        .get(task_id)
+        .is_none_or(|evidence| evidence.is_empty())
+    {
+        report.verify_exit_code = -1;
+    }
+    Some(report)
+}
+
 async fn cancel_live_run_tasks_and_sync(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -2698,13 +2750,27 @@ async fn rollback_dispatch_grant(
     run_store: &RunStore,
     run_id: &str,
     grant: &DispatchGrant,
+    failure_summary: Option<String>,
 ) {
-    let updated_run = {
+    let (updated_run, rolled_back_state) = {
         let Ok(mut rel) = reliability_state.lock(cx).await else {
             return;
         };
         let _ = rel.expire_dispatch_grant(grant);
         rel.refresh_dependency_states();
+        let rolled_back_state = rel
+            .tasks
+            .get(&grant.task_id)
+            .map(|task| RpcReliabilityState::state_label(&task.runtime.state).to_string())
+            .unwrap_or_else(|| "ready".to_string());
+        let rollback_report = failure_summary.as_ref().and_then(|summary| {
+            build_dispatch_rollback_task_report(
+                &rel,
+                &grant.task_id,
+                summary,
+                "orchestration_execution_error",
+            )
+        });
         let mut run = {
             let Ok(orchestration) = orchestration_state.lock(cx).await else {
                 return;
@@ -2714,15 +2780,24 @@ async fn rollback_dispatch_grant(
                 .or_else(|| run_store.load(run_id).ok())
         };
         if let Some(mut run) = run.take() {
+            if let Some(report) = rollback_report.as_ref() {
+                run.upsert_task_report(report.clone());
+            }
             refresh_run_from_reliability(&rel, &mut run);
             if let Ok(mut orchestration) = orchestration_state.lock(cx).await {
                 orchestration.update_run(run.clone());
             }
-            Some(run)
+            (Some(run), rolled_back_state)
         } else {
-            None
+            (None, rolled_back_state)
         }
     };
+
+    if let Some(summary) = failure_summary.as_deref() {
+        let _ =
+            append_dispatch_rollback_session_entry(cx, session, grant, &rolled_back_state, summary)
+                .await;
+    }
 
     if let Some(run) = updated_run {
         let _ = persist_run_status(cx, session, run_store, &run).await;
@@ -2895,6 +2970,7 @@ async fn finalize_captured_dispatch_execution(
     {
         Ok(evidence) => evidence,
         Err(err) => {
+            let summary = format!("failed to record orchestration evidence: {err}");
             rollback_dispatch_grant(
                 cx,
                 session,
@@ -2903,6 +2979,7 @@ async fn finalize_captured_dispatch_execution(
                 run_store,
                 run_id,
                 &capture.grant,
+                Some(summary),
             )
             .await;
             return Err(err);
@@ -2912,6 +2989,7 @@ async fn finalize_captured_dispatch_execution(
     if capture.verification.passed
         && let Err(err) = apply_diff_to_repo(repo_root, &capture.diff)
     {
+        let summary = format!("failed to apply verified orchestration diff: {err}");
         rollback_dispatch_grant(
             cx,
             session,
@@ -2920,6 +2998,7 @@ async fn finalize_captured_dispatch_execution(
             run_store,
             run_id,
             &capture.grant,
+            Some(summary),
         )
         .await;
         return Err(err);
@@ -2961,6 +3040,7 @@ async fn finalize_captured_dispatch_execution(
     )
     .await
     {
+        let summary = format!("failed to submit orchestration task result: {err}");
         rollback_dispatch_grant(
             cx,
             session,
@@ -2969,6 +3049,7 @@ async fn finalize_captured_dispatch_execution(
             run_store,
             run_id,
             &capture.grant,
+            Some(summary),
         )
         .await;
         return Err(err);
@@ -2995,6 +3076,7 @@ async fn execute_inline_dispatch_grant_with_worker(
         {
             Ok(capture) => capture,
             Err(err) => {
+                let summary = format!("worker execution failed for {}: {err}", grant.task_id);
                 rollback_dispatch_grant(
                     cx,
                     session,
@@ -3003,6 +3085,7 @@ async fn execute_inline_dispatch_grant_with_worker(
                     run_store,
                     run_id,
                     grant,
+                    Some(summary),
                 )
                 .await;
                 return Err(err);
@@ -3049,6 +3132,10 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
         {
             Ok(capture) => capture,
             Err(err) => {
+                let summary = format!(
+                    "worker replay execution failed for {}: {err}",
+                    grant.task_id
+                );
                 rollback_dispatch_grant(
                     cx,
                     session,
@@ -3057,6 +3144,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
                     run_store,
                     &updated_run.run_id,
                     grant,
+                    Some(summary),
                 )
                 .await;
                 return Err(err);
@@ -3105,11 +3193,22 @@ async fn execute_dispatch_grants_with_worker(
         }))
         .await;
         let mut captures = Vec::with_capacity(capture_results.len());
-        for result in capture_results {
+        for (grant, result) in grants.iter().zip(capture_results) {
             match result {
                 Ok(capture) => captures.push(capture),
                 Err(err) => {
-                    for grant in grants {
+                    let failed_task_id = grant.task_id.clone();
+                    let failed_summary = format!(
+                        "parallel wave worker execution failed for {failed_task_id}: {err}"
+                    );
+                    for rollback_grant in grants {
+                        let summary = if rollback_grant.task_id == failed_task_id {
+                            failed_summary.clone()
+                        } else {
+                            format!(
+                                "parallel wave aborted after {failed_task_id} failed before merge"
+                            )
+                        };
                         rollback_dispatch_grant(
                             cx,
                             session,
@@ -3117,7 +3216,8 @@ async fn execute_dispatch_grants_with_worker(
                             orchestration_state,
                             run_store,
                             &run.run_id,
-                            grant,
+                            rollback_grant,
+                            Some(summary),
                         )
                         .await;
                     }
@@ -8660,6 +8760,17 @@ mod tests {
         }
     }
 
+    struct FailingInlineWorker {
+        message: String,
+    }
+
+    #[async_trait]
+    impl OrchestrationInlineWorker for FailingInlineWorker {
+        async fn execute(&self, _workspace_path: &Path, _task: &TaskContract) -> Result<String> {
+            Err(Error::validation(self.message.clone()))
+        }
+    }
+
     #[test]
     fn reliability_external_lease_provider_conflicts() {
         let provider = Arc::new(reliability::InMemoryExternalLeaseProvider::default());
@@ -9596,6 +9707,128 @@ mod tests {
                     .map(|task| &task.runtime.state),
                 Some(reliability::RuntimeState::Ready)
             ));
+        });
+    }
+
+    #[test]
+    fn orchestration_inline_execution_failure_persists_rollback_report() {
+        let (temp_dir, repo_path, head) = setup_inline_execution_repo();
+        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let cx = AgentCx::for_request();
+        let session = build_test_agent_session(&repo_path);
+        let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
+            ReliabilityEnforcementMode::Hard,
+            true,
+            true,
+        )));
+        let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
+
+        run_async(async {
+            let mut contract = reliability_contract("task-inline-worker-fail", Vec::new());
+            contract.input_snapshot = Some(head);
+            contract.verify_command = "true".to_string();
+            contract.planned_touches = vec!["src/lib.rs".to_string()];
+
+            let grant = {
+                let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                rel.request_dispatch(&contract, "worker", 120)
+                    .expect("dispatch inline task")
+            };
+
+            let mut run = RunStatus::new(
+                "run-inline-worker-fail",
+                "Inline execution worker failure",
+                ExecutionTier::Inline,
+            );
+            run.task_ids = vec![contract.task_id.clone()];
+            run.run_verify_command = "true".to_string();
+            run.run_verify_timeout_sec = Some(30);
+            {
+                let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+                refresh_run_from_reliability(&rel, &mut run);
+            }
+            {
+                let mut orchestration = orchestration_state
+                    .lock(&cx)
+                    .await
+                    .expect("lock orchestration");
+                orchestration.register_run(run.clone());
+            }
+            persist_run_status(&cx, &session, &run_store, &run)
+                .await
+                .expect("persist initial run");
+
+            let worker = FailingInlineWorker {
+                message: "fixture worker exploded".to_string(),
+            };
+            let err = execute_inline_dispatch_grant_with_worker(
+                &cx,
+                &session,
+                &reliability_state,
+                &orchestration_state,
+                &run_store,
+                &repo_path,
+                "run-inline-worker-fail",
+                &grant,
+                &worker,
+            )
+            .await
+            .expect_err("worker failure should surface");
+            assert!(err.to_string().contains("fixture worker exploded"));
+
+            let run = current_run_status(
+                &cx,
+                &orchestration_state,
+                &run_store,
+                "run-inline-worker-fail",
+            )
+            .await
+            .expect("load updated run");
+            let report = run
+                .task_reports
+                .get(&contract.task_id)
+                .expect("rollback task report");
+
+            assert_eq!(run.lifecycle, RunLifecycle::Pending);
+            assert_eq!(
+                report.failure_class.as_deref(),
+                Some("orchestration_execution_error")
+            );
+            assert_eq!(report.verify_exit_code, -1);
+            assert!(report.summary.contains("fixture worker exploded"));
+
+            let rel = reliability_state.lock(&cx).await.expect("lock reliability");
+            assert!(matches!(
+                rel.tasks
+                    .get(&contract.task_id)
+                    .map(|task| &task.runtime.state),
+                Some(reliability::RuntimeState::Ready)
+            ));
+
+            let snapshot = {
+                let guard = session.lock(&cx).await.expect("lock session");
+                let inner = guard.session.lock(&cx).await.expect("lock inner session");
+                inner.export_snapshot()
+            };
+            let transitions = snapshot
+                .entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::TaskTransition(entry) => Some(entry),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(transitions.iter().any(|entry| {
+                entry.task_id == contract.task_id
+                    && entry.from.as_deref() == Some("leased")
+                    && entry.to == "ready"
+                    && entry
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("orchestration.rollback_dispatch_grant")
+            }));
         });
     }
 
