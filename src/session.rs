@@ -13,7 +13,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, TextContent, ToolResultMessage, UserContent,
     UserMessage,
 };
-use crate::reliability::{ClosePayload, CloseResult, EvidenceRecord, StateDigest};
+use crate::reliability::{ClosePayload, CloseResult, EvidenceRecord, EvidenceStatus, StateDigest};
 use crate::session_index::{SessionIndex, enqueue_session_index_snapshot_update};
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -2564,9 +2564,33 @@ impl Session {
             .map(ToOwned::to_owned)
     }
 
+    fn tool_command_from_arguments(arguments: &Value) -> Option<String> {
+        arguments
+            .as_object()
+            .and_then(|args| args.get("command"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     fn repeated_read_notice(path: &str, repeat_count: u32) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(TextContent::new(format!(
             "[Repeated read omitted: {path} already appears earlier in this session at the same file version (repeat #{repeat_count})]"
+        )))]
+    }
+
+    fn verification_output_notice(
+        command: &str,
+        exit_code: i32,
+        evidence: &PromptVerificationRecord,
+        artifact_ref: &str,
+    ) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(TextContent::new(format!(
+            "[Verification output omitted: {command} {status} (exit {exit_code}); task={task_id}; evidence={evidence_id}; artifact={artifact_ref}]",
+            status = evidence.status,
+            task_id = evidence.task_id,
+            evidence_id = evidence.evidence_id,
         )))]
     }
 
@@ -2587,6 +2611,37 @@ impl Session {
         }
 
         saw_text.then_some(text)
+    }
+
+    fn tool_exit_code(details: Option<&Value>, is_error: bool) -> i32 {
+        details
+            .and_then(|value| value.get("exitCode"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+            .unwrap_or_else(|| i32::from(is_error))
+    }
+
+    fn tool_full_output_path(details: Option<&Value>) -> Option<String> {
+        details
+            .and_then(|value| value.get("fullOutputPath"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
+    fn is_verification_command(command: &str) -> bool {
+        const PREFIXES: &[&str] = &[
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "cargo nextest",
+            "pytest",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "go test",
+        ];
+        let normalized = command.trim().to_ascii_lowercase();
+        PREFIXES.iter().any(|prefix| normalized.starts_with(prefix))
     }
 
     fn append_model_message_for_entry(
@@ -2631,7 +2686,6 @@ impl Session {
 
         if let Some((compaction_idx, compaction)) = last_compaction {
             let mut messages = Vec::new();
-            let mut context_state = PromptContextState::default();
             let summary_message = SessionMessage::CompactionSummary {
                 summary: compaction.summary.clone(),
                 tokens_before: compaction.tokens_before,
@@ -2648,6 +2702,7 @@ impl Session {
 
             let mut keep = false;
             let mut past_compaction = false;
+            let mut kept_entries = Vec::new();
             for idx in 0..path_len {
                 let entry = entry_at(idx);
                 if idx == compaction_idx {
@@ -2673,16 +2728,24 @@ impl Session {
                         continue;
                     }
                 }
+                kept_entries.push(entry);
+            }
+
+            let metadata = prompt_metadata_from_entries(kept_entries.iter().copied());
+            let mut context_state = PromptContextState::with_metadata(metadata);
+            for entry in kept_entries {
                 Self::append_model_message_for_entry(&mut messages, entry, &mut context_state);
             }
 
             return messages;
         }
 
+        let entries: Vec<_> = (0..path_len).map(entry_at).collect();
         let mut messages = Vec::new();
-        let mut context_state = PromptContextState::default();
-        for idx in 0..path_len {
-            Self::append_model_message_for_entry(&mut messages, entry_at(idx), &mut context_state);
+        let metadata = prompt_metadata_from_entries(entries.iter().copied());
+        let mut context_state = PromptContextState::with_metadata(metadata);
+        for entry in entries {
+            Self::append_model_message_for_entry(&mut messages, entry, &mut context_state);
         }
         messages
     }
@@ -3638,6 +3701,7 @@ pub struct CustomEntry {
 struct PromptToolCall {
     name: String,
     path: Option<String>,
+    command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3646,14 +3710,35 @@ struct PromptReadRecord {
     repeat_count: u32,
 }
 
+#[derive(Debug, Clone)]
+struct PromptVerificationRecord {
+    evidence_id: String,
+    task_id: String,
+    status: &'static str,
+    artifact_ref: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PromptAssemblyMetadata {
+    verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
+}
+
 #[derive(Debug, Default)]
 struct PromptContextState {
     tool_calls: HashMap<String, PromptToolCall>,
     file_versions: HashMap<String, u64>,
     read_results: HashMap<(String, u64), PromptReadRecord>,
+    verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
 }
 
 impl PromptContextState {
+    fn with_metadata(metadata: PromptAssemblyMetadata) -> Self {
+        Self {
+            verification_records: metadata.verification_records,
+            ..Self::default()
+        }
+    }
+
     fn transform_message_for_prompt(&mut self, message: &SessionMessage) -> Option<SessionMessage> {
         match message {
             SessionMessage::Assistant { message: assistant } => {
@@ -3664,6 +3749,7 @@ impl PromptContextState {
                             PromptToolCall {
                                 name: call.name.clone(),
                                 path: Session::tool_path_from_arguments(&call.arguments),
+                                command: Session::tool_command_from_arguments(&call.arguments),
                             },
                         );
                     }
@@ -3711,6 +3797,36 @@ impl PromptContextState {
                     "write" | "edit" => {
                         if let Some(path) = &metadata.path {
                             *self.file_versions.entry(path.clone()).or_insert(0) += 1;
+                        }
+                    }
+                    "bash" => {
+                        if let Some(command) = &metadata.command {
+                            let exit_code = Session::tool_exit_code(details.as_ref(), is_error);
+                            if exit_code == 0 && Session::is_verification_command(command) {
+                                let key = (command.trim().to_string(), exit_code);
+                                if let Some(queue) = self.verification_records.get_mut(&key) {
+                                    if let Some(evidence) = queue.pop_front() {
+                                        let artifact_ref =
+                                            Session::tool_full_output_path(details.as_ref())
+                                                .or_else(|| evidence.artifact_ref.clone());
+                                        if let Some(artifact_ref) = artifact_ref {
+                                            return SessionMessage::ToolResult {
+                                                tool_call_id: tool_call_id.to_string(),
+                                                tool_name: tool_name.to_string(),
+                                                content: Session::verification_output_notice(
+                                                    command,
+                                                    exit_code,
+                                                    &evidence,
+                                                    &artifact_ref,
+                                                ),
+                                                details,
+                                                is_error,
+                                                timestamp,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     "read" => {
@@ -3765,8 +3881,50 @@ impl PromptContextState {
     }
 }
 
+fn prompt_verification_status(status: EvidenceStatus) -> &'static str {
+    match status {
+        EvidenceStatus::Pending => "pending",
+        EvidenceStatus::Passed => "passed",
+        EvidenceStatus::Failed => "failed",
+        EvidenceStatus::Skipped => "skipped",
+    }
+}
+
+pub(crate) fn prompt_metadata_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a SessionEntry>,
+) -> PromptAssemblyMetadata {
+    let mut metadata = PromptAssemblyMetadata::default();
+    for entry in entries {
+        let SessionEntry::VerificationEvidence(entry) = entry else {
+            continue;
+        };
+
+        metadata
+            .verification_records
+            .entry((
+                entry.evidence.command.trim().to_string(),
+                entry.evidence.exit_code,
+            ))
+            .or_default()
+            .push_back(PromptVerificationRecord {
+                evidence_id: entry.evidence.evidence_id.clone(),
+                task_id: entry.evidence.task_id.clone(),
+                status: prompt_verification_status(entry.evidence.status),
+                artifact_ref: entry.evidence.artifact_ids.first().cloned(),
+            });
+    }
+    metadata
+}
+
 pub(crate) fn prompt_transform_messages(messages: &[SessionMessage]) -> Vec<SessionMessage> {
-    let mut context_state = PromptContextState::default();
+    prompt_transform_messages_with_metadata(messages, PromptAssemblyMetadata::default())
+}
+
+pub(crate) fn prompt_transform_messages_with_metadata(
+    messages: &[SessionMessage],
+    metadata: PromptAssemblyMetadata,
+) -> Vec<SessionMessage> {
+    let mut context_state = PromptContextState::with_metadata(metadata);
     messages
         .iter()
         .filter_map(|message| context_state.transform_message_for_prompt(message))
@@ -5000,6 +5158,26 @@ mod tests {
         }
     }
 
+    fn make_test_bash_tool_call(call_id: &str, command: &str) -> SessionMessage {
+        SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                    id: call_id.to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({ "command": command }),
+                    thought_signature: None,
+                })],
+                api: "test".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            },
+        }
+    }
+
     fn make_test_tool_result(call_id: &str, name: &str, text: &str) -> SessionMessage {
         SessionMessage::ToolResult {
             tool_call_id: call_id.to_string(),
@@ -6057,6 +6235,86 @@ mod tests {
                 .any(|block| matches!(block, ContentBlock::Image(_))),
             "repeated image reads must preserve the image attachment"
         );
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_elides_successful_verify_output_with_evidence() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let output_path = temp_dir.path().join("cargo-test.log");
+        std::fs::write(&output_path, "all tests passed").expect("write output");
+
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("run verification"));
+        session.append_message(make_test_bash_tool_call("call-1", "cargo test --lib"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "huge cargo test output that should be elided",
+            ))],
+            details: Some(serde_json::json!({
+                "exitCode": 0,
+                "fullOutputPath": output_path.display().to_string(),
+            })),
+            is_error: false,
+            timestamp: Some(0),
+        });
+        session.append_verification_evidence_entry(EvidenceRecord::from_command_output(
+            "task-1",
+            "cargo test --lib",
+            0,
+            "all tests passed",
+            "",
+            vec!["artifact://verify/stdout".to_string()],
+        ));
+
+        let messages = session.to_messages_for_current_path();
+        let output = match &messages[2] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected bash tool result, got {other:?}"),
+        };
+
+        assert!(output.contains("Verification output omitted"));
+        assert!(output.contains("cargo test --lib"));
+        assert!(output.contains("task-1"));
+        assert!(output.contains("artifact"));
+        assert!(!output.contains("huge cargo test output"));
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_keeps_failed_verify_output() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("run failing verification"));
+        session.append_message(make_test_bash_tool_call("call-1", "cargo test --lib"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "failing cargo test output remains visible",
+            ))],
+            details: Some(serde_json::json!({
+                "exitCode": 1,
+                "fullOutputPath": "/tmp/failing-cargo-test.log",
+            })),
+            is_error: true,
+            timestamp: Some(0),
+        });
+        session.append_verification_evidence_entry(EvidenceRecord::from_command_output(
+            "task-1",
+            "cargo test --lib",
+            1,
+            "",
+            "failed",
+            vec!["artifact://verify/stdout".to_string()],
+        ));
+
+        let messages = session.to_messages_for_current_path();
+        let output = match &messages[2] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected bash tool result, got {other:?}"),
+        };
+
+        assert_eq!(output, "failing cargo test output remains visible");
     }
 
     #[test]

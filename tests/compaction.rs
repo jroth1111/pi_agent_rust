@@ -4,7 +4,9 @@
 mod common;
 
 use common::{TestHarness, run_async};
-use pi::compaction::{CompactionPreparation, CompactionResult, compact, prepare_compaction};
+use pi::compaction::{
+    CompactionPreparation, CompactionResult, compact, prepare_compaction, summarize_entries,
+};
 use pi::model::{
     AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent,
     ThinkingContent, ToolCall, Usage, UserContent, UserMessage,
@@ -938,6 +940,63 @@ fn compact_prompt_dedups_repeated_reads_before_summarization() {
     assert!(prompt.contains("[Tool result]: same contents"));
     assert_eq!(prompt.matches("[Tool result]: same contents").count(), 1);
     assert!(prompt.contains("Repeated read omitted"));
+}
+
+#[test]
+fn summarize_entries_elides_successful_verify_output_with_evidence() {
+    let harness =
+        TestHarness::new("summarize_entries_elides_successful_verify_output_with_evidence");
+
+    let entries = vec![
+        message_entry("u1", None, user_text("run verification")),
+        message_entry(
+            "a1",
+            Some("u1"),
+            assistant_message(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-0".to_string(),
+                    name: "bash".to_string(),
+                    arguments: json!({"command": "cargo test --lib"}),
+                    thought_signature: None,
+                })],
+                Usage::default(),
+                StopReason::ToolUse,
+            ),
+        ),
+        message_entry(
+            "tr1",
+            Some("a1"),
+            SessionMessage::ToolResult {
+                tool_call_id: "call-0".to_string(),
+                tool_name: "bash".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "very large cargo test output that should not be replayed",
+                ))],
+                details: Some(json!({
+                    "exitCode": 0,
+                    "fullOutputPath": "/tmp/cargo-test-output.log",
+                })),
+                is_error: false,
+                timestamp: Some(0),
+            },
+        ),
+        verification_evidence_entry("ev1", Some("tr1"), "task-1", "cargo test --lib", 0),
+    ];
+
+    let provider = Arc::new(ScriptedProvider::new([checkpoint_json("SUMMARY")]));
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+
+    let _ = run_async(async move {
+        summarize_entries(&entries, provider_dyn, "test-key", 0, None)
+            .await
+            .expect("summarize")
+    });
+
+    let prompt = provider.prompts().first().expect("prompt").clone();
+    assert!(prompt.contains("Verification output omitted"));
+    assert!(prompt.contains("cargo test --lib"));
+    assert!(!prompt.contains("very large cargo test output"));
+    harness.log().info("prompt", prompt);
 }
 
 #[test]

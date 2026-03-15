@@ -19,7 +19,8 @@ use crate::model::{
 };
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::session::{
-    SessionEntry, SessionMessage, prompt_transform_messages, session_message_to_model,
+    SessionEntry, SessionMessage, prompt_metadata_from_entries,
+    prompt_transform_messages_with_metadata, session_message_to_model,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1310,6 +1311,7 @@ async fn complete_simple(
 }
 
 async fn generate_summary(
+    entries: &[SessionEntry],
     messages: &[SessionMessage],
     provider: Arc<dyn Provider>,
     api_key: &str,
@@ -1329,7 +1331,10 @@ async fn generate_summary(
         let _ = write!(prompt, "\n\nAdditional focus: {custom}");
     }
 
-    let prompt_messages = prompt_transform_messages(messages);
+    let prompt_messages = prompt_transform_messages_with_metadata(
+        messages,
+        prompt_metadata_from_entries(entries.iter()),
+    );
     let llm_messages = prompt_messages
         .iter()
         .filter_map(session_message_to_model)
@@ -1375,12 +1380,16 @@ async fn generate_summary(
 }
 
 async fn generate_turn_prefix_summary(
+    entries: &[SessionEntry],
     messages: &[SessionMessage],
     provider: Arc<dyn Provider>,
     api_key: &str,
     settings: &ResolvedCompactionSettings,
 ) -> Result<String> {
-    let prompt_messages = prompt_transform_messages(messages);
+    let prompt_messages = prompt_transform_messages_with_metadata(
+        messages,
+        prompt_metadata_from_entries(entries.iter()),
+    );
     let llm_messages = prompt_messages
         .iter()
         .filter_map(session_message_to_model)
@@ -1615,6 +1624,7 @@ pub async fn summarize_entries(
     };
 
     let mut summary = generate_summary(
+        entries,
         &messages,
         provider,
         api_key,
@@ -1641,6 +1651,7 @@ pub async fn compact(
             seed_split_turn_history_summary(&preparation)
         } else {
             generate_summary(
+                &preparation.entries_to_summarize,
                 &preparation.messages_to_summarize,
                 Arc::clone(&provider),
                 api_key,
@@ -1653,6 +1664,7 @@ pub async fn compact(
         };
 
         let turn_prefix_summary = generate_turn_prefix_summary(
+            &preparation.turn_prefix_entries,
             &preparation.turn_prefix_messages,
             Arc::clone(&provider),
             api_key,
@@ -1671,6 +1683,7 @@ pub async fn compact(
         history_summary
     } else {
         generate_summary(
+            &preparation.entries_to_summarize,
             &preparation.messages_to_summarize,
             Arc::clone(&provider),
             api_key,
