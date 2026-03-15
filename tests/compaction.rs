@@ -10,9 +10,11 @@ use pi::model::{
     ThinkingContent, ToolCall, Usage, UserContent, UserMessage,
 };
 use pi::provider::{Context, Provider, StreamOptions};
+use pi::reliability::{EvidenceRecord, StateDigest};
 use pi::session::{
     BranchSummaryEntry, CompactionEntry, EntryBase, MessageEntry, ModelChangeEntry, Session,
-    SessionEntry, SessionMessage,
+    SessionEntry, SessionMessage, StateDigestEntry, TaskCreatedEntry, TaskTransitionEntry,
+    VerificationEvidenceEntry,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -155,6 +157,71 @@ fn branch_summary_entry(
     })
 }
 
+fn state_digest_entry(
+    id: &str,
+    parent_id: Option<&str>,
+    objective: &str,
+    phase: &str,
+    blockers: Vec<&str>,
+    next_action: Option<&str>,
+) -> SessionEntry {
+    let mut digest = StateDigest::new(objective, phase);
+    digest.blockers = blockers.into_iter().map(str::to_string).collect();
+    digest.next_action = next_action.map(str::to_string);
+    SessionEntry::StateDigest(StateDigestEntry {
+        base: base(Some(id), parent_id),
+        digest,
+    })
+}
+
+fn task_created_entry(
+    id: &str,
+    parent_id: Option<&str>,
+    task_id: &str,
+    objective: &str,
+) -> SessionEntry {
+    SessionEntry::TaskCreated(TaskCreatedEntry {
+        base: base(Some(id), parent_id),
+        task_id: task_id.to_string(),
+        objective: objective.to_string(),
+        agent_id: None,
+        timestamp_utc: TS.to_string(),
+    })
+}
+
+fn task_transition_entry(
+    id: &str,
+    parent_id: Option<&str>,
+    task_id: &str,
+    from: Option<&str>,
+    to: &str,
+    details: Option<Value>,
+) -> SessionEntry {
+    SessionEntry::TaskTransition(TaskTransitionEntry {
+        base: base(Some(id), parent_id),
+        task_id: task_id.to_string(),
+        from: from.map(str::to_string),
+        to: to.to_string(),
+        details,
+        timestamp_utc: TS.to_string(),
+    })
+}
+
+fn verification_evidence_entry(
+    id: &str,
+    parent_id: Option<&str>,
+    task_id: &str,
+    command: &str,
+    exit_code: i32,
+) -> SessionEntry {
+    let evidence =
+        EvidenceRecord::from_command_output(task_id, command, exit_code, "ok", "", Vec::new());
+    SessionEntry::VerificationEvidence(VerificationEvidenceEntry {
+        base: base(Some(id), parent_id),
+        evidence,
+    })
+}
+
 fn compaction_entry(
     id: &str,
     parent_id: Option<&str>,
@@ -265,6 +332,13 @@ fn tool_result(tool_call_id: &str, tool_name: &str, content: &str) -> SessionMes
         is_error: false,
         timestamp: Some(0),
     }
+}
+
+fn checkpoint_json(state: &str) -> String {
+    json!({
+        "currentState": state,
+    })
+    .to_string()
 }
 
 fn text_of_tokens(tokens: usize) -> String {
@@ -645,7 +719,7 @@ fn compact_non_split_turn_calls_provider_once() {
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    let provider = Arc::new(ScriptedProvider::new(["SUMMARY"]));
+    let provider = Arc::new(ScriptedProvider::new([checkpoint_json("SUMMARY")]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
 
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
@@ -680,8 +754,8 @@ fn compact_split_turn_calls_provider_twice_and_formats_sections() {
     assert!(!prep.turn_prefix_messages.is_empty());
 
     let provider = Arc::new(ScriptedProvider::new([
-        "HISTORY_SUMMARY",
-        "TURN_PREFIX_SUMMARY",
+        checkpoint_json("HISTORY_SUMMARY"),
+        "TURN_PREFIX_SUMMARY".to_string(),
     ]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
 
@@ -690,7 +764,11 @@ fn compact_split_turn_calls_provider_twice_and_formats_sections() {
     log_result(&harness, &result);
 
     assert!(result.summary.contains("HISTORY_SUMMARY"));
-    assert!(result.summary.contains("**Turn Context (split turn):**"));
+    assert!(
+        result
+            .summary
+            .contains("Split-turn carry-over: TURN_PREFIX_SUMMARY")
+    );
     assert!(result.summary.contains("TURN_PREFIX_SUMMARY"));
     assert_eq!(provider.prompts().len(), 2);
 }
@@ -721,13 +799,13 @@ fn compact_appends_file_operations_and_sorts_lists() {
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new([checkpoint_json("S")]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
     log_result(&harness, &result);
 
-    assert!(result.summary.contains("<read-files>"));
-    assert!(result.summary.contains("<modified-files>"));
+    assert!(result.summary.contains("files_examined[1]:"));
+    assert!(result.summary.contains("files_modified[2]:"));
     assert_eq!(result.details.read_files, vec!["b.txt".to_string()]);
     assert_eq!(
         result.details.modified_files,
@@ -767,7 +845,7 @@ fn compact_seeds_file_ops_from_previous_compaction_details() {
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new([checkpoint_json("S")]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
     log_result(&harness, &result);
@@ -812,13 +890,98 @@ fn compact_does_not_seed_file_ops_when_previous_compaction_from_hook() {
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new([checkpoint_json("S")]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
     log_result(&harness, &result);
 
     assert_eq!(result.details.read_files, vec!["r2.txt".to_string()]);
     assert!(result.details.modified_files.is_empty());
+}
+
+#[test]
+fn compact_merges_runtime_tasks_and_verification_into_checkpoint() {
+    let harness = TestHarness::new("compact_merges_runtime_tasks_and_verification_into_checkpoint");
+
+    let entries = vec![
+        state_digest_entry(
+            "sd0",
+            None,
+            "Ship token-efficient compaction",
+            "dispatching",
+            vec!["task-tests waiting on task-compaction"],
+            Some("dispatch ready tasks"),
+        ),
+        task_created_entry(
+            "tc0",
+            Some("sd0"),
+            "task-compaction",
+            "Implement structured checkpoints",
+        ),
+        task_transition_entry(
+            "tt0",
+            Some("tc0"),
+            "task-compaction",
+            Some("ready"),
+            "executing",
+            None,
+        ),
+        verification_evidence_entry(
+            "ve0",
+            Some("tt0"),
+            "task-compaction",
+            "cargo test compaction",
+            0,
+        ),
+        task_created_entry("tc1", Some("ve0"), "task-tests", "Update compaction tests"),
+        task_transition_entry(
+            "tt1",
+            Some("tc1"),
+            "task-tests",
+            Some("ready"),
+            "blocked",
+            Some(json!({"waitingOn": ["task-compaction"]})),
+        ),
+        message_entry("u1", Some("tt1"), user_text(text_of_tokens(1))),
+        message_entry("u2", Some("u1"), user_text(text_of_tokens(1))),
+    ];
+
+    let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
+    log_preparation(&harness, &entries, &prep);
+
+    let provider_dyn: Arc<dyn Provider> =
+        Arc::new(ScriptedProvider::new([checkpoint_json("ORCH")]));
+    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
+        .expect("compact");
+    log_result(&harness, &result);
+
+    assert!(result.summary.contains(
+        "orchestration: dispatching | Ship token-efficient compaction | next=dispatch ready tasks"
+    ));
+    assert!(result.summary.contains("task_counts[2]:"));
+    assert!(result.summary.contains("- blocked=1"));
+    assert!(result.summary.contains("- executing=1"));
+    assert!(result.summary.contains(
+        "- task-compaction | executing | Implement structured checkpoints | verify=passed: cargo test compaction (exit=0)"
+    ));
+    assert!(
+        result.summary.contains(
+            "- task-tests | blocked | Update compaction tests | blockers=task-compaction"
+        )
+    );
+
+    let structured = result
+        .details
+        .structured_summary
+        .as_ref()
+        .expect("structured summary");
+    assert!(
+        structured
+            .orchestration
+            .as_ref()
+            .is_some_and(|orchestration| orchestration.phase == "dispatching")
+    );
+    assert_eq!(structured.runtime_tasks.len(), 2);
 }
 
 #[test]
@@ -837,7 +1000,7 @@ fn compact_includes_previous_summary_in_prompt_for_incremental_update() {
     log_preparation(&harness, &entries, &prep);
     assert_eq!(prep.previous_summary.as_deref(), Some("PREV"));
 
-    let provider = Arc::new(ScriptedProvider::new(["UPDATED"]));
+    let provider = Arc::new(ScriptedProvider::new([checkpoint_json("UPDATED")]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
@@ -846,7 +1009,7 @@ fn compact_includes_previous_summary_in_prompt_for_incremental_update() {
     let prompt = provider.prompts().first().expect("prompt").clone();
     assert!(prompt.contains("<previous-summary>"));
     assert!(prompt.contains("PREV"));
-    assert!(prompt.contains("Update the existing structured summary"));
+    assert!(prompt.contains("merge into the existing checkpoint"));
 }
 
 #[test]
@@ -980,7 +1143,7 @@ fn compact_prompt_includes_thinking_and_tool_calls_in_serialized_conversation() 
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    let provider = Arc::new(ScriptedProvider::new(["S"]));
+    let provider = Arc::new(ScriptedProvider::new([checkpoint_json("S")]));
     let provider_dyn: Arc<dyn Provider> = provider.clone();
     let _result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
@@ -1086,7 +1249,8 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
     log_preparation(&harness, &session.entries, &prep);
     assert_eq!(prep.first_kept_entry_id, "u1");
 
-    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["SUM1"]));
+    let provider_dyn: Arc<dyn Provider> =
+        Arc::new(ScriptedProvider::new([checkpoint_json("SUM1")]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
     log_result(&harness, &result);
@@ -1178,7 +1342,7 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
     // u1(1) + a1(2) + u2(1) = 4 tokens to keep
     let prep1 = prepare_compaction(&entries, make_settings(4)).expect("prep1");
     assert_eq!(prep1.first_kept_entry_id, "u1");
-    let provider1_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S1"]));
+    let provider1_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new([checkpoint_json("S1")]));
     let result1 = run_async(async move { compact(prep1, provider1_dyn, "test-key", None).await })
         .expect("compact1");
 
@@ -1225,7 +1389,7 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
 
     dump_timeline(&harness, "setup", &entries2);
 
-    let provider2 = Arc::new(ScriptedProvider::new(["S2"]));
+    let provider2 = Arc::new(ScriptedProvider::new([checkpoint_json("S2")]));
     let provider2_dyn: Arc<dyn Provider> = provider2.clone();
 
     let prep2 = prepare_compaction(&entries2, make_settings(1)).expect("prep2");
@@ -1254,7 +1418,7 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
     let prompt = provider2.prompts().first().expect("prompt").clone();
     assert!(prompt.contains("<previous-summary>"));
     assert!(prompt.contains("S1"));
-    assert!(prompt.contains("Update the existing structured summary"));
+    assert!(prompt.contains("merge into the existing checkpoint"));
 
     let mut session = Session::in_memory();
     session.header.id = "sess-bd-p2l-2".to_string();
@@ -1329,7 +1493,7 @@ fn prepare_compaction_ignores_malformed_previous_compaction_details() {
     let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["S"]));
+    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new([checkpoint_json("S")]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
     log_result(&harness, &result);
@@ -1428,7 +1592,8 @@ fn prepare_compaction_turn_prefix_tool_calls_contribute_to_file_ops() {
     assert_eq!(prep.messages_to_summarize.len(), 2);
     assert_eq!(prep.turn_prefix_messages.len(), 3);
 
-    let provider_dyn: Arc<dyn Provider> = Arc::new(ScriptedProvider::new(["TURN"]));
+    let provider_dyn: Arc<dyn Provider> =
+        Arc::new(ScriptedProvider::new([checkpoint_json("TURN")]));
     let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
         .expect("compact");
     log_result(&harness, &result);

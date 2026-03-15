@@ -294,6 +294,7 @@ mod tests {
             details: compaction::CompactionDetails {
                 read_files: vec![],
                 modified_files: vec![],
+                structured_summary: None,
             },
         };
         tx.send(Ok(result)).unwrap();

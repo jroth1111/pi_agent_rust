@@ -30,8 +30,9 @@ pub use processors::{
     LastNProcessor, NoOpProcessor, ProcessorChain,
 };
 pub use summary::{
-    ChangeType, CompactionSummary, Decision, ErrorRecord, FileChange, FileSummary, TaskComplexity,
-    TaskOutcome, calculate_threshold, threshold_to_tokens,
+    ChangeType, CompactionSummary, Decision, ErrorRecord, FileChange, FileSummary,
+    OrchestrationSummary, RuntimeTaskSummary, TaskComplexity, TaskOutcome, VerificationSummary,
+    calculate_threshold, threshold_to_tokens,
 };
 pub use tool_output_pruner::{
     PRUNE_MINIMUM_TOKENS, PRUNE_PROTECT_TOKENS, TAG_KEEP_OUTPUT, TAG_PRUNE_OUTPUT,

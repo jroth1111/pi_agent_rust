@@ -8,6 +8,10 @@
 //!   and omits older messages.
 
 use crate::context::visibility::VisibilityState;
+use crate::context::{
+    ChangeType, CompactionSummary, Decision, ErrorRecord, FileChange, FileSummary,
+    OrchestrationSummary, RuntimeTaskSummary, TaskOutcome, VerificationSummary,
+};
 use crate::error::{Error, Result};
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ThinkingLevel, ToolCall,
@@ -16,9 +20,9 @@ use crate::model::{
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -97,6 +101,8 @@ impl Default for ResolvedCompactionSettings {
 pub struct CompactionDetails {
     pub read_files: Vec<String>,
     pub modified_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_summary: Option<CompactionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,11 +117,14 @@ pub struct CompactionResult {
 #[derive(Debug, Clone)]
 pub struct CompactionPreparation {
     pub first_kept_entry_id: String,
+    pub entries_to_summarize: Vec<SessionEntry>,
     pub messages_to_summarize: Vec<SessionMessage>,
+    pub turn_prefix_entries: Vec<SessionEntry>,
     pub turn_prefix_messages: Vec<SessionMessage>,
     pub is_split_turn: bool,
     pub tokens_before: u64,
     pub previous_summary: Option<String>,
+    pub previous_structured_summary: Option<CompactionSummary>,
     pub file_ops: FileOperations,
     pub settings: ResolvedCompactionSettings,
 }
@@ -319,6 +328,7 @@ fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
     (read_only, modified_files)
 }
 
+#[cfg(test)]
 fn write_escaped_file_list(out: &mut String, tag: &str, files: &[String]) {
     out.push('<');
     out.push_str(tag);
@@ -341,6 +351,7 @@ fn write_escaped_file_list(out: &mut String, tag: &str, files: &[String]) {
     out.push('>');
 }
 
+#[cfg(test)]
 fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     if read_files.is_empty() && modified_files.is_empty() {
         return String::new();
@@ -641,13 +652,51 @@ fn find_cut_point(
 // Summarization prompts
 // =============================================================================
 
-const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Read a conversation between a user and an AI coding assistant, then emit ONLY valid JSON matching the requested schema. Do not continue the conversation. Do not wrap the JSON in markdown fences.";
 
-const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const SUMMARIZATION_PROMPT: &str = "Summarize the conversation into a compact checkpoint for a future coding agent turn.\n\nReturn EXACTLY one JSON object with this shape:\n{\n  \"userIntent\": string,\n  \"completedTasks\": [{\"task\": string, \"result\": \"success\"|\"partial\"|\"failed\", \"details\": string}],\n  \"pendingTasks\": [string],\n  \"filesExamined\": [{\"path\": string, \"purpose\": string, \"keyInsights\": [string]}],\n  \"filesModified\": [{\"path\": string, \"changeType\": \"created\"|\"modified\"|\"deleted\", \"summary\": string}],\n  \"currentState\": string,\n  \"keyDecisions\": [{\"decision\": string, \"rationale\": string}],\n  \"errorHistory\": [{\"error\": string, \"resolution\": string|null}]\n}\n\nRules:\n- Preserve exact file paths, function names, command names, and error messages.\n- Prefer short factual strings over prose.\n- Omit duplicate items.\n- If a section has no data, use an empty string or empty array.";
 
-const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to merge into the existing checkpoint.\n\nIf <previous-summary-json> is present, treat it as authoritative structured state. If only <previous-summary> is present, preserve that information while converting it into the JSON schema.\n\nReturn EXACTLY one JSON object with the same schema as before.\n\nRules:\n- Preserve existing facts unless contradicted by the new messages.\n- Move tasks from pending to completed when they are finished.\n- Remove blockers only when the new messages show they were resolved.\n- Keep the result concise, deduplicated, and factual.\n- Preserve exact file paths, function names, command names, and error messages.";
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmCompactionSummary {
+    #[serde(default)]
+    user_intent: String,
+    #[serde(default)]
+    completed_tasks: Vec<TaskOutcome>,
+    #[serde(default)]
+    pending_tasks: Vec<String>,
+    #[serde(default)]
+    files_examined: Vec<FileSummary>,
+    #[serde(default)]
+    files_modified: Vec<FileChange>,
+    #[serde(default)]
+    current_state: String,
+    #[serde(default)]
+    key_decisions: Vec<Decision>,
+    #[serde(default)]
+    error_history: Vec<ErrorRecord>,
+}
+
+impl From<LlmCompactionSummary> for CompactionSummary {
+    fn from(value: LlmCompactionSummary) -> Self {
+        Self {
+            user_intent: value.user_intent,
+            completed_tasks: value.completed_tasks,
+            pending_tasks: value.pending_tasks,
+            files_examined: value.files_examined,
+            files_modified: value.files_modified,
+            current_state: value.current_state,
+            orchestration: None,
+            runtime_tasks: Vec::new(),
+            key_decisions: value.key_decisions,
+            error_history: value.error_history,
+        }
+    }
+}
 
 fn push_message_separator(out: &mut String) {
     if !out.is_empty() {
@@ -838,6 +887,350 @@ fn collect_text_blocks(blocks: &[ContentBlock]) -> String {
     out
 }
 
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_structured_summary(text: &str) -> Result<CompactionSummary> {
+    let candidate = extract_first_json_object(text).unwrap_or(text);
+    let parsed: LlmCompactionSummary = serde_json::from_str(candidate)
+        .map_err(|e| Error::api(format!("Failed to parse compaction summary JSON: {e}")))?;
+    Ok(parsed.into())
+}
+
+fn merge_file_ops_into_summary(
+    summary: &mut CompactionSummary,
+    read_files: &[String],
+    modified_files: &[String],
+) {
+    let mut seen_examined = summary
+        .files_examined
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
+    for path in read_files {
+        if seen_examined.insert(path.clone()) {
+            summary.files_examined.push(FileSummary {
+                path: path.clone(),
+                purpose: "Referenced in compacted history".to_string(),
+                key_insights: Vec::new(),
+            });
+        }
+    }
+
+    let mut seen_modified = summary
+        .files_modified
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
+    for path in modified_files {
+        if seen_modified.insert(path.clone()) {
+            summary.files_modified.push(FileChange {
+                path: path.clone(),
+                change_type: ChangeType::Modified,
+                summary: "Modified in compacted history".to_string(),
+            });
+        }
+    }
+}
+
+fn push_unique_trimmed(target: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() || target.iter().any(|item| item == value) {
+        return;
+    }
+    target.push(value.to_string());
+}
+
+fn set_trimmed(target: &mut String, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        target.clear();
+        target.push_str(value);
+    }
+}
+
+fn set_optional_trimmed(target: &mut Option<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        *target = Some(value.to_string());
+    }
+}
+
+fn clear_task_blockers_for_state(state: &str) -> bool {
+    matches!(
+        state,
+        "ready"
+            | "leased"
+            | "executing"
+            | "verifying"
+            | "succeeded"
+            | "failed"
+            | "canceled"
+            | "superseded"
+    )
+}
+
+fn detail_string(details: Option<&Value>, key: &str) -> Option<String> {
+    details
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn detail_string_list(details: Option<&Value>, key: &str) -> Vec<String> {
+    details
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn task_detail_note(details: Option<&Value>) -> Option<String> {
+    for key in ["summary", "reason", "context"] {
+        if let Some(value) = detail_string(details, key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn is_effectively_empty_orchestration(summary: &OrchestrationSummary) -> bool {
+    summary.objective.is_empty()
+        && summary.phase.is_empty()
+        && summary.blockers.is_empty()
+        && summary.recent_actions.is_empty()
+        && summary.next_action.is_none()
+}
+
+fn is_effectively_empty_runtime_task(summary: &RuntimeTaskSummary) -> bool {
+    summary.task_id.is_empty()
+        && summary.state.is_empty()
+        && summary.objective.is_empty()
+        && summary.blockers.is_empty()
+        && summary.latest_update.is_empty()
+        && summary.last_checkpoint_phase.is_none()
+        && summary.verification.is_none()
+        && summary.close_outcome.is_none()
+}
+
+fn merge_runtime_state_into_summary(
+    summary: &mut CompactionSummary,
+    entries: &[SessionEntry],
+    previous_summary: Option<&CompactionSummary>,
+) {
+    let mut orchestration = summary
+        .orchestration
+        .clone()
+        .or_else(|| previous_summary.and_then(|previous| previous.orchestration.clone()));
+    let mut tasks = if summary.runtime_tasks.is_empty() {
+        previous_summary
+            .map(|previous| {
+                previous
+                    .runtime_tasks
+                    .iter()
+                    .cloned()
+                    .map(|task| (task.task_id.clone(), task))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default()
+    } else {
+        summary
+            .runtime_tasks
+            .iter()
+            .cloned()
+            .map(|task| (task.task_id.clone(), task))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    for entry in entries {
+        match entry {
+            SessionEntry::StateDigest(entry) => {
+                let snapshot = orchestration.get_or_insert_with(OrchestrationSummary::default);
+                set_trimmed(&mut snapshot.objective, &entry.digest.objective);
+                set_trimmed(&mut snapshot.phase, &entry.digest.phase);
+                snapshot.blockers.clear();
+                for blocker in &entry.digest.blockers {
+                    push_unique_trimmed(&mut snapshot.blockers, blocker);
+                }
+                snapshot.recent_actions.clear();
+                for action in &entry.digest.recent_actions {
+                    push_unique_trimmed(&mut snapshot.recent_actions, action);
+                }
+                snapshot.next_action = entry
+                    .digest
+                    .next_action
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+            }
+            SessionEntry::TaskCreated(entry) => {
+                let task = tasks
+                    .entry(entry.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.task_id.clone()));
+                set_trimmed(&mut task.objective, &entry.objective);
+                if task.state.is_empty() {
+                    task.state = "created".to_string();
+                }
+            }
+            SessionEntry::TaskTransition(entry) => {
+                let task = tasks
+                    .entry(entry.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.task_id.clone()));
+                set_trimmed(&mut task.state, &entry.to);
+                if clear_task_blockers_for_state(task.state.as_str()) {
+                    task.blockers.clear();
+                }
+                let mut blockers = detail_string_list(entry.details.as_ref(), "waitingOn");
+                if blockers.is_empty() {
+                    blockers = detail_string_list(entry.details.as_ref(), "waiting_on");
+                }
+                if blockers.is_empty()
+                    && matches!(
+                        task.state.as_str(),
+                        "blocked" | "awaiting_human" | "recoverable"
+                    )
+                {
+                    if let Some(note) = task_detail_note(entry.details.as_ref()) {
+                        blockers.push(note);
+                    }
+                }
+                if !blockers.is_empty() {
+                    task.blockers.clear();
+                    for blocker in blockers {
+                        push_unique_trimmed(&mut task.blockers, &blocker);
+                    }
+                }
+                if let Some(note) = task_detail_note(entry.details.as_ref()) {
+                    set_trimmed(&mut task.latest_update, &note);
+                }
+            }
+            SessionEntry::TaskCheckpoint(entry) => {
+                let task = tasks
+                    .entry(entry.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.task_id.clone()));
+                set_optional_trimmed(&mut task.last_checkpoint_phase, &entry.phase);
+                set_trimmed(&mut task.latest_update, &entry.summary);
+            }
+            SessionEntry::VerificationEvidence(entry) => {
+                let task = tasks
+                    .entry(entry.evidence.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.evidence.task_id.clone()));
+                task.verification = Some(VerificationSummary {
+                    command: entry.evidence.command.trim().to_string(),
+                    status: match entry.evidence.status {
+                        crate::reliability::EvidenceStatus::Pending => "pending".to_string(),
+                        crate::reliability::EvidenceStatus::Passed => "passed".to_string(),
+                        crate::reliability::EvidenceStatus::Failed => "failed".to_string(),
+                        crate::reliability::EvidenceStatus::Skipped => "skipped".to_string(),
+                    },
+                    exit_code: Some(entry.evidence.exit_code),
+                });
+            }
+            SessionEntry::CloseDecision(entry) => {
+                let task = tasks
+                    .entry(entry.payload.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.payload.task_id.clone()));
+                set_optional_trimmed(&mut task.close_outcome, &entry.payload.outcome);
+                if entry.result.approved {
+                    match entry.payload.outcome_kind {
+                        Some(crate::reliability::CloseOutcomeKind::Success) => {
+                            task.state = "succeeded".to_string();
+                            task.blockers.clear();
+                        }
+                        Some(crate::reliability::CloseOutcomeKind::Failure) => {
+                            task.state = "failed".to_string();
+                        }
+                        None => {}
+                    }
+                } else {
+                    for violation in &entry.result.violations {
+                        push_unique_trimmed(&mut task.blockers, violation);
+                    }
+                }
+            }
+            SessionEntry::HumanBlockerRaised(entry) => {
+                let task = tasks
+                    .entry(entry.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.task_id.clone()));
+                if task.state.is_empty() {
+                    task.state = "awaiting_human".to_string();
+                }
+                push_unique_trimmed(&mut task.blockers, &entry.reason);
+                push_unique_trimmed(&mut task.blockers, &entry.context);
+                set_trimmed(&mut task.latest_update, &entry.reason);
+            }
+            SessionEntry::HumanBlockerResolved(entry) => {
+                let task = tasks
+                    .entry(entry.task_id.clone())
+                    .or_insert_with(|| RuntimeTaskSummary::new(entry.task_id.clone()));
+                task.blockers.clear();
+                set_trimmed(
+                    &mut task.latest_update,
+                    &format!("Resolved blocker: {}", entry.resolution.trim()),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    summary.orchestration =
+        orchestration.filter(|value| !is_effectively_empty_orchestration(value));
+    summary.runtime_tasks = tasks
+        .into_values()
+        .filter(|task| !is_effectively_empty_runtime_task(task))
+        .collect::<Vec<_>>();
+    summary
+        .runtime_tasks
+        .sort_by(|left, right| left.task_id.cmp(&right.task_id));
+}
+
 fn serialize_conversation(messages: &[Message]) -> String {
     let mut out = String::new();
 
@@ -919,8 +1312,9 @@ async fn generate_summary(
     settings: &ResolvedCompactionSettings,
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
-) -> Result<String> {
-    let base_prompt = if previous_summary.is_some() {
+    previous_structured_summary: Option<&CompactionSummary>,
+) -> Result<CompactionSummary> {
+    let base_prompt = if previous_summary.is_some() || previous_structured_summary.is_some() {
         UPDATE_SUMMARIZATION_PROMPT
     } else {
         SUMMARIZATION_PROMPT
@@ -938,6 +1332,14 @@ async fn generate_summary(
     let conversation_text = serialize_conversation(&llm_messages);
 
     let mut prompt_text = format!("<conversation>\n{conversation_text}\n</conversation>\n\n");
+    if let Some(previous) = previous_structured_summary {
+        let previous_json = serde_json::to_string(previous)
+            .map_err(|e| Error::api(format!("Failed to serialize previous summary JSON: {e}")))?;
+        let _ = write!(
+            prompt_text,
+            "<previous-summary-json>\n{previous_json}\n</previous-summary-json>\n\n"
+        );
+    }
     if let Some(previous) = previous_summary {
         let _ = write!(
             prompt_text,
@@ -952,7 +1354,7 @@ async fn generate_summary(
         prompt_text,
         api_key,
         settings.reserve_tokens,
-        0.8,
+        0.3,
     )
     .await?;
 
@@ -964,7 +1366,7 @@ async fn generate_summary(
         ));
     }
 
-    Ok(text)
+    parse_structured_summary(&text)
 }
 
 async fn generate_turn_prefix_summary(
@@ -1067,17 +1469,20 @@ pub fn prepare_compaction(
         cut_point.first_kept_entry_index
     };
 
+    let entries_to_summarize = path_entries[boundary_start..history_end].to_vec();
     let mut messages_to_summarize = Vec::new();
-    for entry in &path_entries[boundary_start..history_end] {
+    for entry in &entries_to_summarize {
         if let Some(msg) = message_from_entry(entry) {
             messages_to_summarize.push(msg);
         }
     }
 
+    let mut turn_prefix_entries = Vec::new();
     let mut turn_prefix_messages = Vec::new();
     if cut_point.is_split_turn {
         let turn_start = cut_point.turn_start_index?;
-        for entry in &path_entries[turn_start..cut_point.first_kept_entry_index] {
+        turn_prefix_entries = path_entries[turn_start..cut_point.first_kept_entry_index].to_vec();
+        for entry in &turn_prefix_entries {
             if let Some(msg) = message_from_entry(entry) {
                 turn_prefix_messages.push(msg);
             }
@@ -1094,6 +1499,17 @@ pub fn prepare_compaction(
         SessionEntry::Compaction(entry) => Some(entry.summary.clone()),
         _ => None,
     });
+    let previous_structured_summary =
+        prev_compaction_index.and_then(|idx| match &path_entries[idx] {
+            SessionEntry::Compaction(entry) => entry
+                .details
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("structuredSummary"))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            _ => None,
+        });
 
     let mut file_ops = FileOperations::default();
 
@@ -1131,11 +1547,14 @@ pub fn prepare_compaction(
 
     Some(CompactionPreparation {
         first_kept_entry_id,
+        entries_to_summarize,
         messages_to_summarize,
+        turn_prefix_entries,
         turn_prefix_messages,
         is_split_turn: cut_point.is_split_turn,
         tokens_before,
         previous_summary,
+        previous_structured_summary,
         file_ops,
         settings,
     })
@@ -1166,17 +1585,20 @@ pub async fn summarize_entries(
         ..Default::default()
     };
 
-    let summary = generate_summary(
+    let mut summary = generate_summary(
         &messages,
         provider,
         api_key,
         &settings,
         custom_instructions,
         None,
+        None,
     )
     .await?;
 
-    Ok(Some(summary))
+    merge_runtime_state_into_summary(&mut summary, entries, None);
+
+    Ok(Some(summary.to_checkpoint_string()))
 }
 
 pub async fn compact(
@@ -1185,9 +1607,13 @@ pub async fn compact(
     api_key: &str,
     custom_instructions: Option<&str>,
 ) -> Result<CompactionResult> {
-    let summary = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let history_summary = if preparation.messages_to_summarize.is_empty() {
-            "No prior history.".to_string()
+    let mut summary = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+        let mut history_summary = if preparation.messages_to_summarize.is_empty() {
+            CompactionSummary {
+                current_state: "No prior history before the retained split-turn suffix."
+                    .to_string(),
+                ..Default::default()
+            }
         } else {
             generate_summary(
                 &preparation.messages_to_summarize,
@@ -1196,6 +1622,7 @@ pub async fn compact(
                 &preparation.settings,
                 custom_instructions,
                 preparation.previous_summary.as_deref(),
+                preparation.previous_structured_summary.as_ref(),
             )
             .await?
         };
@@ -1208,9 +1635,15 @@ pub async fn compact(
         )
         .await?;
 
-        format!(
-            "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
-        )
+        if history_summary.current_state.is_empty() {
+            history_summary.current_state = format!("Split-turn carry-over: {turn_prefix_summary}");
+        } else {
+            history_summary
+                .current_state
+                .push_str(&format!("\nSplit-turn carry-over: {turn_prefix_summary}"));
+        }
+
+        history_summary
     } else {
         generate_summary(
             &preparation.messages_to_summarize,
@@ -1219,18 +1652,29 @@ pub async fn compact(
             &preparation.settings,
             custom_instructions,
             preparation.previous_summary.as_deref(),
+            preparation.previous_structured_summary.as_ref(),
         )
         .await?
     };
 
+    merge_runtime_state_into_summary(
+        &mut summary,
+        &preparation.entries_to_summarize,
+        preparation.previous_structured_summary.as_ref(),
+    );
+    if preparation.is_split_turn {
+        merge_runtime_state_into_summary(&mut summary, &preparation.turn_prefix_entries, None);
+    }
+
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+    merge_file_ops_into_summary(&mut summary, &read_files, &modified_files);
     let details = CompactionDetails {
         read_files: read_files.clone(),
         modified_files: modified_files.clone(),
+        structured_summary: Some(summary.clone()),
     };
 
-    let mut summary = summary;
-    summary.push_str(&format_file_operations(&read_files, &modified_files));
+    let summary = summary.to_checkpoint_string();
 
     Ok(CompactionResult {
         summary,
@@ -1571,6 +2015,7 @@ mod tests {
         let details = CompactionDetails {
             read_files: vec!["a.rs".to_string()],
             modified_files: vec!["b.rs".to_string()],
+            structured_summary: None,
         };
         let value = compaction_details_to_value(&details).unwrap();
         assert_eq!(value["readFiles"], json!(["a.rs"]));

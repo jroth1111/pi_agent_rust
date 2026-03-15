@@ -12,6 +12,7 @@
 //! formatted as human-readable context strings for LLM consumption.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Type of file change operation.
@@ -95,6 +96,99 @@ pub struct ErrorRecord {
     pub resolution: Option<String>,
 }
 
+/// Snapshot of the runtime orchestration state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationSummary {
+    /// Runtime objective currently being executed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub objective: String,
+    /// High-level runtime phase.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase: String,
+    /// Active blockers reported by the runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    /// Recent runtime actions worth preserving across compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_actions: Vec<String>,
+    /// Next action suggested by the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+}
+
+impl OrchestrationSummary {
+    pub fn is_empty(&self) -> bool {
+        self.objective.is_empty()
+            && self.phase.is_empty()
+            && self.blockers.is_empty()
+            && self.recent_actions.is_empty()
+            && self.next_action.is_none()
+    }
+}
+
+/// Verification state attached to a runtime task.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationSummary {
+    /// Verification command that last ran for the task.
+    pub command: String,
+    /// Verification outcome status.
+    pub status: String,
+    /// Exit code when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// Dense task snapshot derived from the reliability runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeTaskSummary {
+    /// Stable runtime task identifier.
+    pub task_id: String,
+    /// Current runtime state label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// Task objective or title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub objective: String,
+    /// Current blockers tied to the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    /// Most recent noteworthy update.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub latest_update: String,
+    /// Last checkpoint phase recorded for the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_phase: Option<String>,
+    /// Latest verification status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationSummary>,
+    /// Outcome recorded during close-out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_outcome: Option<String>,
+}
+
+impl RuntimeTaskSummary {
+    pub fn new(task_id: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.task_id.is_empty()
+            && self.state.is_empty()
+            && self.objective.is_empty()
+            && self.blockers.is_empty()
+            && self.latest_update.is_empty()
+            && self.last_checkpoint_phase.is_none()
+            && self.verification.is_none()
+            && self.close_outcome.is_none()
+    }
+}
+
 /// Structured summary for context compaction.
 ///
 /// This is the main type for capturing session state in a structured format
@@ -126,6 +220,7 @@ pub struct ErrorRecord {
 ///         },
 ///     ],
 ///     error_history: vec![],
+///     ..Default::default()
 /// };
 ///
 /// let context_string = summary.to_context_string();
@@ -157,6 +252,14 @@ pub struct CompactionSummary {
     /// Current state of the work.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub current_state: String,
+
+    /// Runtime orchestration state preserved across compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<OrchestrationSummary>,
+
+    /// Runtime task snapshots preserved across compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_tasks: Vec<RuntimeTaskSummary>,
 
     /// Key decisions made during the session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -240,6 +343,82 @@ impl CompactionSummary {
             output.push_str("\n\n");
         }
 
+        if let Some(orchestration) = &self.orchestration {
+            if !orchestration.is_empty() {
+                output.push_str("## Orchestration\n");
+                if !orchestration.phase.is_empty() || !orchestration.objective.is_empty() {
+                    if orchestration.phase.is_empty() {
+                        let _ = writeln!(output, "- objective: {}", orchestration.objective);
+                    } else if orchestration.objective.is_empty() {
+                        let _ = writeln!(output, "- phase: {}", orchestration.phase);
+                    } else {
+                        let _ = writeln!(
+                            output,
+                            "- phase: {} | objective: {}",
+                            orchestration.phase, orchestration.objective
+                        );
+                    }
+                }
+                if let Some(next_action) = &orchestration.next_action {
+                    let _ = writeln!(output, "- next: {}", next_action);
+                }
+                for blocker in &orchestration.blockers {
+                    let _ = writeln!(output, "- blocker: {}", blocker);
+                }
+                for action in &orchestration.recent_actions {
+                    let _ = writeln!(output, "- recent: {}", action);
+                }
+                output.push('\n');
+            }
+        }
+
+        if !self.runtime_tasks.is_empty() {
+            output.push_str("## Runtime Tasks\n");
+            let mut tasks = self.runtime_tasks.clone();
+            tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+            for task in &tasks {
+                let _ = writeln!(
+                    output,
+                    "- {} [{}] {}",
+                    task.task_id,
+                    if task.state.is_empty() {
+                        "unknown"
+                    } else {
+                        &task.state
+                    },
+                    task.objective
+                );
+                if !task.blockers.is_empty() {
+                    let _ = writeln!(output, "  - blockers: {}", task.blockers.join(", "));
+                }
+                if let Some(phase) = &task.last_checkpoint_phase {
+                    let _ = writeln!(output, "  - phase: {}", phase);
+                }
+                if !task.latest_update.is_empty() {
+                    let _ = writeln!(output, "  - update: {}", task.latest_update);
+                }
+                if let Some(verification) = &task.verification {
+                    if let Some(exit_code) = verification.exit_code {
+                        let _ = writeln!(
+                            output,
+                            "  - verify: {} ({}, exit={})",
+                            verification.command, verification.status, exit_code
+                        );
+                    } else {
+                        let _ = writeln!(
+                            output,
+                            "  - verify: {} ({})",
+                            verification.command, verification.status
+                        );
+                    }
+                }
+                if let Some(close_outcome) = &task.close_outcome {
+                    let _ = writeln!(output, "  - close: {}", close_outcome);
+                }
+            }
+            output.push('\n');
+        }
+
         // Key Decisions
         if !self.key_decisions.is_empty() {
             output.push_str("## Key Decisions\n");
@@ -269,6 +448,188 @@ impl CompactionSummary {
         output.trim_end().to_string()
     }
 
+    /// Format the summary as a dense checkpoint string for prompt reuse.
+    ///
+    /// This keeps the structure explicit while cutting markdown overhead and
+    /// adding per-section counts to make truncation or omission easier to spot.
+    pub fn to_checkpoint_string(&self) -> String {
+        let mut output = String::from("CHECKPOINT v2\n");
+
+        if !self.user_intent.is_empty() {
+            let _ = writeln!(output, "goal: {}", self.user_intent.trim());
+        }
+
+        let _ = writeln!(output, "done[{}]:", self.completed_tasks.len());
+        for task in &self.completed_tasks {
+            if task.details.trim().is_empty() {
+                let _ = writeln!(output, "- {} | {}", task.result.trim(), task.task.trim());
+            } else {
+                let _ = writeln!(
+                    output,
+                    "- {} | {} | {}",
+                    task.result.trim(),
+                    task.task.trim(),
+                    task.details.trim()
+                );
+            }
+        }
+
+        let _ = writeln!(output, "pending[{}]:", self.pending_tasks.len());
+        for task in &self.pending_tasks {
+            let _ = writeln!(output, "- {}", task.trim());
+        }
+
+        let _ = writeln!(output, "files_examined[{}]:", self.files_examined.len());
+        for file in &self.files_examined {
+            if file.key_insights.is_empty() {
+                let _ = writeln!(output, "- {} | {}", file.path.trim(), file.purpose.trim());
+            } else {
+                let _ = writeln!(
+                    output,
+                    "- {} | {} | {}",
+                    file.path.trim(),
+                    file.purpose.trim(),
+                    file.key_insights.join(" ; ")
+                );
+            }
+        }
+
+        let _ = writeln!(output, "files_modified[{}]:", self.files_modified.len());
+        for change in &self.files_modified {
+            let _ = writeln!(
+                output,
+                "- {} | {} | {}",
+                change.path.trim(),
+                change.change_type,
+                change.summary.trim()
+            );
+        }
+
+        if !self.current_state.is_empty() {
+            let _ = writeln!(output, "state: {}", self.current_state.trim());
+        }
+
+        if let Some(orchestration) = &self.orchestration {
+            if !orchestration.is_empty() {
+                let mut parts = Vec::new();
+                if !orchestration.phase.trim().is_empty() {
+                    parts.push(orchestration.phase.trim().to_string());
+                }
+                if !orchestration.objective.trim().is_empty() {
+                    parts.push(orchestration.objective.trim().to_string());
+                }
+                if let Some(next_action) = &orchestration.next_action {
+                    let next_action = next_action.trim();
+                    if !next_action.is_empty() {
+                        parts.push(format!("next={next_action}"));
+                    }
+                }
+                if !parts.is_empty() {
+                    let _ = writeln!(output, "orchestration: {}", parts.join(" | "));
+                }
+                let _ = writeln!(
+                    output,
+                    "orchestration_blockers[{}]:",
+                    orchestration.blockers.len()
+                );
+                for blocker in &orchestration.blockers {
+                    let _ = writeln!(output, "- {}", blocker.trim());
+                }
+                let _ = writeln!(
+                    output,
+                    "orchestration_recent[{}]:",
+                    orchestration.recent_actions.len()
+                );
+                for action in &orchestration.recent_actions {
+                    let _ = writeln!(output, "- {}", action.trim());
+                }
+            }
+        }
+
+        if !self.runtime_tasks.is_empty() {
+            let mut counts = BTreeMap::new();
+            for task in &self.runtime_tasks {
+                let key = if task.state.trim().is_empty() {
+                    "unknown".to_string()
+                } else {
+                    task.state.trim().to_string()
+                };
+                *counts.entry(key).or_insert(0usize) += 1;
+            }
+            let _ = writeln!(output, "task_counts[{}]:", counts.len());
+            for (state, count) in counts {
+                let _ = writeln!(output, "- {}={}", state, count);
+            }
+
+            let mut tasks = self.runtime_tasks.clone();
+            tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+            let _ = writeln!(output, "tasks[{}]:", tasks.len());
+            for task in &tasks {
+                let mut parts = vec![task.task_id.trim().to_string()];
+                if !task.state.trim().is_empty() {
+                    parts.push(task.state.trim().to_string());
+                }
+                if !task.objective.trim().is_empty() {
+                    parts.push(task.objective.trim().to_string());
+                }
+                if !task.blockers.is_empty() {
+                    parts.push(format!("blockers={}", task.blockers.join(" ; ")));
+                }
+                if let Some(phase) = &task.last_checkpoint_phase {
+                    let phase = phase.trim();
+                    if !phase.is_empty() {
+                        parts.push(format!("phase={phase}"));
+                    }
+                }
+                if !task.latest_update.trim().is_empty() {
+                    parts.push(format!("update={}", task.latest_update.trim()));
+                }
+                if let Some(verification) = &task.verification {
+                    let mut verify = format!(
+                        "verify={}: {}",
+                        verification.status.trim(),
+                        verification.command.trim()
+                    );
+                    if let Some(exit_code) = verification.exit_code {
+                        verify.push_str(&format!(" (exit={exit_code})"));
+                    }
+                    parts.push(verify);
+                }
+                if let Some(close_outcome) = &task.close_outcome {
+                    let close_outcome = close_outcome.trim();
+                    if !close_outcome.is_empty() {
+                        parts.push(format!("close={close_outcome}"));
+                    }
+                }
+                let _ = writeln!(output, "- {}", parts.join(" | "));
+            }
+        }
+
+        let _ = writeln!(output, "decisions[{}]:", self.key_decisions.len());
+        for decision in &self.key_decisions {
+            let _ = writeln!(
+                output,
+                "- {} | {}",
+                decision.decision.trim(),
+                decision.rationale.trim()
+            );
+        }
+
+        let _ = writeln!(output, "errors[{}]:", self.error_history.len());
+        for error in &self.error_history {
+            match &error.resolution {
+                Some(resolution) if !resolution.trim().is_empty() => {
+                    let _ = writeln!(output, "- {} | {}", error.error.trim(), resolution.trim());
+                }
+                _ => {
+                    let _ = writeln!(output, "- {}", error.error.trim());
+                }
+            }
+        }
+
+        output.trim_end().to_string()
+    }
+
     /// Check if the summary is empty (contains no meaningful information).
     pub fn is_empty(&self) -> bool {
         self.user_intent.is_empty()
@@ -277,6 +638,11 @@ impl CompactionSummary {
             && self.files_examined.is_empty()
             && self.files_modified.is_empty()
             && self.current_state.is_empty()
+            && self
+                .orchestration
+                .as_ref()
+                .is_none_or(OrchestrationSummary::is_empty)
+            && self.runtime_tasks.is_empty()
             && self.key_decisions.is_empty()
             && self.error_history.is_empty()
     }
@@ -690,6 +1056,7 @@ mod tests {
                 error: "Type error".to_string(),
                 resolution: Some("Added cast".to_string()),
             }],
+            ..Default::default()
         };
         let context = summary.to_context_string();
 
@@ -712,6 +1079,53 @@ mod tests {
         assert!(context.contains("50% complete"));
         assert!(context.contains("**Use async**: Performance"));
         assert!(context.contains("Type error (resolved: Added cast)"));
+    }
+
+    #[test]
+    fn to_checkpoint_string_full() {
+        let summary = CompactionSummary {
+            user_intent: "Implement feature X".to_string(),
+            completed_tasks: vec![TaskOutcome {
+                task: "Research".to_string(),
+                result: "success".to_string(),
+                details: "Captured edge cases".to_string(),
+            }],
+            pending_tasks: vec!["Code it".to_string()],
+            files_examined: vec![FileSummary {
+                path: "/docs/api.md".to_string(),
+                purpose: "API docs".to_string(),
+                key_insights: vec!["Explains auth flow".to_string()],
+            }],
+            files_modified: vec![FileChange {
+                path: "/src/x.rs".to_string(),
+                change_type: ChangeType::Created,
+                summary: "Feature X impl".to_string(),
+            }],
+            current_state: "50% complete".to_string(),
+            key_decisions: vec![Decision {
+                decision: "Use async".to_string(),
+                rationale: "Performance".to_string(),
+            }],
+            error_history: vec![ErrorRecord {
+                error: "Type error".to_string(),
+                resolution: Some("Added cast".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let checkpoint = summary.to_checkpoint_string();
+
+        assert!(checkpoint.contains("CHECKPOINT v2"));
+        assert!(checkpoint.contains("done[1]:"));
+        assert!(checkpoint.contains("pending[1]:"));
+        assert!(checkpoint.contains("files_examined[1]:"));
+        assert!(checkpoint.contains("files_modified[1]:"));
+        assert!(checkpoint.contains("decisions[1]:"));
+        assert!(checkpoint.contains("errors[1]:"));
+        assert!(checkpoint.contains("- success | Research | Captured edge cases"));
+        assert!(checkpoint.contains("- /docs/api.md | API docs | Explains auth flow"));
+        assert!(checkpoint.contains("- /src/x.rs | created | Feature X impl"));
+        assert!(checkpoint.contains("state: 50% complete"));
     }
 
     #[test]
@@ -743,6 +1157,7 @@ mod tests {
                 error: "Oops".to_string(),
                 resolution: Some("Fixed".to_string()),
             }],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -776,8 +1191,67 @@ mod tests {
         assert!(!json.contains("\"filesExamined\""));
         assert!(!json.contains("\"filesModified\""));
         assert!(!json.contains("\"currentState\""));
+        assert!(!json.contains("\"orchestration\""));
+        assert!(!json.contains("\"runtimeTasks\""));
         assert!(!json.contains("\"keyDecisions\""));
         assert!(!json.contains("\"errorHistory\""));
+    }
+
+    #[test]
+    fn to_checkpoint_string_includes_orchestration_and_runtime_tasks() {
+        let summary = CompactionSummary {
+            orchestration: Some(OrchestrationSummary {
+                objective: "Ship token-efficient compaction".to_string(),
+                phase: "dispatching".to_string(),
+                blockers: vec!["task-tests waiting on task-compaction".to_string()],
+                recent_actions: vec!["planned compaction".to_string()],
+                next_action: Some("dispatch ready tasks".to_string()),
+            }),
+            runtime_tasks: vec![
+                RuntimeTaskSummary {
+                    task_id: "task-compaction".to_string(),
+                    state: "executing".to_string(),
+                    objective: "Implement structured checkpoints".to_string(),
+                    blockers: Vec::new(),
+                    latest_update: String::new(),
+                    last_checkpoint_phase: None,
+                    verification: Some(VerificationSummary {
+                        command: "cargo test compaction".to_string(),
+                        status: "passed".to_string(),
+                        exit_code: Some(0),
+                    }),
+                    close_outcome: None,
+                },
+                RuntimeTaskSummary {
+                    task_id: "task-tests".to_string(),
+                    state: "blocked".to_string(),
+                    objective: "Update compaction tests".to_string(),
+                    blockers: vec!["task-compaction".to_string()],
+                    latest_update: String::new(),
+                    last_checkpoint_phase: None,
+                    verification: None,
+                    close_outcome: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let checkpoint = summary.to_checkpoint_string();
+
+        assert!(checkpoint.contains(
+            "orchestration: dispatching | Ship token-efficient compaction | next=dispatch ready tasks"
+        ));
+        assert!(checkpoint.contains("orchestration_blockers[1]:"));
+        assert!(checkpoint.contains("orchestration_recent[1]:"));
+        assert!(checkpoint.contains("task_counts[2]:"));
+        assert!(checkpoint.contains("- blocked=1"));
+        assert!(checkpoint.contains("- executing=1"));
+        assert!(checkpoint.contains(
+            "- task-compaction | executing | Implement structured checkpoints | verify=passed: cargo test compaction (exit=0)"
+        ));
+        assert!(checkpoint.contains(
+            "- task-tests | blocked | Update compaction tests | blockers=task-compaction"
+        ));
     }
 
     #[test]
