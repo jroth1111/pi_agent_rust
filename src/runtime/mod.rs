@@ -1,27 +1,31 @@
-mod events;
-mod store;
-mod types;
+//! Canonical runtime control plane for durable multi-step runs.
+//!
+//! This subsystem is the long-term source of truth for run state, event
+//! history, model routing, and policy decisions. Existing orchestration paths
+//! can migrate into it incrementally.
 
-pub use events::{RuntimeEvent, RuntimeEventDraft, RuntimeEventKind, RuntimeEventLog};
-pub use store::{RuntimeSnapshotStore, RuntimeStore, RuntimeStoreManifest};
-pub use types::{
-    JobRecord, JobStatus, Metadata, ModelProfile, PlanArtifact, PolicyOutcome, PolicyVerdict,
-    RunSnapshot, RunSpec, TaskNode, TaskRuntime, TaskState, JOB_RECORD_SCHEMA,
-    MODEL_PROFILE_SCHEMA, PLAN_ARTIFACT_SCHEMA, POLICY_VERDICT_SCHEMA, RUN_SNAPSHOT_SCHEMA,
-    RUN_SPEC_SCHEMA, TASK_NODE_SCHEMA, TASK_RUNTIME_SCHEMA,
+pub mod controller;
+pub mod events;
+pub mod model_routing;
+pub mod policy;
+pub mod state_machine;
+pub mod store;
+pub mod types;
+
+pub use controller::{ControllerError, ControllerOutput, RuntimeCommand, RuntimeController};
+pub use events::{RuntimeEvent, RuntimeEventKind};
+pub use model_routing::{
+    ModelRoute, ModelRouter, PhaseModelRouter, RouteError, RouteRequest, RuntimeModelRef,
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_module_exports_are_constructible() {
-        let profile = ModelProfile::new("openai", "gpt-5");
-        let spec = RunSpec::new("bootstrap runtime", profile);
-        let snapshot = RunSnapshot::new(spec);
-
-        assert!(snapshot.run_id.starts_with("run-"));
-        assert!(snapshot.snapshot_id.starts_with("snapshot-"));
-    }
-}
+pub use policy::{
+    PolicyDecision, PolicyReason, PolicyRequest, PolicySet, PolicyTarget, PolicyVerdict,
+    RuntimePolicy,
+};
+pub use state_machine::{RuntimeStateMachine, RuntimeTransition, TransitionError};
+pub use store::RuntimeStore;
+pub use types::{
+    ApprovalCheckpoint, ApprovalState, ArtifactRef, AutonomyLevel, ContinuationReason,
+    FailureRecord, JobId, JobKind, JobRecord, JobState, LeaseRecord, ModelProfile, ModelSelector,
+    PlanArtifact, PlanId, RunBudgets, RunConstraints, RunId, RunPhase, RunSnapshot, RunSpec,
+    RunSummary, TaskId, TaskNode, TaskRuntime, TaskSpec, TaskState, VerifySpec,
+};

@@ -154,6 +154,7 @@ pub mod providers;
 pub mod reliability;
 pub mod resources;
 pub mod rpc;
+pub mod runtime;
 pub mod sandbox;
 pub mod scheduler;
 pub mod sdk;
