@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::TaskResult;
 use super::discovery::DiscoveryPriority;
-use super::{RuntimeState, TaskResult};
 use crate::reliability::StuckPattern;
 
 /// Evidence attached to task completion events.
@@ -404,51 +404,6 @@ impl TaskEventLog {
         self.filter(|e| predicate(&e.kind))
     }
 
-    /// Reconstructs the current state from event history.
-    ///
-    /// This is the core of event sourcing - we can derive the current
-    /// state at any point by replaying events.
-    pub fn reconstruct_state(&self) -> RuntimeState {
-        let mut state = RuntimeState::Ready;
-
-        for event in &self.events {
-            match &event.kind {
-                TaskEventKind::Claimed { fence } => {
-                    if let Some(agent_id) = &event.agent_id {
-                        state = RuntimeState::Leased {
-                            agent_id: agent_id.clone(),
-                            fence: *fence,
-                            leased_at: event.timestamp,
-                        };
-                    }
-                }
-                TaskEventKind::Released { .. } => {
-                    state = RuntimeState::Ready;
-                }
-                TaskEventKind::VerificationStarted => {
-                    state = RuntimeState::Verifying;
-                }
-                TaskEventKind::Completed { result, .. } => {
-                    state = RuntimeState::Terminal {
-                        result: result.clone(),
-                        completed_at: event.timestamp,
-                    };
-                }
-                TaskEventKind::Abandoned { .. } => {
-                    state = RuntimeState::Terminal {
-                        result: TaskResult::Failed {
-                            reason: "Task was abandoned".to_string(),
-                        },
-                        completed_at: event.timestamp,
-                    };
-                }
-                _ => {}
-            }
-        }
-
-        state
-    }
-
     /// Serializes the log to JSON bytes.
     pub fn serialize(&self) -> crate::error::Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(|e| crate::error::Error::Json(Box::new(e)))
@@ -603,37 +558,6 @@ mod tests {
 
         let transitions = log.state_transitions();
         assert_eq!(transitions.len(), 2); // Claimed and Released
-    }
-
-    #[test]
-    fn reconstruct_state_from_events() {
-        let mut log = TaskEventLog::new();
-        log.append(TaskEventKind::Created, None);
-
-        assert!(log.reconstruct_state().is_claimable());
-
-        log.append(
-            TaskEventKind::Claimed { fence: 1 },
-            Some("agent-1".to_string()),
-        );
-
-        let state = log.reconstruct_state();
-        assert!(state.is_leased());
-        assert_eq!(state.lease_holder(), Some("agent-1"));
-
-        log.append(TaskEventKind::VerificationStarted, None);
-        assert!(matches!(log.reconstruct_state(), RuntimeState::Verifying));
-
-        log.append(
-            TaskEventKind::Completed {
-                result: TaskResult::Success,
-                reason: "All tests passed".to_string(),
-                evidence: vec![],
-            },
-            None,
-        );
-
-        assert!(log.reconstruct_state().is_terminal());
     }
 
     #[test]
