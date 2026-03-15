@@ -877,6 +877,68 @@ mod tests {
     }
 
     #[test]
+    fn parse_skills_init_subcommand() {
+        let cli = Cli::parse_from([
+            "pi",
+            "skills",
+            "init",
+            "deploy-readiness",
+            "--description",
+            "Check deploy readiness",
+            "--use-when",
+            "the user wants a release audit",
+            "--not-for",
+            "incident response",
+            "--trigger",
+            "run a deploy readiness check",
+            "--anti-trigger",
+            "fix a live outage",
+            "--global",
+            "--format",
+            "json",
+        ]);
+        match cli.command {
+            Some(Commands::Skills {
+                command:
+                    SkillCommands::Init {
+                        name,
+                        description,
+                        use_when,
+                        not_for,
+                        trigger_examples,
+                        anti_trigger_examples,
+                        global,
+                        format,
+                    },
+            }) => {
+                assert_eq!(name, "deploy-readiness");
+                assert_eq!(description, "Check deploy readiness");
+                assert_eq!(use_when, "the user wants a release audit");
+                assert_eq!(not_for, "incident response");
+                assert_eq!(trigger_examples, vec!["run a deploy readiness check"]);
+                assert_eq!(anti_trigger_examples, vec!["fix a live outage"]);
+                assert!(global);
+                assert_eq!(format, "json");
+            }
+            other => panic!("expected Skills::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_lint_subcommand() {
+        let cli = Cli::parse_from(["pi", "skills", "lint", "--global", "--format", "json"]);
+        match cli.command {
+            Some(Commands::Skills {
+                command: SkillCommands::Lint { global, format },
+            }) => {
+                assert!(global);
+                assert_eq!(format, "json");
+            }
+            other => panic!("expected Skills::Lint, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_subcommand_when_only_message() {
         let cli = Cli::parse_from(["pi", "hello"]);
         assert!(cli.command.is_none());
@@ -1788,6 +1850,41 @@ pub enum SkillCommands {
         /// Optional session id; when present, binds feedback to the latest observed revision in that session
         #[arg(long = "session-id")]
         session_id: Option<String>,
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Scaffold a new SKILL.md with routing and evaluation structure
+    Init {
+        /// Skill name / slug
+        name: String,
+        /// Short purpose statement for the skill
+        #[arg(long)]
+        description: String,
+        /// Concrete routing boundary describing when the skill should be used
+        #[arg(long = "use-when")]
+        use_when: String,
+        /// Concrete boundary describing nearby work the skill should not claim
+        #[arg(long = "not-for")]
+        not_for: String,
+        /// Concrete example request that should trigger the skill
+        #[arg(long = "trigger", action = clap::ArgAction::Append)]
+        trigger_examples: Vec<String>,
+        /// Concrete near-miss request that should not trigger the skill
+        #[arg(long = "anti-trigger", action = clap::ArgAction::Append)]
+        anti_trigger_examples: Vec<String>,
+        /// Write the scaffold to global skills instead of `.pi/skills`
+        #[arg(long)]
+        global: bool,
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Critique skill authoring quality and missing structured sections
+    Lint {
+        /// Lint global skills instead of `.pi/skills`
+        #[arg(long)]
+        global: bool,
         /// Output format: text or json
         #[arg(long, default_value = "text")]
         format: String,

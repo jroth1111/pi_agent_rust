@@ -7,8 +7,8 @@ use crate::resources::{CollisionInfo, DiagnosticKind, ResourceDiagnostic};
 
 use super::resolver::is_under_path;
 use super::schema::{
-    Skill, infer_skill_name, parse_frontmatter, validate_description, validate_frontmatter_fields,
-    validate_name,
+    Skill, infer_skill_name, parse_frontmatter, parse_skill_sections, validate_description,
+    validate_frontmatter_fields, validate_name,
 };
 
 #[derive(Debug, Clone)]
@@ -325,6 +325,7 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
             base_dir,
             source,
             disable_model_invocation,
+            sections: parse_skill_sections(&parsed.body),
         }),
         diagnostics,
     }

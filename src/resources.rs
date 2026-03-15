@@ -59,6 +59,7 @@ pub struct ResourceDiagnostic {
 pub use crate::skills::loader::{LoadSkillsOptions, LoadSkillsResult};
 pub use crate::skills::schema::{
     ExplicitSkillInvocation, InputExpansion, MAX_SKILL_DESC_LEN, MAX_SKILL_NAME_LEN, Skill,
+    SkillSections,
 };
 
 // ============================================================================
@@ -1225,6 +1226,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/a"),
                 source: "user".to_string(),
                 disable_model_invocation: false,
+                sections: SkillSections::default(),
             },
             Skill {
                 name: "b".to_string(),
@@ -1233,6 +1235,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/b"),
                 source: "user".to_string(),
                 disable_model_invocation: true,
+                sections: SkillSections::default(),
             },
         ];
         let prompt = format_skills_for_prompt(&skills);
@@ -1616,6 +1619,7 @@ still frontmatter",
             base_dir: tmp.path().to_path_buf(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            sections: SkillSections::default(),
         }];
         let result = expand_skill_command("/skill:test-skill extra args", &skills);
         assert!(result.contains("<skill name=\"test-skill\""));

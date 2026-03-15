@@ -15,6 +15,19 @@ pub const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
     "disable-model-invocation",
 ];
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillSections {
+    pub purpose: Vec<String>,
+    pub use_when: Vec<String>,
+    pub not_for: Vec<String>,
+    pub trigger_examples: Vec<String>,
+    pub anti_trigger_examples: Vec<String>,
+    pub inputs: Vec<String>,
+    pub output_contract: Vec<String>,
+    pub success_criteria: Vec<String>,
+    pub instructions: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -23,6 +36,7 @@ pub struct Skill {
     pub base_dir: PathBuf,
     pub source: String,
     pub disable_model_invocation: bool,
+    pub sections: SkillSections,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +116,25 @@ where
     errors
 }
 
+pub fn parse_skill_sections(body: &str) -> SkillSections {
+    let parsed = parse_markdown_sections(body);
+    SkillSections {
+        purpose: parsed.get("purpose").cloned().unwrap_or_default(),
+        use_when: parsed.get("use when").cloned().unwrap_or_default(),
+        not_for: parsed.get("not for").cloned().unwrap_or_default(),
+        trigger_examples: parsed.get("trigger examples").cloned().unwrap_or_default(),
+        anti_trigger_examples: parsed
+            .get("anti trigger examples")
+            .or_else(|| parsed.get("anti trigger example"))
+            .cloned()
+            .unwrap_or_default(),
+        inputs: parsed.get("inputs").cloned().unwrap_or_default(),
+        output_contract: parsed.get("output contract").cloned().unwrap_or_default(),
+        success_criteria: parsed.get("success criteria").cloned().unwrap_or_default(),
+        instructions: parsed.get("instructions").cloned().unwrap_or_default(),
+    }
+}
+
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     let visible: Vec<&Skill> = skills
         .iter()
@@ -114,6 +147,8 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     let mut lines = vec![
         "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
         "Use the read tool to load a skill's file when the task matches its description."
+            .to_string(),
+        "Prefer skills whose `use_when` and trigger examples match the user request, and avoid skills whose `not_for` or anti-trigger examples match."
             .to_string(),
         "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
         String::new(),
@@ -131,6 +166,36 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
             "    <location>{}</location>",
             escape_xml(&skill.file_path.display().to_string())
         ));
+        if !skill.sections.use_when.is_empty() {
+            lines.push(format!(
+                "    <use_when>{}</use_when>",
+                escape_xml(&summarize_section_items(&skill.sections.use_when, 2))
+            ));
+        }
+        if !skill.sections.not_for.is_empty() {
+            lines.push(format!(
+                "    <not_for>{}</not_for>",
+                escape_xml(&summarize_section_items(&skill.sections.not_for, 2))
+            ));
+        }
+        if !skill.sections.trigger_examples.is_empty() {
+            lines.push(format!(
+                "    <trigger_examples>{}</trigger_examples>",
+                escape_xml(&summarize_section_items(
+                    &skill.sections.trigger_examples,
+                    2
+                ))
+            ));
+        }
+        if !skill.sections.anti_trigger_examples.is_empty() {
+            lines.push(format!(
+                "    <anti_trigger_examples>{}</anti_trigger_examples>",
+                escape_xml(&summarize_section_items(
+                    &skill.sections.anti_trigger_examples,
+                    2
+                ))
+            ));
+        }
         lines.push("  </skill>".to_string());
     }
 
@@ -275,6 +340,130 @@ fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
         map.insert(key.to_string(), value.to_string());
     }
     map
+}
+
+fn parse_markdown_sections(body: &str) -> HashMap<String, Vec<String>> {
+    let mut sections = HashMap::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = markdown_heading_name(trimmed) {
+            flush_markdown_section(&mut sections, current_heading.take(), &current_lines);
+            current_heading = Some(heading);
+            current_lines.clear();
+            continue;
+        }
+
+        if current_heading.is_some() {
+            current_lines.push(line.to_string());
+        }
+    }
+
+    flush_markdown_section(&mut sections, current_heading.take(), &current_lines);
+    sections
+}
+
+fn flush_markdown_section(
+    sections: &mut HashMap<String, Vec<String>>,
+    heading: Option<String>,
+    lines: &[String],
+) {
+    let Some(heading) = heading else {
+        return;
+    };
+    let items = parse_section_items(lines);
+    if items.is_empty() {
+        return;
+    }
+    sections.insert(heading, items);
+}
+
+fn markdown_heading_name(trimmed: &str) -> Option<String> {
+    let hash_count = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if hash_count < 2 {
+        return None;
+    }
+    let title = trimmed[hash_count..].trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(normalize_heading(title))
+}
+
+fn normalize_heading(title: &str) -> String {
+    title
+        .trim()
+        .trim_end_matches(':')
+        .chars()
+        .map(|ch| match ch {
+            '-' | '_' => ' ',
+            _ => ch.to_ascii_lowercase(),
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_section_items(lines: &[String]) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut paragraph = Vec::new();
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            flush_paragraph(&mut items, &mut paragraph);
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            continue;
+        }
+        if let Some(item) = strip_list_marker(trimmed) {
+            flush_paragraph(&mut items, &mut paragraph);
+            items.push(item.to_string());
+            continue;
+        }
+        paragraph.push(trimmed.to_string());
+    }
+
+    flush_paragraph(&mut items, &mut paragraph);
+    items
+}
+
+fn flush_paragraph(items: &mut Vec<String>, paragraph: &mut Vec<String>) {
+    if paragraph.is_empty() {
+        return;
+    }
+    items.push(paragraph.join(" "));
+    paragraph.clear();
+}
+
+fn strip_list_marker(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| strip_numbered_list_marker(trimmed))
+        .map(str::trim)
+}
+
+fn strip_numbered_list_marker(trimmed: &str) -> Option<&str> {
+    let period_index = trimmed.find(". ")?;
+    trimmed[..period_index]
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then_some(&trimmed[period_index + 2..])
+}
+
+fn summarize_section_items(items: &[String], limit: usize) -> String {
+    items
+        .iter()
+        .take(limit)
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 pub fn strip_frontmatter(raw: &str) -> String {
@@ -444,6 +633,57 @@ mod tests {
         assert!(parsed.body.is_empty());
     }
 
+    #[test]
+    fn parse_skill_sections_collects_authoring_fields() {
+        let sections = parse_skill_sections(
+            "## Purpose\nHelp with release checks.\n\n## Use When\n- user asks for a release audit\n- user wants a go/no-go check\n\n## Not For\n- unrelated bug fixes\n\n## Trigger Examples\n- check deployment readiness\n\n## Anti-Trigger Examples\n- fix a production outage\n\n## Inputs\n- release branch\n\n## Output Contract\n- concise checklist\n\n## Success Criteria\n- zero missing critical blockers\n\n## Instructions\n1. inspect the release diff",
+        );
+
+        assert_eq!(
+            sections.purpose,
+            vec!["Help with release checks.".to_string()]
+        );
+        assert_eq!(sections.use_when.len(), 2);
+        assert_eq!(sections.not_for, vec!["unrelated bug fixes".to_string()]);
+        assert_eq!(
+            sections.trigger_examples,
+            vec!["check deployment readiness".to_string()]
+        );
+        assert_eq!(
+            sections.anti_trigger_examples,
+            vec!["fix a production outage".to_string()]
+        );
+        assert_eq!(sections.inputs, vec!["release branch".to_string()]);
+        assert_eq!(
+            sections.output_contract,
+            vec!["concise checklist".to_string()]
+        );
+        assert_eq!(
+            sections.success_criteria,
+            vec!["zero missing critical blockers".to_string()]
+        );
+        assert_eq!(
+            sections.instructions,
+            vec!["inspect the release diff".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_skill_sections_accepts_paragraphs_and_normalizes_headings() {
+        let sections = parse_skill_sections(
+            "## Use-When:\nUse this when the user wants deeper code review.\n\n## Anti_Trigger_Examples\n- write a marketing email",
+        );
+
+        assert_eq!(
+            sections.use_when,
+            vec!["Use this when the user wants deeper code review.".to_string()]
+        );
+        assert_eq!(
+            sections.anti_trigger_examples,
+            vec!["write a marketing email".to_string()]
+        );
+    }
+
     // --- escape_xml ---
 
     #[test]
@@ -502,6 +742,7 @@ mod tests {
             base_dir: skill_dir.clone(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            sections: SkillSections::default(),
         }];
 
         let result = expand_skill_command("/skill:my-skill", &skills);
@@ -528,6 +769,7 @@ mod tests {
             base_dir: skill_dir.clone(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            sections: SkillSections::default(),
         }];
 
         let result = expand_skill_command("/skill:my-skill extra args here", &skills);
@@ -550,6 +792,7 @@ mod tests {
             base_dir: PathBuf::from("/tmp/hidden"),
             source: "test".to_string(),
             disable_model_invocation: true,
+            sections: SkillSections::default(),
         }];
         assert_eq!(format_skills_for_prompt(&skills), "");
     }
@@ -564,6 +807,13 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/skill-a"),
                 source: "test".to_string(),
                 disable_model_invocation: false,
+                sections: SkillSections {
+                    use_when: vec!["the user asks for a release audit".to_string()],
+                    not_for: vec!["incident response".to_string()],
+                    trigger_examples: vec!["check deploy readiness".to_string()],
+                    anti_trigger_examples: vec!["fix a production outage".to_string()],
+                    ..SkillSections::default()
+                },
             },
             Skill {
                 name: "skill-b".to_string(),
@@ -572,6 +822,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/skill-b"),
                 source: "test".to_string(),
                 disable_model_invocation: false,
+                sections: SkillSections::default(),
             },
         ];
         let result = format_skills_for_prompt(&skills);
@@ -579,6 +830,13 @@ mod tests {
         assert!(result.contains("<name>skill-b</name>"));
         assert!(result.contains("<available_skills>"));
         assert!(result.contains("</available_skills>"));
+        assert!(result.contains("<use_when>the user asks for a release audit</use_when>"));
+        assert!(result.contains("<not_for>incident response</not_for>"));
+        assert!(result.contains("<trigger_examples>check deploy readiness</trigger_examples>"));
+        assert!(
+            result
+                .contains("<anti_trigger_examples>fix a production outage</anti_trigger_examples>")
+        );
     }
 
     // --- strip_frontmatter ---

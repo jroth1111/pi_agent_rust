@@ -1,4 +1,6 @@
 use super::loader::{LoadSkillsOptions, load_skills};
+#[cfg(test)]
+use super::schema::SkillSections;
 use super::schema::{ExplicitSkillInvocation, Skill};
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -1664,6 +1666,7 @@ mod tests {
             base_dir: skill_path.parent().expect("parent").to_path_buf(),
             source: "project".to_string(),
             disable_model_invocation: false,
+            sections: SkillSections::default(),
         }];
         let mut tracker = SkillRunTracker::new(
             dir.path().to_path_buf(),
@@ -1843,6 +1846,7 @@ mod tests {
             base_dir: skill_path.parent().expect("parent").to_path_buf(),
             source: "project".to_string(),
             disable_model_invocation: false,
+            sections: SkillSections::default(),
         }];
         let mut tracker =
             SkillRunTracker::new(dir.path().to_path_buf(), "summarize this", &skills, None);
@@ -1886,6 +1890,7 @@ mod tests {
             base_dir: skill_path.parent().expect("parent").to_path_buf(),
             source: "project".to_string(),
             disable_model_invocation: false,
+            sections: SkillSections::default(),
         }];
         let mut tracker =
             SkillRunTracker::new(dir.path().to_path_buf(), "summarize this", &skills, None);

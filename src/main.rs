@@ -70,7 +70,7 @@ use pi::session::Session;
 use pi::session_index::SessionIndex;
 use pi::skills::{
     SkillDoctorFormat, SkillRunTracker, handle_skill_doctor, handle_skill_feedback,
-    persist_skill_tracker,
+    handle_skill_init, handle_skill_lint, persist_skill_tracker,
 };
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
@@ -193,6 +193,31 @@ fn main_impl() -> Result<()> {
                             session_id.as_deref(),
                             SkillDoctorFormat::parse(format)?,
                         )?;
+                    }
+                    cli::SkillCommands::Init {
+                        name,
+                        description,
+                        use_when,
+                        not_for,
+                        trigger_examples,
+                        anti_trigger_examples,
+                        global,
+                        format,
+                    } => {
+                        handle_skill_init(
+                            &cwd,
+                            name,
+                            description,
+                            use_when,
+                            not_for,
+                            trigger_examples,
+                            anti_trigger_examples,
+                            *global,
+                            SkillDoctorFormat::parse(format)?,
+                        )?;
+                    }
+                    cli::SkillCommands::Lint { global, format } => {
+                        handle_skill_lint(&cwd, *global, SkillDoctorFormat::parse(format)?)?;
                     }
                 }
                 return Ok(());
@@ -1394,6 +1419,31 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                     session_id.as_deref(),
                     SkillDoctorFormat::parse(&format)?,
                 )?;
+            }
+            cli::SkillCommands::Init {
+                name,
+                description,
+                use_when,
+                not_for,
+                trigger_examples,
+                anti_trigger_examples,
+                global,
+                format,
+            } => {
+                handle_skill_init(
+                    cwd,
+                    &name,
+                    &description,
+                    &use_when,
+                    &not_for,
+                    &trigger_examples,
+                    &anti_trigger_examples,
+                    global,
+                    SkillDoctorFormat::parse(&format)?,
+                )?;
+            }
+            cli::SkillCommands::Lint { global, format } => {
+                handle_skill_lint(cwd, global, SkillDoctorFormat::parse(&format)?)?;
             }
         },
         cli::Commands::Migrate { path, dry_run } => {
