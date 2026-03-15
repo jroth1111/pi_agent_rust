@@ -7,8 +7,8 @@ use crate::resources::{CollisionInfo, DiagnosticKind, ResourceDiagnostic};
 
 use super::resolver::is_under_path;
 use super::schema::{
-    Skill, infer_skill_name, parse_frontmatter, parse_skill_sections, validate_description,
-    validate_frontmatter_fields, validate_name,
+    Skill, frontmatter_bool, frontmatter_string, infer_skill_name, parse_frontmatter,
+    parse_skill_sections, validate_description, validate_frontmatter_fields, validate_name,
 };
 
 #[derive(Debug, Clone)]
@@ -265,6 +265,15 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
     let parsed = parse_frontmatter(&raw);
     let frontmatter = &parsed.frontmatter;
 
+    if let Some(error) = &parsed.error {
+        diagnostics.push(ResourceDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: error.clone(),
+            path: path.to_path_buf(),
+            collision: None,
+        });
+    }
+
     let field_errors = validate_frontmatter_fields(frontmatter.keys());
     for error in field_errors {
         diagnostics.push(ResourceDiagnostic {
@@ -275,7 +284,7 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
         });
     }
 
-    let description = frontmatter.get("description").cloned().unwrap_or_default();
+    let description = frontmatter_string(frontmatter, "description").unwrap_or_default();
     let desc_errors = validate_description(&description);
     for error in desc_errors {
         diagnostics.push(ResourceDiagnostic {
@@ -298,10 +307,7 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
     let parent_dir = infer_skill_name(path);
-    let name = frontmatter
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| parent_dir.clone());
+    let name = frontmatter_string(frontmatter, "name").unwrap_or_else(|| parent_dir.clone());
 
     let name_errors = validate_name(&name, &parent_dir);
     for error in name_errors {
@@ -313,9 +319,8 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
         });
     }
 
-    let disable_model_invocation = frontmatter
-        .get("disable-model-invocation")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let disable_model_invocation =
+        frontmatter_bool(frontmatter, "disable-model-invocation").unwrap_or(false);
 
     LoadSkillFileResult {
         skill: Some(Skill {
@@ -396,6 +401,24 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|d| d.message.contains("unknown"))
+        );
+    }
+
+    #[test]
+    fn load_skill_from_file_reports_invalid_yaml_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = make_skill_dir(
+            tmp.path(),
+            "bad-yaml",
+            "---\nname: [unterminated\ndescription: Broken\n---\nBody",
+        );
+        let result = load_skill_from_file(&skill_dir.join("SKILL.md"), "test".to_string());
+        assert!(result.skill.is_none());
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("invalid YAML frontmatter:"))
         );
     }
 

@@ -700,11 +700,8 @@ fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> Vec<PromptT
 fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<PromptTemplate> {
     let raw = fs::read_to_string(path).ok()?;
     let parsed = parse_frontmatter(&raw);
-    let mut description = parsed
-        .frontmatter
-        .get("description")
-        .cloned()
-        .unwrap_or_default();
+    let mut description =
+        frontmatter_string(&parsed.frontmatter, "description").unwrap_or_default();
 
     if description.is_empty() {
         if let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty()) {
@@ -1099,6 +1096,13 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     crate::skills::parse_frontmatter(raw)
 }
 
+fn frontmatter_string(
+    frontmatter: &std::collections::HashMap<String, serde_yaml::Value>,
+    key: &str,
+) -> Option<String> {
+    crate::skills::schema::frontmatter_string(frontmatter, key)
+}
+
 fn strip_frontmatter(raw: &str) -> String {
     crate::skills::strip_frontmatter(raw)
 }
@@ -1429,18 +1433,19 @@ body line 1
 body line 2"#,
         );
         assert_eq!(
-            parsed.frontmatter.get("name"),
-            Some(&"skill-name".to_string())
+            frontmatter_string(&parsed.frontmatter, "name").as_deref(),
+            Some("skill-name")
         );
         assert_eq!(
-            parsed.frontmatter.get("description"),
-            Some(&"demo".to_string())
+            frontmatter_string(&parsed.frontmatter, "description").as_deref(),
+            Some("demo")
         );
         assert_eq!(
-            parsed.frontmatter.get("metadata"),
-            Some(&"keep".to_string())
+            frontmatter_string(&parsed.frontmatter, "metadata").as_deref(),
+            Some("keep")
         );
         assert_eq!(parsed.body, "body line 1\nbody line 2");
+        assert_eq!(parsed.error, None);
 
         let unclosed = parse_frontmatter(
             r"---
@@ -1449,6 +1454,7 @@ still frontmatter",
         );
         assert!(unclosed.frontmatter.is_empty());
         assert!(unclosed.body.starts_with("---"));
+        assert_eq!(unclosed.error.as_deref(), Some("unclosed YAML frontmatter"));
     }
 
     #[test]
@@ -1723,10 +1729,16 @@ still frontmatter",
     }
 
     #[test]
-    fn test_parse_frontmatter_empty_key_ignored() {
+    fn test_parse_frontmatter_invalid_yaml_reports_error() {
         let parsed = parse_frontmatter("---\n: value\nname: test\n---\nbody");
-        assert!(!parsed.frontmatter.contains_key(""));
-        assert_eq!(parsed.frontmatter.get("name"), Some(&"test".to_string()));
+        assert!(parsed.frontmatter.is_empty());
+        assert_eq!(parsed.body, "body");
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("invalid YAML frontmatter:"))
+        );
     }
 
     // ── validate_name edge cases ───────────────────────────────────────
@@ -2040,8 +2052,8 @@ still frontmatter",
                 let raw = format!("---\n{key}: {val}\n---\n{body}");
                 let parsed = parse_frontmatter(&raw);
                 assert_eq!(
-                    parsed.frontmatter.get(&key),
-                    Some(&val),
+                    frontmatter_string(&parsed.frontmatter, &key).as_deref(),
+                    Some(val.as_str()),
                     "closed frontmatter should extract {key}: {val}"
                 );
                 assert_eq!(parsed.body, body);

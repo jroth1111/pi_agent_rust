@@ -26,6 +26,6 @@ pub use resolver::is_under_path;
 pub use schema::{
     ExplicitSkillInvocation, InputExpansion, MAX_SKILL_DESC_LEN, MAX_SKILL_NAME_LEN, Skill,
     SkillSections, expand_skill_command, expand_skill_command_with_trace, format_skills_for_prompt,
-    parse_frontmatter, parse_skill_sections, strip_frontmatter, validate_description,
-    validate_frontmatter_fields, validate_name,
+    frontmatter_bool, frontmatter_string, parse_frontmatter, parse_skill_sections,
+    strip_frontmatter, validate_description, validate_frontmatter_fields, validate_name,
 };

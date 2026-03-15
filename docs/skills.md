@@ -36,6 +36,25 @@ You are an expert SQL developer. When writing queries:
 
 If `name` is omitted, the parent directory name is used.
 
+Frontmatter is parsed as real YAML now. Scalar fields such as `name`, `description`, and `disable-model-invocation` are read directly, while richer fields such as `metadata` and `allowed-tools` can safely use nested maps and lists.
+
+```yaml
+---
+name: deploy-readiness
+description: Check deploy readiness before release
+metadata:
+  owner: platform
+  task-patterns:
+    - release audit
+    - go/no-go review
+allowed-tools:
+  - read
+  - bash
+---
+```
+
+Invalid YAML frontmatter is reported as a loader warning instead of being silently flattened or partially ignored.
+
 ## Usage
 
 ### Auto-Discovery

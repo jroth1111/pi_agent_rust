@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_yaml::Value as YamlValue;
+
 pub const MAX_SKILL_NAME_LEN: usize = 64;
 pub const MAX_SKILL_DESC_LEN: usize = 1024;
 
@@ -274,8 +276,35 @@ pub(crate) fn escape_xml(input: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ParsedFrontmatter {
-    pub frontmatter: HashMap<String, String>,
+    pub frontmatter: HashMap<String, YamlValue>,
     pub body: String,
+    pub error: Option<String>,
+}
+
+pub fn frontmatter_string(frontmatter: &HashMap<String, YamlValue>, key: &str) -> Option<String> {
+    frontmatter.get(key).and_then(frontmatter_scalar_string)
+}
+
+pub fn frontmatter_bool(frontmatter: &HashMap<String, YamlValue>, key: &str) -> Option<bool> {
+    match frontmatter.get(key)? {
+        YamlValue::Bool(value) => Some(*value),
+        YamlValue::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn frontmatter_scalar_string(value: &YamlValue) -> Option<String> {
+    match value {
+        YamlValue::Null => None,
+        YamlValue::Bool(value) => Some(value.to_string()),
+        YamlValue::Number(value) => Some(value.to_string()),
+        YamlValue::String(value) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 pub fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
@@ -284,6 +313,7 @@ pub fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
             body: String::new(),
+            error: None,
         };
     };
 
@@ -291,6 +321,7 @@ pub fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
             body: raw.to_string(),
+            error: None,
         };
     }
 
@@ -313,33 +344,67 @@ pub fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
             body: raw.to_string(),
+            error: Some("unclosed YAML frontmatter".to_string()),
         };
     }
 
+    let (frontmatter, error) = parse_frontmatter_yaml(&front_lines.join("\n"));
+
     ParsedFrontmatter {
-        frontmatter: parse_frontmatter_lines(&front_lines),
+        frontmatter,
         body: body_lines.join("\n"),
+        error,
     }
 }
 
-fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        map.insert(key.to_string(), value.to_string());
+fn parse_frontmatter_yaml(raw: &str) -> (HashMap<String, YamlValue>, Option<String>) {
+    if raw.trim().is_empty() {
+        return (HashMap::new(), None);
     }
-    map
+
+    let parsed = match serde_yaml::from_str::<YamlValue>(raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                HashMap::new(),
+                Some(format!("invalid YAML frontmatter: {err}")),
+            );
+        }
+    };
+
+    let YamlValue::Mapping(mapping) = parsed else {
+        return (
+            HashMap::new(),
+            Some("YAML frontmatter root must be a mapping".to_string()),
+        );
+    };
+
+    let mut map = HashMap::new();
+    let mut invalid_keys = Vec::new();
+    for (key, value) in mapping {
+        match key {
+            YamlValue::String(key) if !key.is_empty() => {
+                map.insert(key, value);
+            }
+            YamlValue::String(_) => {}
+            other => invalid_keys.push(render_yaml_value(&other)),
+        }
+    }
+
+    let error = (!invalid_keys.is_empty()).then(|| {
+        format!(
+            "YAML frontmatter keys must be strings; unsupported key(s): {}",
+            invalid_keys.join(", ")
+        )
+    });
+    (map, error)
+}
+
+fn render_yaml_value(value: &YamlValue) -> String {
+    serde_yaml::to_string(value)
+        .unwrap_or_else(|_| format!("{value:?}"))
+        .trim()
+        .to_string()
 }
 
 fn parse_markdown_sections(body: &str) -> HashMap<String, Vec<String>> {
@@ -592,24 +657,32 @@ mod tests {
         let parsed = parse_frontmatter("Just a body\nwith lines");
         assert!(parsed.frontmatter.is_empty());
         assert_eq!(parsed.body, "Just a body\nwith lines");
+        assert_eq!(parsed.error, None);
     }
 
     #[test]
     fn parse_frontmatter_valid() {
         let raw = "---\nname: my-skill\ndescription: A skill\n---\nBody content";
         let parsed = parse_frontmatter(raw);
-        assert_eq!(parsed.frontmatter.get("name").unwrap(), "my-skill");
-        assert_eq!(parsed.frontmatter.get("description").unwrap(), "A skill");
+        assert_eq!(
+            frontmatter_string(&parsed.frontmatter, "name").as_deref(),
+            Some("my-skill")
+        );
+        assert_eq!(
+            frontmatter_string(&parsed.frontmatter, "description").as_deref(),
+            Some("A skill")
+        );
         assert_eq!(parsed.body, "Body content");
+        assert_eq!(parsed.error, None);
     }
 
     #[test]
     fn parse_frontmatter_unclosed() {
         let raw = "---\nname: test\nno closing delimiter";
         let parsed = parse_frontmatter(raw);
-        // Unclosed frontmatter treated as plain body
         assert!(parsed.frontmatter.is_empty());
         assert_eq!(parsed.body, raw);
+        assert_eq!(parsed.error.as_deref(), Some("unclosed YAML frontmatter"));
     }
 
     #[test]
@@ -617,17 +690,24 @@ mod tests {
         let raw = "---\n# comment\nname: test\n\n---\nBody";
         let parsed = parse_frontmatter(raw);
         assert_eq!(parsed.frontmatter.len(), 1);
-        assert_eq!(parsed.frontmatter.get("name").unwrap(), "test");
+        assert_eq!(
+            frontmatter_string(&parsed.frontmatter, "name").as_deref(),
+            Some("test")
+        );
+        assert_eq!(parsed.error, None);
     }
 
     #[test]
     fn parse_frontmatter_quoted_values() {
         let raw = "---\nname: \"my-skill\"\ndescription: 'A description'\n---\n";
         let parsed = parse_frontmatter(raw);
-        assert_eq!(parsed.frontmatter.get("name").unwrap(), "my-skill");
         assert_eq!(
-            parsed.frontmatter.get("description").unwrap(),
-            "A description"
+            frontmatter_string(&parsed.frontmatter, "name").as_deref(),
+            Some("my-skill")
+        );
+        assert_eq!(
+            frontmatter_string(&parsed.frontmatter, "description").as_deref(),
+            Some("A description")
         );
     }
 
@@ -636,6 +716,58 @@ mod tests {
         let parsed = parse_frontmatter("");
         assert!(parsed.frontmatter.is_empty());
         assert!(parsed.body.is_empty());
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn parse_frontmatter_preserves_structured_yaml_values() {
+        let raw = "---\nname: my-skill\nmetadata:\n  owner: platform\n  tags:\n    - routing\n    - evaluation\nallowed-tools:\n  - read\n  - bash\ndisable-model-invocation: true\n---\nBody";
+        let parsed = parse_frontmatter(raw);
+        let owner_key = YamlValue::String("owner".to_string());
+
+        assert_eq!(
+            frontmatter_string(&parsed.frontmatter, "name").as_deref(),
+            Some("my-skill")
+        );
+        assert_eq!(
+            frontmatter_bool(&parsed.frontmatter, "disable-model-invocation"),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .frontmatter
+                .get("metadata")
+                .and_then(YamlValue::as_mapping)
+                .and_then(|metadata| metadata.get(&owner_key))
+                .and_then(YamlValue::as_str),
+            Some("platform")
+        );
+        assert_eq!(
+            parsed
+                .frontmatter
+                .get("allowed-tools")
+                .and_then(YamlValue::as_sequence)
+                .map(|items| items
+                    .iter()
+                    .filter_map(YamlValue::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["read", "bash"])
+        );
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn parse_frontmatter_reports_invalid_yaml() {
+        let parsed = parse_frontmatter("---\nname: [unterminated\n---\nBody");
+
+        assert!(parsed.frontmatter.is_empty());
+        assert_eq!(parsed.body, "Body");
+        assert!(
+            parsed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("invalid YAML frontmatter:"))
+        );
     }
 
     #[test]
