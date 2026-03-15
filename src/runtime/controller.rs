@@ -9,6 +9,7 @@ use crate::runtime::types::{
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeCommand {
     BootstrapRun {
         spec: RunSpec,
@@ -78,7 +79,7 @@ where
     R: ModelRouter,
     P: RuntimePolicy,
 {
-    pub fn new(router: R, policy: P) -> Self {
+    pub const fn new(router: R, policy: P) -> Self {
         Self {
             state_machine: None,
             router,
@@ -86,7 +87,7 @@ where
         }
     }
 
-    pub fn from_snapshot(snapshot: RunSnapshot, router: R, policy: P) -> Self {
+    pub const fn from_snapshot(snapshot: RunSnapshot, router: R, policy: P) -> Self {
         Self {
             state_machine: Some(RuntimeStateMachine::new(snapshot)),
             router,
@@ -94,7 +95,7 @@ where
         }
     }
 
-    pub fn state_machine(&self) -> Option<&RuntimeStateMachine> {
+    pub const fn state_machine(&self) -> Option<&RuntimeStateMachine> {
         self.state_machine.as_ref()
     }
 

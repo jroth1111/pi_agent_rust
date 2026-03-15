@@ -25,7 +25,9 @@ pub use state_machine::{RuntimeStateMachine, RuntimeTransition, TransitionError}
 pub use store::RuntimeStore;
 pub use types::{
     ApprovalCheckpoint, ApprovalState, ArtifactRef, AutonomyLevel, ContinuationReason,
-    FailureRecord, JobId, JobKind, JobRecord, JobState, LeaseRecord, ModelProfile, ModelSelector,
-    PlanArtifact, PlanId, RunBudgets, RunConstraints, RunId, RunPhase, RunSnapshot, RunSpec,
-    RunSummary, TaskId, TaskNode, TaskRuntime, TaskSpec, TaskState, VerifySpec,
+    ExecutionTier, FailureRecord, JobId, JobKind, JobRecord, JobState, LeaseRecord, ModelProfile,
+    ModelSelector, PlanArtifact, PlanId, RunBudgets, RunConstraints, RunDispatchState, RunId,
+    RunLifecycle, RunPhase, RunSnapshot, RunSpec, RunStatus, RunSummary, RunVerifyScopeKind,
+    RunVerifyStatus, SubrunPlan, TaskId, TaskNode, TaskReport, TaskRuntime, TaskSpec, TaskState,
+    VerifySpec, WaveStatus,
 };

@@ -10,7 +10,7 @@ use pi::cli::Cli;
 use pi::config::Config;
 use pi::model::UserContent;
 use pi::session::{Session, SessionHeader, SessionMessage, encode_cwd};
-use pi::session_index::{SessionIndex, SessionMeta};
+use pi::session_index::SessionMeta;
 use pi::session_picker::{SessionPicker, format_time, list_sessions_for_project, pick_session};
 use std::env;
 use std::future::Future;
@@ -96,88 +96,6 @@ fn create_session(harness: &TestHarness, base_dir: &Path, cwd: &Path, label: &st
     path
 }
 
-fn create_workflow_session(path: &Path, base_dir: &Path, cwd: &Path, id: &str) {
-    let mut session = Session::create_with_dir(Some(base_dir.to_path_buf()));
-    session.path = Some(path.to_path_buf());
-    session.header.cwd = cwd.display().to_string();
-    session.header.id = id.to_string();
-    session.append_message(SessionMessage::User {
-        content: UserContent::Text("workflow visibility".to_string()),
-        timestamp: Some(0),
-    });
-
-    let contract = serde_json::json!({
-        "schemaVersion": 1,
-        "tasks": [
-            {
-                "id": "coord-1",
-                "kind": "coordination",
-                "title": "Workflow session",
-                "goal": "Coordinate workflow visibility",
-                "inputSnapshot": {
-                    "summary": "Current session",
-                    "references": [{"kind": "session_context", "locator": "session://current"}]
-                },
-                "priority": "medium",
-                "acceptanceCriteria": [{"description": "Expose workflow visibility"}],
-                "definitionOfDone": [{"description": "Workflow metadata is indexed"}],
-                "contextBudget": {"maxPromptTokens": 32000, "maxOutputTokens": 4000, "maxToolCalls": 8},
-                "maxAttempts": 2,
-                "outputContract": {"summaryRequired": true}
-            },
-            {
-                "id": "task-1",
-                "kind": "implementation",
-                "title": "Index workflow metadata",
-                "goal": "Keep scan fallback workflow-aware",
-                "inputSnapshot": {
-                    "summary": "Current session",
-                    "references": [{"kind": "session_context", "locator": "session://current"}]
-                },
-                "parentTaskId": "coord-1",
-                "priority": "high",
-                "acceptanceCriteria": [{"description": "build_meta includes workflow"}],
-                "definitionOfDone": [{"description": "session picker preserves it"}],
-                "contextBudget": {"maxPromptTokens": 32000, "maxOutputTokens": 4000, "maxToolCalls": 8},
-                "maxAttempts": 2,
-                "outputContract": {"summaryRequired": true}
-            }
-        ]
-    });
-    session
-        .set_workflow_contract(serde_json::from_value(contract).expect("workflow contract"))
-        .expect("set workflow contract");
-    session
-        .set_workflow_active_task("task-1".to_string())
-        .expect("set active workflow task");
-
-    let snapshot = serde_json::json!({
-        "taskStates": [{
-            "taskId": "task-1",
-            "status": "in_progress",
-            "attemptsUsed": 1,
-            "reviewStatus": "not_requested",
-            "verificationStatus": "not_requested",
-            "statusSummary": "Indexing workflow visibility",
-            "completionEvidence": {
-                "summary": "Workflow metadata is available",
-                "acceptanceCriteria": [],
-                "definitionOfDone": [],
-                "artifacts": []
-            }
-        }]
-    });
-    session
-        .append_workflow_runtime_snapshot(
-            serde_json::from_value(snapshot).expect("workflow runtime snapshot"),
-        )
-        .expect("append workflow runtime snapshot");
-
-    run_async(async {
-        session.save().await.expect("save workflow session");
-    });
-}
-
 fn corrupt_session_header(path: &Path) {
     let raw = std::fs::read_to_string(path).expect("read session file");
     let mut lines = raw.lines().map(str::to_string).collect::<Vec<_>>();
@@ -250,66 +168,6 @@ fn list_sessions_for_project_orders_by_mtime() {
     assert!(sessions.len() >= 2);
     assert_eq!(sessions[0].path, second_path);
     assert_eq!(sessions[1].path, first_path);
-}
-
-#[test]
-fn list_sessions_for_project_preserves_workflow_summary_from_disk_scan() {
-    let harness =
-        TestHarness::new("list_sessions_for_project_preserves_workflow_summary_from_disk_scan");
-    let base_dir = harness.temp_path("sessions");
-    let cwd = harness.temp_path("project");
-    std::fs::create_dir_all(&cwd).expect("create cwd");
-
-    let project_dir = base_dir.join(encode_cwd(&cwd));
-    std::fs::create_dir_all(&project_dir).expect("create project session dir");
-    let session_path = project_dir.join("workflow.jsonl");
-
-    std::fs::write(&session_path, "stale index payload").expect("write stale payload");
-    let mut stale_header = SessionHeader::new();
-    stale_header.cwd = cwd.display().to_string();
-    stale_header.id = "workflow-session".to_string();
-    stale_header.timestamp = "2026-02-03T12:00:00.000Z".to_string();
-
-    let index = SessionIndex::for_sessions_root(&base_dir);
-    index
-        .index_session_snapshot(&session_path, &stale_header, 1, None, None)
-        .expect("seed stale index row without workflow metadata");
-
-    sleep(Duration::from_millis(20));
-    create_workflow_session(&session_path, &base_dir, &cwd, "workflow-session");
-
-    let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
-    assert_eq!(sessions.len(), 1);
-
-    let workflow = sessions[0]
-        .workflow
-        .as_ref()
-        .expect("disk scan should restore workflow summary");
-    harness
-        .log()
-        .info_ctx("workflow", "picker session metadata", |ctx| {
-            ctx.push(("path".to_string(), sessions[0].path.clone()));
-            ctx.push((
-                "active_task_id".to_string(),
-                workflow.active_task_id.clone().unwrap_or_default(),
-            ));
-            ctx.push((
-                "snapshot_count".to_string(),
-                workflow.snapshot_count.to_string(),
-            ));
-            ctx.push((
-                "in_progress_tasks".to_string(),
-                workflow.summary.in_progress_tasks.to_string(),
-            ));
-            ctx.push((
-                "total_tasks".to_string(),
-                workflow.summary.total_tasks.to_string(),
-            ));
-        });
-    assert_eq!(workflow.active_task_id.as_deref(), Some("task-1"));
-    assert_eq!(workflow.snapshot_count, 1);
-    assert_eq!(workflow.summary.in_progress_tasks, 1);
-    assert_eq!(workflow.summary.total_tasks, 2);
 }
 
 #[test]

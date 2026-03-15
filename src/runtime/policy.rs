@@ -76,7 +76,7 @@ pub struct PolicyDecision {
 }
 
 impl PolicyDecision {
-    pub fn allow() -> Self {
+    pub const fn allow() -> Self {
         Self {
             verdict: PolicyVerdict::Allow,
             reasons: Vec::new(),

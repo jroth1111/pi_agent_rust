@@ -27,8 +27,8 @@ use crate::model::{
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind,
-    RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus,
+    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunVerifyScopeKind, RunVerifyStatus,
+    SubrunPlan, TaskReport, WaveStatus,
 };
 use crate::provider::Provider;
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
@@ -44,8 +44,9 @@ use crate::runtime::model_routing::{ModelRoute, PhaseModelRouter};
 use crate::runtime::policy::PolicySet;
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
-    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints, RunPhase,
-    RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState, VerifySpec,
+    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints,
+    RunDispatchState, RunPhase, RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec,
+    TaskState, VerifySpec,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -286,14 +287,12 @@ struct RpcReliabilityState {
 
 #[derive(Debug, Default)]
 struct RpcOrchestrationState {
-    runs: HashMap<String, RunStatus>,
     task_runs: HashMap<String, HashSet<String>>,
 }
 
 impl RpcOrchestrationState {
-    fn register_run(&mut self, run: RunStatus) {
-        self.update_task_run_index(&run.run_id, &run.task_ids);
-        self.runs.insert(run.run_id.clone(), run);
+    fn register_run(&mut self, run_id: &str, task_ids: &[String]) {
+        self.update_task_run_index(run_id, task_ids);
     }
 
     fn update_task_run_index(&mut self, run_id: &str, task_ids: &[String]) {
@@ -309,13 +308,8 @@ impl RpcOrchestrationState {
         self.task_runs.retain(|_, run_ids| !run_ids.is_empty());
     }
 
-    fn get_run(&self, run_id: &str) -> Option<RunStatus> {
-        self.runs.get(run_id).cloned()
-    }
-
-    fn update_run(&mut self, run: RunStatus) {
-        self.update_task_run_index(&run.run_id, &run.task_ids);
-        self.runs.insert(run.run_id.clone(), run);
+    fn update_run(&mut self, run_id: &str, task_ids: &[String]) {
+        self.update_task_run_index(run_id, task_ids);
     }
 
     fn run_ids_for_task(&self, task_id: &str) -> Vec<String> {
@@ -1335,38 +1329,21 @@ fn next_run_id(candidate: Option<&str>) -> String {
 async fn persist_run_status(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     status: &RunStatus,
 ) -> Result<()> {
-    run_store.save(status)?;
-
-    let mut guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    {
-        let mut inner_session = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        inner_session.append_custom_entry(
-            "orchestration_run_status".to_string(),
-            Some(json!(status.clone())),
-        );
-    }
-    guard.persist_session().await?;
-    Ok(())
+    let mut snapshot = runtime_store.load_snapshot(&status.run_id)?;
+    apply_run_status_to_snapshot(&mut snapshot, status);
+    persist_runtime_snapshot(cx, session, runtime_store, &snapshot).await
 }
 
-async fn persist_runtime_bootstrap(
+async fn persist_runtime_snapshot(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
     runtime_store: &RuntimeStore,
-    output: &RuntimeControllerOutput,
+    snapshot: &RunSnapshot,
 ) -> Result<()> {
-    runtime_store.append_events(&output.events)?;
-    runtime_store.save_snapshot(&output.snapshot)?;
+    runtime_store.save_snapshot(snapshot)?;
 
     let mut guard = session
         .lock(cx)
@@ -1380,14 +1357,24 @@ async fn persist_runtime_bootstrap(
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         inner_session.append_custom_entry(
             "runtime_run_snapshot".to_string(),
-            Some(json!(output.snapshot.clone())),
+            Some(json!(snapshot.clone())),
         );
     }
     guard.persist_session().await?;
     Ok(())
 }
 
-fn runtime_phase_to_run_lifecycle(phase: RunPhase) -> RunLifecycle {
+async fn persist_runtime_bootstrap(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    runtime_store: &RuntimeStore,
+    output: &RuntimeControllerOutput,
+) -> Result<()> {
+    runtime_store.append_events(&output.events)?;
+    persist_runtime_snapshot(cx, session, runtime_store, &output.snapshot).await
+}
+
+const fn runtime_phase_to_run_lifecycle(phase: RunPhase) -> RunLifecycle {
     match phase {
         RunPhase::Created | RunPhase::Planning | RunPhase::Dispatching => RunLifecycle::Pending,
         RunPhase::Running | RunPhase::Verifying | RunPhase::Recovering => RunLifecycle::Running,
@@ -1398,7 +1385,7 @@ fn runtime_phase_to_run_lifecycle(phase: RunPhase) -> RunLifecycle {
     }
 }
 
-fn runtime_task_state_label(state: TaskState) -> &'static str {
+const fn runtime_task_state_label(state: TaskState) -> &'static str {
     match state {
         TaskState::Draft | TaskState::Blocked => "blocked",
         TaskState::Ready => "ready",
@@ -1453,11 +1440,52 @@ fn runtime_snapshot_dag_depth(snapshot: &RunSnapshot) -> usize {
 }
 
 fn runtime_snapshot_execution_tier(snapshot: &RunSnapshot) -> ExecutionTier {
+    if snapshot.dispatch.selected_tier != ExecutionTier::Inline || snapshot.tasks.len() <= 1 {
+        return snapshot.dispatch.selected_tier;
+    }
     match snapshot.tasks.len() {
         0 | 1 => ExecutionTier::Inline,
         2..=24 if runtime_snapshot_dag_depth(snapshot) <= 4 => ExecutionTier::Wave,
         _ => ExecutionTier::Hierarchical,
     }
+}
+
+const fn run_lifecycle_to_runtime_phase(
+    lifecycle: RunLifecycle,
+    current_phase: RunPhase,
+) -> RunPhase {
+    match lifecycle {
+        RunLifecycle::Pending | RunLifecycle::Blocked => {
+            if matches!(current_phase, RunPhase::Created | RunPhase::Planning) {
+                current_phase
+            } else {
+                RunPhase::Dispatching
+            }
+        }
+        RunLifecycle::Running => RunPhase::Running,
+        RunLifecycle::AwaitingHuman => RunPhase::AwaitingHuman,
+        RunLifecycle::Succeeded => RunPhase::Completed,
+        RunLifecycle::Failed => RunPhase::Failed,
+        RunLifecycle::Canceled => RunPhase::Canceled,
+    }
+}
+
+fn apply_run_status_to_snapshot(snapshot: &mut RunSnapshot, status: &RunStatus) {
+    snapshot.phase = run_lifecycle_to_runtime_phase(status.lifecycle, snapshot.phase);
+    snapshot.spec.run_verify_command = Some(status.run_verify_command.clone());
+    snapshot.spec.run_verify_timeout_sec = status.run_verify_timeout_sec;
+    snapshot.spec.budgets.max_parallelism = status.max_parallelism.max(1);
+    snapshot.dispatch = RunDispatchState {
+        selected_tier: status.selected_tier,
+        active_subrun_id: status.active_subrun_id.clone(),
+        active_wave: status.active_wave.clone(),
+        planned_subruns: status.planned_subruns.clone(),
+        task_reports: status.task_reports.clone(),
+        latest_run_verify: status.latest_run_verify.clone(),
+    };
+    snapshot.summary.task_counts = status.task_counts.clone();
+    snapshot.created_at = status.created_at;
+    snapshot.updated_at = status.updated_at;
 }
 
 fn project_runtime_run_status(snapshot: &RunSnapshot) -> RunStatus {
@@ -1477,12 +1505,12 @@ fn project_runtime_run_status(snapshot: &RunSnapshot) -> RunStatus {
         run_verify_timeout_sec: snapshot.spec.run_verify_timeout_sec,
         max_parallelism: snapshot.spec.budgets.max_parallelism.max(1),
         task_ids: snapshot.tasks.keys().cloned().collect(),
-        active_subrun_id: None,
-        active_wave: None,
-        planned_subruns: Vec::new(),
+        active_subrun_id: snapshot.dispatch.active_subrun_id.clone(),
+        active_wave: snapshot.dispatch.active_wave.clone(),
+        planned_subruns: snapshot.dispatch.planned_subruns.clone(),
         task_counts,
-        task_reports: BTreeMap::new(),
-        latest_run_verify: None,
+        task_reports: snapshot.dispatch.task_reports.clone(),
+        latest_run_verify: snapshot.dispatch.latest_run_verify.clone(),
         created_at: snapshot.created_at,
         updated_at: snapshot.updated_at,
     }
@@ -1683,6 +1711,7 @@ async fn bootstrap_runtime_run(
     req: &StartRunRequest,
 ) -> Result<RuntimeControllerOutput> {
     let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
+    let selected_tier = select_execution_tier(&req.tasks);
     let run_verify_timeout_sec = req
         .run_verify_timeout_sec
         .unwrap_or(options.config.reliability_verify_timeout_sec_default());
@@ -1708,9 +1737,11 @@ async fn bootstrap_runtime_run(
     let tasks = build_runtime_task_nodes(req, run_verify_timeout_sec);
     let route = ModelRoute::from_profile(&model_profile);
     let mut controller = RuntimeController::new(PhaseModelRouter::new(route), PolicySet::new());
-    controller
+    let mut output = controller
         .handle(RuntimeCommand::BootstrapRun { spec, plan, tasks })
-        .map_err(|err| Error::session(format!("runtime bootstrap failed: {err}")))
+        .map_err(|err| Error::session(format!("runtime bootstrap failed: {err}")))?;
+    output.snapshot.dispatch.selected_tier = selected_tier;
+    Ok(output)
 }
 
 async fn append_dispatch_grants_session_entries(
@@ -1869,16 +1900,8 @@ async fn append_dispatch_rollback_session_entry(
     Ok(())
 }
 
-fn ensure_run_id_available(
-    orchestration: &RpcOrchestrationState,
-    run_store: &RunStore,
-    runtime_store: &RuntimeStore,
-    run_id: &str,
-) -> Result<()> {
-    if orchestration.get_run(run_id).is_some()
-        || run_store.exists(run_id)
-        || runtime_store.exists(run_id)
-    {
+fn ensure_run_id_available(runtime_store: &RuntimeStore, run_id: &str) -> Result<()> {
+    if runtime_store.exists(run_id) {
         return Err(Error::validation(format!(
             "orchestration run already exists: {run_id}"
         )));
@@ -2627,7 +2650,7 @@ async fn cancel_live_run_tasks_and_sync(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     run: &mut RunStatus,
 ) -> Result<()> {
     let canceled_grants = {
@@ -2643,7 +2666,7 @@ async fn cancel_live_run_tasks_and_sync(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(run.clone());
+        orchestration.update_run(&run.run_id, &run.task_ids);
     }
 
     append_canceled_dispatch_grants_session_entries(
@@ -2667,7 +2690,7 @@ async fn cancel_live_run_tasks_and_sync(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             &grant.task_id,
             report,
         )
@@ -2689,9 +2712,9 @@ async fn cancel_live_run_tasks_and_sync(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(run.clone());
+        orchestration.update_run(&run.run_id, &run.task_ids);
     }
-    persist_run_status(cx, session, run_store, run).await?;
+    persist_run_status(cx, session, runtime_store, run).await?;
 
     Ok(())
 }
@@ -3103,7 +3126,7 @@ async fn submit_task_and_sync(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     req: SubmitTaskRequest,
 ) -> Result<SubmitTaskResponse> {
     let req_for_report = req.clone();
@@ -3150,7 +3173,7 @@ async fn submit_task_and_sync(
         session,
         reliability_state,
         orchestration_state,
-        run_store,
+        runtime_store,
         &result.task_id,
         Some(report),
     )
@@ -3164,7 +3187,7 @@ async fn rollback_dispatch_grant(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     run_id: &str,
     grant: &DispatchGrant,
     failure_summary: Option<String>,
@@ -3183,21 +3206,17 @@ async fn rollback_dispatch_grant(
                 "orchestration_execution_error",
             )
         });
-        let mut run = {
-            let Ok(orchestration) = orchestration_state.lock(cx).await else {
-                return;
-            };
-            orchestration
-                .get_run(run_id)
-                .or_else(|| run_store.load(run_id).ok())
-        };
+        let mut run = runtime_store
+            .load_snapshot(run_id)
+            .ok()
+            .map(|snapshot| project_runtime_run_status(&snapshot));
         if let Some(mut run) = run.take() {
             if let Some(report) = rollback_report.as_ref() {
                 run.upsert_task_report(report.clone());
             }
             refresh_run_from_reliability(&rel, &mut run);
             if let Ok(mut orchestration) = orchestration_state.lock(cx).await {
-                orchestration.update_run(run.clone());
+                orchestration.update_run(&run.run_id, &run.task_ids);
             }
             (Some(run), rolled_back_state)
         } else {
@@ -3212,7 +3231,7 @@ async fn rollback_dispatch_grant(
     }
 
     if let Some(run) = updated_run {
-        let _ = persist_run_status(cx, session, run_store, &run).await;
+        let _ = persist_run_status(cx, session, runtime_store, &run).await;
     }
 }
 
@@ -3283,19 +3302,20 @@ async fn capture_dispatch_grant_execution_with_base_patches(
         snapshot.clone(),
     )?;
     workspace.prepare()?;
-    let mut layered_base = false;
-    if !base_patches.is_empty() {
+    let layered_base = if base_patches.is_empty() {
+        let parent_base_patch = repo_worktree_diff_against_snapshot(repo_root, &snapshot)?;
+        if parent_base_patch.trim().is_empty() {
+            false
+        } else {
+            workspace.apply_patch(&parent_base_patch)?;
+            true
+        }
+    } else {
         for patch in base_patches {
             workspace.apply_patch(patch)?;
         }
-        layered_base = true;
-    } else {
-        let parent_base_patch = repo_worktree_diff_against_snapshot(repo_root, &snapshot)?;
-        if !parent_base_patch.trim().is_empty() {
-            workspace.apply_patch(&parent_base_patch)?;
-            layered_base = true;
-        }
-    }
+        true
+    };
     if layered_base {
         workspace.commit_staged_changes("pi orchestration replay base")?;
     }
@@ -3337,21 +3357,14 @@ fn captured_dispatches_overlap(captures: &[CapturedDispatchExecution]) -> bool {
 }
 
 async fn current_run_status(
-    cx: &AgentCx,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    _cx: &AgentCx,
+    _orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    runtime_store: &RuntimeStore,
     run_id: &str,
 ) -> Result<RunStatus> {
-    if let Some(run) = {
-        let orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.get_run(run_id)
-    } {
-        return Ok(run);
-    }
-    run_store.load(run_id)
+    runtime_store
+        .load_snapshot(run_id)
+        .map(|snapshot| project_runtime_run_status(&snapshot))
 }
 
 async fn finalize_captured_dispatch_execution(
@@ -3359,7 +3372,7 @@ async fn finalize_captured_dispatch_execution(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     repo_root: &Path,
     run_id: &str,
     capture: CapturedDispatchExecution,
@@ -3388,7 +3401,7 @@ async fn finalize_captured_dispatch_execution(
                 session,
                 reliability_state,
                 orchestration_state,
-                run_store,
+                runtime_store,
                 run_id,
                 &capture.grant,
                 Some(summary),
@@ -3407,7 +3420,7 @@ async fn finalize_captured_dispatch_execution(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             run_id,
             &capture.grant,
             Some(summary),
@@ -3434,7 +3447,7 @@ async fn finalize_captured_dispatch_execution(
         session,
         reliability_state,
         orchestration_state,
-        run_store,
+        runtime_store,
         SubmitTaskRequest {
             task_id: capture.grant.task_id.clone(),
             lease_id: capture.grant.lease_id.clone(),
@@ -3458,7 +3471,7 @@ async fn finalize_captured_dispatch_execution(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             run_id,
             &capture.grant,
             Some(summary),
@@ -3467,7 +3480,7 @@ async fn finalize_captured_dispatch_execution(
         return Err(err);
     }
 
-    current_run_status(cx, orchestration_state, run_store, run_id).await
+    current_run_status(cx, orchestration_state, runtime_store, run_id).await
 }
 
 #[allow(dead_code)]
@@ -3476,7 +3489,7 @@ async fn execute_inline_dispatch_grant_with_worker(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     repo_root: &Path,
     run_id: &str,
     grant: &DispatchGrant,
@@ -3494,7 +3507,7 @@ async fn execute_inline_dispatch_grant_with_worker(
                     session,
                     reliability_state,
                     orchestration_state,
-                    run_store,
+                    runtime_store,
                     run_id,
                     grant,
                     Some(summary),
@@ -3509,7 +3522,7 @@ async fn execute_inline_dispatch_grant_with_worker(
         session,
         reliability_state,
         orchestration_state,
-        run_store,
+        runtime_store,
         repo_root,
         run_id,
         capture,
@@ -3522,7 +3535,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     repo_root: &Path,
     run: RunStatus,
     grants: &[DispatchGrant],
@@ -3553,7 +3566,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
                     session,
                     reliability_state,
                     orchestration_state,
-                    run_store,
+                    runtime_store,
                     &updated_run.run_id,
                     grant,
                     Some(summary),
@@ -3569,7 +3582,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             repo_root,
             &updated_run.run_id,
             capture,
@@ -3589,7 +3602,7 @@ async fn finalize_captured_dispatches(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     repo_root: &Path,
     run: RunStatus,
     captures: Vec<CapturedDispatchExecution>,
@@ -3601,7 +3614,7 @@ async fn finalize_captured_dispatches(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             repo_root,
             &updated_run.run_id,
             capture,
@@ -3616,7 +3629,7 @@ async fn execute_dispatch_grants_with_worker(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     repo_root: &Path,
     run: RunStatus,
     grants: &[DispatchGrant],
@@ -3653,7 +3666,7 @@ async fn execute_dispatch_grants_with_worker(
                     session,
                     reliability_state,
                     orchestration_state,
-                    run_store,
+                    runtime_store,
                     &run.run_id,
                     &grant,
                     Some(summary),
@@ -3673,7 +3686,7 @@ async fn execute_dispatch_grants_with_worker(
                         session,
                         reliability_state,
                         orchestration_state,
-                        run_store,
+                        runtime_store,
                         repo_root,
                         run,
                         &success_grants,
@@ -3686,7 +3699,7 @@ async fn execute_dispatch_grants_with_worker(
                         session,
                         reliability_state,
                         orchestration_state,
-                        run_store,
+                        runtime_store,
                         repo_root,
                         run,
                         captures,
@@ -3694,7 +3707,7 @@ async fn execute_dispatch_grants_with_worker(
                     .await?
                 }
             } else {
-                current_run_status(cx, orchestration_state, run_store, &run.run_id).await?
+                current_run_status(cx, orchestration_state, runtime_store, &run.run_id).await?
             };
             return Ok(updated_run);
         }
@@ -3705,7 +3718,7 @@ async fn execute_dispatch_grants_with_worker(
                 session,
                 reliability_state,
                 orchestration_state,
-                run_store,
+                runtime_store,
                 repo_root,
                 run,
                 grants,
@@ -3719,7 +3732,7 @@ async fn execute_dispatch_grants_with_worker(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             repo_root,
             run,
             captures,
@@ -3734,7 +3747,7 @@ async fn execute_dispatch_grants_with_worker(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             repo_root,
             &updated_run.run_id,
             grant,
@@ -3750,7 +3763,7 @@ async fn execute_inline_run_dispatch(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     config: &Config,
     run: RunStatus,
     grants: &[DispatchGrant],
@@ -3769,7 +3782,7 @@ async fn execute_inline_run_dispatch(
         session,
         reliability_state,
         orchestration_state,
-        run_store,
+        runtime_store,
         repo_root.as_path(),
         run,
         grants,
@@ -3804,7 +3817,7 @@ async fn dispatch_run_until_quiescent(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     config: &Config,
     mut run: RunStatus,
     agent_id_prefix: &str,
@@ -3836,7 +3849,7 @@ async fn dispatch_run_until_quiescent(
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-            orchestration.update_run(run.clone());
+            orchestration.update_run(&run.run_id, &run.task_ids);
         }
 
         if grants.is_empty() {
@@ -3869,7 +3882,7 @@ async fn dispatch_run_until_quiescent(
             session,
             reliability_state,
             orchestration_state,
-            run_store,
+            runtime_store,
             config,
             run,
             &grants,
@@ -3879,7 +3892,7 @@ async fn dispatch_run_until_quiescent(
             Ok(updated_run) => updated_run,
             Err(err) if grants.len() == 1 => {
                 let recovered_run =
-                    current_run_status(cx, orchestration_state, run_store, &run_id).await?;
+                    current_run_status(cx, orchestration_state, runtime_store, &run_id).await?;
                 if matches!(
                     recovered_run.lifecycle,
                     RunLifecycle::Pending | RunLifecycle::Running
@@ -4012,6 +4025,7 @@ fn build_runtime_task_report(
 fn refresh_task_runs_with_verify_scopes(
     reliability: &RpcReliabilityState,
     orchestration: &mut RpcOrchestrationState,
+    runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<&TaskReport>,
 ) -> Vec<(RunStatus, Option<CompletedRunVerifyScope>)> {
@@ -4019,16 +4033,17 @@ fn refresh_task_runs_with_verify_scopes(
     let mut updated_runs = Vec::new();
 
     for run_id in run_ids {
-        let Some(mut run) = orchestration.get_run(&run_id) else {
+        let Ok(snapshot) = runtime_store.load_snapshot(&run_id) else {
             continue;
         };
+        let mut run = project_runtime_run_status(&snapshot);
         if let Some(report) = report.filter(|report| run.task_ids.contains(&report.task_id)) {
             run.upsert_task_report(report.clone());
         }
         let verify_scope = completed_run_verify_scope(reliability, &run)
             .filter(|scope| !should_skip_run_verify(&run, scope));
         refresh_run_from_reliability(reliability, &mut run);
-        orchestration.update_run(run.clone());
+        orchestration.update_run(&run.run_id, &run.task_ids);
         updated_runs.push((run, verify_scope));
     }
 
@@ -4038,13 +4053,20 @@ fn refresh_task_runs_with_verify_scopes(
 fn refresh_task_runs(
     reliability: &RpcReliabilityState,
     orchestration: &mut RpcOrchestrationState,
+    runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<TaskReport>,
 ) -> Vec<RunStatus> {
-    refresh_task_runs_with_verify_scopes(reliability, orchestration, task_id, report.as_ref())
-        .into_iter()
-        .map(|(run, _)| run)
-        .collect()
+    refresh_task_runs_with_verify_scopes(
+        reliability,
+        orchestration,
+        runtime_store,
+        task_id,
+        report.as_ref(),
+    )
+    .into_iter()
+    .map(|(run, _)| run)
+    .collect()
 }
 
 fn run_verify_scope_summary(
@@ -4124,7 +4146,7 @@ async fn sync_task_runs(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<TaskReport>,
 ) -> Result<Vec<RunStatus>> {
@@ -4140,6 +4162,7 @@ async fn sync_task_runs(
         refresh_task_runs_with_verify_scopes(
             &reliability,
             &mut orchestration,
+            runtime_store,
             task_id,
             report.as_ref(),
         )
@@ -4154,9 +4177,9 @@ async fn sync_task_runs(
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-            orchestration.update_run(run.clone());
+            orchestration.update_run(&run.run_id, &run.task_ids);
         }
-        persist_run_status(cx, session, run_store, &run).await?;
+        persist_run_status(cx, session, runtime_store, &run).await?;
         updated_runs.push(run);
     }
     Ok(updated_runs)
@@ -4167,7 +4190,7 @@ async fn refresh_run_if_live(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     mut run: RunStatus,
 ) -> Result<RunStatus> {
     let original = run.clone();
@@ -4184,11 +4207,11 @@ async fn refresh_run_if_live(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(run.clone());
+        orchestration.update_run(&run.run_id, &run.task_ids);
     }
 
     if has_live_tasks && run != original {
-        persist_run_status(cx, session, run_store, &run).await?;
+        persist_run_status(cx, session, runtime_store, &run).await?;
     }
 
     Ok(run)
@@ -4397,7 +4420,6 @@ pub async fn run(
     let retry_abort = Arc::new(AtomicBool::new(false));
     let reliability_state = Arc::new(Mutex::new(RpcReliabilityState::new(&options.config)?));
     let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
-    let run_store = RunStore::from_global_dir();
     let runtime_store = RuntimeStore::from_global_dir();
 
     {
@@ -4882,12 +4904,7 @@ pub async fn run(
 
                 let run_id = next_run_id(req.run_id.as_deref());
                 {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    if let Err(err) =
-                        ensure_run_id_available(&orchestration, &run_store, &runtime_store, &run_id)
-                    {
+                    if let Err(err) = ensure_run_id_available(&runtime_store, &run_id) {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.start_run",
@@ -4954,9 +4971,11 @@ pub async fn run(
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
-                    orchestration.register_run(status.clone());
+                    orchestration.register_run(&status.run_id, &status.task_ids);
                     drop(orchestration);
-                    if let Err(err) = persist_run_status(&cx, &session, &run_store, &status).await {
+                    if let Err(err) =
+                        persist_run_status(&cx, &session, &runtime_store, &status).await
+                    {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.start_run",
@@ -4986,23 +5005,13 @@ pub async fn run(
                         }
                     };
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-
-                if let Some(run) = cached_run
-                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
-                    .or_else(|| run_store.load(&req.run_id).ok())
-                {
+                if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
                     let run = match refresh_run_if_live(
                         &cx,
                         &session,
                         &reliability_state,
                         &orchestration_state,
-                        &run_store,
+                        &runtime_store,
                         run,
                     )
                     .await
@@ -5050,34 +5059,26 @@ pub async fn run(
                     .unwrap_or("run");
                 let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-                let run = if let Some(run) = cached_run
-                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
-                    .or_else(|| run_store.load(&req.run_id).ok())
-                {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                };
+                let run =
+                    if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
+                        run
+                    } else {
+                        let err =
+                            Error::session(format!("orchestration run not found: {}", req.run_id));
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.dispatch_run",
+                            &err,
+                        ));
+                        continue;
+                    };
 
                 let (run, grants) = match dispatch_run_until_quiescent(
                     &cx,
                     &session,
                     &reliability_state,
                     &orchestration_state,
-                    &run_store,
+                    &runtime_store,
                     &options.config,
                     run,
                     agent_id_prefix,
@@ -5095,7 +5096,7 @@ pub async fn run(
                         continue;
                     }
                 };
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
+                if let Err(err) = persist_run_status(&cx, &session, &runtime_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.dispatch_run",
@@ -5125,27 +5126,19 @@ pub async fn run(
                         }
                     };
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-                let mut run = if let Some(run) = cached_run
-                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
-                    .or_else(|| run_store.load(&req.run_id).ok())
-                {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.cancel_run",
-                        &err,
-                    ));
-                    continue;
-                };
+                let mut run =
+                    if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
+                        run
+                    } else {
+                        let err =
+                            Error::session(format!("orchestration run not found: {}", req.run_id));
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.cancel_run",
+                            &err,
+                        ));
+                        continue;
+                    };
                 let has_live_tasks = {
                     let rel = reliability_state
                         .lock(&cx)
@@ -5159,7 +5152,7 @@ pub async fn run(
                         &session,
                         &reliability_state,
                         &orchestration_state,
-                        &run_store,
+                        &runtime_store,
                         &mut run,
                     )
                     .await
@@ -5181,9 +5174,9 @@ pub async fn run(
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
-                    orchestration.update_run(run.clone());
+                    orchestration.update_run(&run.run_id, &run.task_ids);
                 }
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
+                if let Err(err) = persist_run_status(&cx, &session, &runtime_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.cancel_run",
@@ -5213,27 +5206,19 @@ pub async fn run(
                         }
                     };
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-                let mut run = if let Some(run) = cached_run
-                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
-                    .or_else(|| run_store.load(&req.run_id).ok())
-                {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.resume_run",
-                        &err,
-                    ));
-                    continue;
-                };
+                let mut run =
+                    if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
+                        run
+                    } else {
+                        let err =
+                            Error::session(format!("orchestration run not found: {}", req.run_id));
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.resume_run",
+                            &err,
+                        ));
+                        continue;
+                    };
                 if matches!(
                     run.lifecycle,
                     RunLifecycle::Canceled | RunLifecycle::Blocked | RunLifecycle::Failed
@@ -5267,7 +5252,7 @@ pub async fn run(
                         &session,
                         &reliability_state,
                         &orchestration_state,
-                        &run_store,
+                        &runtime_store,
                         &options.config,
                         run,
                         "resume",
@@ -5293,10 +5278,10 @@ pub async fn run(
                             orchestration_state.lock(&cx).await.map_err(|err| {
                                 Error::session(format!("orchestration lock failed: {err}"))
                             })?;
-                        orchestration.update_run(run.clone());
+                        orchestration.update_run(&run.run_id, &run.task_ids);
                     }
                 }
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
+                if let Err(err) = persist_run_status(&cx, &session, &runtime_store, &run).await {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.resume_run",
@@ -5390,7 +5375,7 @@ pub async fn run(
                     &session,
                     &reliability_state,
                     &orchestration_state,
-                    &run_store,
+                    &runtime_store,
                     &grant.task_id,
                     None,
                 )
@@ -5545,7 +5530,7 @@ pub async fn run(
                     &session,
                     &reliability_state,
                     &orchestration_state,
-                    &run_store,
+                    &runtime_store,
                     &result.task_id,
                     Some(report),
                 )
@@ -5642,7 +5627,7 @@ pub async fn run(
                     &session,
                     &reliability_state,
                     &orchestration_state,
-                    &run_store,
+                    &runtime_store,
                     &task_id_for_note,
                     report,
                 )
@@ -8927,15 +8912,15 @@ mod tests {
 
     #[async_trait]
     impl Provider for CountingProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "counting"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "counting"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "counting-model"
         }
 
@@ -9397,7 +9382,7 @@ mod tests {
         let mut orchestration = RpcOrchestrationState::default();
         let mut run = RunStatus::new("run-1", "Ship it", ExecutionTier::Wave);
         run.task_ids = vec!["task-a".to_string(), "task-b".to_string()];
-        orchestration.register_run(run.clone());
+        orchestration.register_run(&run.run_id, &run.task_ids);
 
         assert_eq!(
             orchestration.run_ids_for_task("task-a"),
@@ -9409,7 +9394,7 @@ mod tests {
         );
 
         run.task_ids = vec!["task-b".to_string()];
-        orchestration.update_run(run);
+        orchestration.update_run(&run.run_id, &run.task_ids);
 
         assert!(orchestration.run_ids_for_task("task-a").is_empty());
         assert_eq!(
@@ -9421,23 +9406,25 @@ mod tests {
     #[test]
     fn orchestration_run_id_availability_rejects_cached_and_persisted_runs() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let store = RunStore::new(temp_dir.path().to_path_buf());
         let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
-        let mut orchestration = RpcOrchestrationState::default();
-        let cached_run = RunStatus::new("run-cached", "Cached", ExecutionTier::Inline);
-        orchestration.register_run(cached_run);
+        let persisted_snapshot = RunSnapshot::new(RunSpec {
+            run_id: "run-persisted".to_string(),
+            objective: "Persisted".to_string(),
+            root_workspace: PathBuf::from("/tmp/persisted"),
+            policy_profile: "default".to_string(),
+            model_profile: "default".to_string(),
+            run_verify_command: Some("cargo test".to_string()),
+            run_verify_timeout_sec: Some(60),
+            budgets: RunBudgets::default(),
+            constraints: RunConstraints::default(),
+            created_at: Utc::now(),
+        });
+        runtime_store
+            .save_snapshot(&persisted_snapshot)
+            .expect("save persisted snapshot");
 
-        let persisted_run = RunStatus::new("run-persisted", "Persisted", ExecutionTier::Inline);
-        store.save(&persisted_run).expect("save persisted run");
-
-        let cached_err =
-            ensure_run_id_available(&orchestration, &store, &runtime_store, "run-cached")
-                .expect_err("cached run should conflict");
-        assert!(cached_err.to_string().contains("already exists"));
-
-        let persisted_err =
-            ensure_run_id_available(&orchestration, &store, &runtime_store, "run-persisted")
-                .expect_err("persisted run should conflict");
+        let persisted_err = ensure_run_id_available(&runtime_store, "run-persisted")
+            .expect_err("persisted run should conflict");
         assert!(persisted_err.to_string().contains("already exists"));
 
         let runtime_snapshot = RunSnapshot::new(RunSpec {
@@ -9456,12 +9443,11 @@ mod tests {
             .save_snapshot(&runtime_snapshot)
             .expect("save runtime snapshot");
 
-        let runtime_err =
-            ensure_run_id_available(&orchestration, &store, &runtime_store, "run-runtime")
-                .expect_err("runtime run should conflict");
+        let runtime_err = ensure_run_id_available(&runtime_store, "run-runtime")
+            .expect_err("runtime run should conflict");
         assert!(runtime_err.to_string().contains("already exists"));
 
-        assert!(ensure_run_id_available(&orchestration, &store, &runtime_store, "run-new").is_ok());
+        assert!(ensure_run_id_available(&runtime_store, "run-new").is_ok());
     }
 
     #[test]
@@ -9745,7 +9731,7 @@ mod tests {
     #[test]
     fn orchestration_cancel_live_run_tasks_and_sync_updates_reports_and_session_entries() {
         let (temp_dir, repo_path, _) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -9778,9 +9764,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist run");
             append_dispatch_grants_session_entries(&cx, &session, &reliability_state, &grants)
@@ -9792,7 +9778,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &mut run,
             )
             .await
@@ -9807,7 +9793,10 @@ mod tests {
                     .all(|report| report.summary.contains("canceled dispatch"))
             );
 
-            let persisted = run_store.load(&run.run_id).expect("load persisted run");
+            let persisted = runtime_store
+                .load_snapshot(&run.run_id)
+                .map(|snapshot| project_runtime_run_status(&snapshot))
+                .expect("load persisted run");
             assert_eq!(persisted.lifecycle, RunLifecycle::Canceled);
             assert_eq!(persisted.task_reports.len(), 2);
 
@@ -10072,13 +10061,32 @@ mod tests {
         let report = build_submit_task_report(&reliability, &req, &result).expect("task report");
 
         let mut orchestration = RpcOrchestrationState::default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let mut run = RunStatus::new("run-success", "Run success", ExecutionTier::Inline);
         run.task_ids = vec![contract.task_id.clone()];
-        orchestration.register_run(run);
+        orchestration.register_run(&run.run_id, &run.task_ids);
+        let mut snapshot = RunSnapshot::new(RunSpec {
+            run_id: run.run_id.clone(),
+            objective: run.objective.clone(),
+            root_workspace: PathBuf::from("/tmp/run-success"),
+            policy_profile: "default".to_string(),
+            model_profile: "default".to_string(),
+            run_verify_command: Some(run.run_verify_command.clone()),
+            run_verify_timeout_sec: run.run_verify_timeout_sec,
+            budgets: RunBudgets::default(),
+            constraints: RunConstraints::default(),
+            created_at: run.created_at,
+        });
+        apply_run_status_to_snapshot(&mut snapshot, &run);
+        runtime_store
+            .save_snapshot(&snapshot)
+            .expect("save run snapshot");
 
         let updated = refresh_task_runs(
             &reliability,
             &mut orchestration,
+            &runtime_store,
             &contract.task_id,
             Some(report),
         );
@@ -10097,7 +10105,7 @@ mod tests {
     #[test]
     fn orchestration_inline_execution_substrate_applies_verified_diff_and_closes_task() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10136,9 +10144,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10152,7 +10160,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-inline-exec",
                 &grant,
@@ -10196,7 +10204,7 @@ mod tests {
     #[test]
     fn orchestration_inline_execution_substrate_keeps_parent_repo_clean_on_verify_failure() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10235,9 +10243,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10251,7 +10259,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-inline-fail",
                 &grant,
@@ -10283,7 +10291,7 @@ mod tests {
     #[test]
     fn orchestration_inline_execution_failure_persists_rollback_report() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10322,9 +10330,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10336,7 +10344,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-inline-worker-fail",
                 &grant,
@@ -10349,7 +10357,7 @@ mod tests {
             let run = current_run_status(
                 &cx,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 "run-inline-worker-fail",
             )
             .await
@@ -10409,7 +10417,7 @@ mod tests {
     #[test]
     fn orchestration_inline_execution_substrate_applies_created_file_and_closes_task() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10448,9 +10456,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10464,7 +10472,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-inline-create",
                 &grant,
@@ -10516,7 +10524,7 @@ mod tests {
         run_git(&repo_path, &["add", "."]);
         run_git(&repo_path, &["commit", "-m", "add extra tracked file"]);
         let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10566,9 +10574,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10585,7 +10593,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 run,
                 &grants,
@@ -10622,7 +10630,7 @@ mod tests {
         run_git(&repo_path, &["add", "."]);
         run_git(&repo_path, &["commit", "-m", "add extra tracked file"]);
         let head = git_stdout(&repo_path, &["rev-parse", "HEAD"]);
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10670,9 +10678,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10684,7 +10692,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 run,
                 &grants,
@@ -10701,10 +10709,14 @@ mod tests {
             assert!(lib_contents.contains("task_partial_a"));
             assert!(!extra_contents.contains("task_partial_b"));
 
-            let updated_run =
-                current_run_status(&cx, &orchestration_state, &run_store, "run-partial-wave")
-                    .await
-                    .expect("load updated run");
+            let updated_run = current_run_status(
+                &cx,
+                &orchestration_state,
+                &runtime_store,
+                "run-partial-wave",
+            )
+            .await
+            .expect("load updated run");
             assert_eq!(updated_run.lifecycle, RunLifecycle::Pending);
             assert_eq!(
                 updated_run
@@ -10752,7 +10764,7 @@ mod tests {
     #[test]
     fn orchestration_overlap_replay_uses_merged_base_state() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10802,9 +10814,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10816,7 +10828,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 run,
                 &grants,
@@ -10844,7 +10856,7 @@ mod tests {
     #[test]
     fn orchestration_sequential_dispatch_rebases_on_parent_worktree_base() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -10894,9 +10906,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10908,7 +10920,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-sequential-rebase",
                 &grant_a,
@@ -10937,7 +10949,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-sequential-rebase",
                 &grant_b,
@@ -10958,7 +10970,7 @@ mod tests {
     #[test]
     fn orchestration_dispatch_wave_advances_same_touch_prerequisite_chain() {
         let (temp_dir, repo_path, head) = setup_inline_execution_repo();
-        let run_store = RunStore::new(temp_dir.path().join("runs"));
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let cx = AgentCx::for_request();
         let session = build_test_agent_session(&repo_path);
         let reliability_state = Arc::new(Mutex::new(reliability_state_for_tests(
@@ -11009,9 +11021,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(run.clone());
+                orchestration.register_run(&run.run_id, &run.task_ids);
             }
-            persist_run_status(&cx, &session, &run_store, &run)
+            persist_run_status(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -11032,7 +11044,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &orchestration_state,
-                &run_store,
+                &runtime_store,
                 &repo_path,
                 "run-chain-wave",
                 &first_grant,
@@ -11042,7 +11054,7 @@ mod tests {
             .expect("execute first wave");
 
             let mut run =
-                current_run_status(&cx, &orchestration_state, &run_store, "run-chain-wave")
+                current_run_status(&cx, &orchestration_state, &runtime_store, "run-chain-wave")
                     .await
                     .expect("load updated run");
             let second_grants = {
@@ -11107,13 +11119,32 @@ mod tests {
         .expect("runtime report");
 
         let mut orchestration = RpcOrchestrationState::default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let mut run = RunStatus::new("run-blocked", "Run blocked", ExecutionTier::Inline);
         run.task_ids = vec![contract.task_id.clone()];
-        orchestration.register_run(run);
+        orchestration.register_run(&run.run_id, &run.task_ids);
+        let mut snapshot = RunSnapshot::new(RunSpec {
+            run_id: run.run_id.clone(),
+            objective: run.objective.clone(),
+            root_workspace: PathBuf::from("/tmp/run-blocked"),
+            policy_profile: "default".to_string(),
+            model_profile: "default".to_string(),
+            run_verify_command: Some(run.run_verify_command.clone()),
+            run_verify_timeout_sec: run.run_verify_timeout_sec,
+            budgets: RunBudgets::default(),
+            constraints: RunConstraints::default(),
+            created_at: run.created_at,
+        });
+        apply_run_status_to_snapshot(&mut snapshot, &run);
+        runtime_store
+            .save_snapshot(&snapshot)
+            .expect("save run snapshot");
 
         let updated = refresh_task_runs(
             &reliability,
             &mut orchestration,
+            &runtime_store,
             &contract.task_id,
             Some(report),
         );

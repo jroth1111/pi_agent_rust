@@ -31,7 +31,7 @@ pub struct RuntimeStateMachine {
 }
 
 impl RuntimeStateMachine {
-    pub fn new(snapshot: RunSnapshot) -> Self {
+    pub const fn new(snapshot: RunSnapshot) -> Self {
         Self {
             snapshot,
             history: Vec::new(),
@@ -200,7 +200,7 @@ impl RuntimeStateMachine {
     }
 }
 
-fn state_error_code(state: TaskState) -> &'static str {
+const fn state_error_code(state: TaskState) -> &'static str {
     match state {
         TaskState::Recoverable => "recoverable",
         TaskState::AwaitingHuman => "awaiting_human",

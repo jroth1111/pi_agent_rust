@@ -6,16 +6,15 @@
 
 pub mod coordinator;
 pub mod flock;
-pub mod run;
 
 #[cfg(test)]
 mod tests;
 
+pub use crate::runtime::{
+    ExecutionTier, RunLifecycle, RunStatus, RunVerifyScopeKind, RunVerifyStatus, SubrunPlan,
+    TaskReport, WaveStatus,
+};
 pub use coordinator::{
     ConflictResolution, FileConflict, FlockCoordinator, MergeResult, MergeStrategy,
 };
 pub use flock::{FlockWorker, FlockWorkspace};
-pub use run::{
-    ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind, RunVerifyStatus,
-    SubrunPlan, TaskReport, WaveStatus,
-};

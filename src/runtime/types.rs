@@ -9,6 +9,14 @@ pub type JobId = String;
 pub type PlanId = String;
 pub type ApprovalId = String;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionTier {
+    Inline,
+    Wave,
+    Hierarchical,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RunPhase {
@@ -28,6 +36,18 @@ impl RunPhase {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Canceled)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLifecycle {
+    Pending,
+    Running,
+    Blocked,
+    AwaitingHuman,
+    Succeeded,
+    Failed,
+    Canceled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -160,6 +180,206 @@ pub struct RunSummary {
     pub next_action: Option<String>,
     #[serde(default)]
     pub task_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskReport {
+    pub task_id: String,
+    pub attempt: u8,
+    pub summary: String,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    pub patch_digest: String,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub acceptance_ids: Vec<String>,
+    pub verify_command: String,
+    pub verify_exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    pub workspace_snapshot: String,
+    pub generated_at: DateTime<Utc>,
+}
+
+impl TaskReport {
+    pub fn new(task_id: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            attempt: 0,
+            summary: String::new(),
+            changed_files: Vec::new(),
+            patch_digest: String::new(),
+            evidence_ids: Vec::new(),
+            acceptance_ids: Vec::new(),
+            verify_command: String::new(),
+            verify_exit_code: 0,
+            failure_class: None,
+            blockers: Vec::new(),
+            workspace_snapshot: String::new(),
+            generated_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WaveStatus {
+    pub wave_id: String,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunVerifyScopeKind {
+    Run,
+    Wave,
+    Subrun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunVerifyStatus {
+    pub scope_id: String,
+    pub scope_kind: RunVerifyScopeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subrun_id: Option<String>,
+    pub command: String,
+    pub timeout_sec: u32,
+    pub exit_code: i32,
+    pub ok: bool,
+    pub summary: String,
+    pub duration_ms: u64,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubrunPlan {
+    pub subrun_id: String,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDispatchState {
+    pub selected_tier: ExecutionTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_subrun_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_wave: Option<WaveStatus>,
+    #[serde(default)]
+    pub planned_subruns: Vec<SubrunPlan>,
+    #[serde(default)]
+    pub task_reports: BTreeMap<String, TaskReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_run_verify: Option<RunVerifyStatus>,
+}
+
+impl Default for RunDispatchState {
+    fn default() -> Self {
+        Self {
+            selected_tier: ExecutionTier::Inline,
+            active_subrun_id: None,
+            active_wave: None,
+            planned_subruns: Vec::new(),
+            task_reports: BTreeMap::new(),
+            latest_run_verify: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStatus {
+    pub run_id: String,
+    pub objective: String,
+    pub selected_tier: ExecutionTier,
+    pub lifecycle: RunLifecycle,
+    #[serde(default)]
+    pub run_verify_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_verify_timeout_sec: Option<u32>,
+    #[serde(default = "RunStatus::default_max_parallelism")]
+    pub max_parallelism: usize,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_subrun_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_wave: Option<WaveStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planned_subruns: Vec<SubrunPlan>,
+    #[serde(default)]
+    pub task_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub task_reports: BTreeMap<String, TaskReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_run_verify: Option<RunVerifyStatus>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl RunStatus {
+    pub const DEFAULT_MAX_PARALLELISM: usize = 4;
+
+    const fn default_max_parallelism() -> usize {
+        Self::DEFAULT_MAX_PARALLELISM
+    }
+
+    pub fn new(
+        run_id: impl Into<String>,
+        objective: impl Into<String>,
+        selected_tier: ExecutionTier,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            run_id: run_id.into(),
+            objective: objective.into(),
+            selected_tier,
+            lifecycle: RunLifecycle::Pending,
+            run_verify_command: String::new(),
+            run_verify_timeout_sec: None,
+            max_parallelism: Self::DEFAULT_MAX_PARALLELISM,
+            task_ids: Vec::new(),
+            active_subrun_id: None,
+            active_wave: None,
+            planned_subruns: Vec::new(),
+            task_counts: BTreeMap::new(),
+            task_reports: BTreeMap::new(),
+            latest_run_verify: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_task_count(&mut self, state_label: impl Into<String>, count: usize) {
+        self.task_counts.insert(state_label.into(), count);
+        self.touch();
+    }
+
+    pub fn upsert_task_report(&mut self, report: TaskReport) {
+        self.task_reports.insert(report.task_id.clone(), report);
+        self.touch();
+    }
+
+    pub fn effective_max_parallelism(&self) -> usize {
+        match self.selected_tier {
+            ExecutionTier::Inline => 1,
+            ExecutionTier::Wave | ExecutionTier::Hierarchical => self.max_parallelism.max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -334,6 +554,8 @@ pub struct RunSnapshot {
     pub ready_queue: VecDeque<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub dispatch: RunDispatchState,
     pub summary: RunSummary,
     pub version: u64,
     pub created_at: DateTime<Utc>,
@@ -352,6 +574,7 @@ impl RunSnapshot {
             approvals: BTreeMap::new(),
             ready_queue: VecDeque::new(),
             wake_at: None,
+            dispatch: RunDispatchState::default(),
             summary: RunSummary::default(),
             version: 0,
             created_at: now,
@@ -392,5 +615,34 @@ mod tests {
         let runtime = TaskRuntime::default();
         assert_eq!(runtime.state, TaskState::Draft);
         assert!(runtime.lease.is_none());
+    }
+
+    #[test]
+    fn run_status_upserts_reports_and_counts() {
+        let mut run = RunStatus::new("run-1", "Ship orchestration", ExecutionTier::Wave);
+        run.set_task_count("ready", 2);
+        run.upsert_task_report(TaskReport {
+            task_id: "task-a".to_string(),
+            attempt: 1,
+            summary: "done".to_string(),
+            changed_files: vec!["src/rpc.rs".to_string()],
+            patch_digest: "digest".to_string(),
+            evidence_ids: vec!["ev-1".to_string()],
+            acceptance_ids: vec!["ac-1".to_string()],
+            verify_command: "cargo test".to_string(),
+            verify_exit_code: 0,
+            failure_class: None,
+            blockers: Vec::new(),
+            workspace_snapshot: "abc123".to_string(),
+            generated_at: Utc::now(),
+        });
+
+        assert_eq!(run.task_counts.get("ready"), Some(&2));
+        assert_eq!(
+            run.task_reports
+                .get("task-a")
+                .map(|report| report.summary.as_str()),
+            Some("done")
+        );
     }
 }
