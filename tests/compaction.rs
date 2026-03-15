@@ -1000,6 +1000,58 @@ fn summarize_entries_elides_successful_verify_output_with_evidence() {
 }
 
 #[test]
+fn summarize_entries_elides_consumed_truncated_grep_output_with_artifact() {
+    let harness =
+        TestHarness::new("summarize_entries_elides_consumed_truncated_grep_output_with_artifact");
+
+    let entries = vec![
+        message_entry("u1", None, user_text("search for matches")),
+        message_entry(
+            "a1",
+            Some("u1"),
+            assistant_with_tool_calls(vec![("grep", json!({"path": "src"}))]),
+        ),
+        message_entry(
+            "tr1",
+            Some("a1"),
+            SessionMessage::ToolResult {
+                tool_call_id: "call-0".to_string(),
+                tool_name: "grep".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "very large grep output that should not be replayed forever",
+                ))],
+                details: Some(json!({
+                    "truncation": { "totalBytes": 60000 },
+                    "fullOutputPath": "/tmp/pi-grep-output.log",
+                })),
+                is_error: false,
+                timestamp: Some(0),
+            },
+        ),
+        message_entry(
+            "a2",
+            Some("tr1"),
+            assistant_text("I found the relevant matches", 100),
+        ),
+    ];
+
+    let provider = Arc::new(ScriptedProvider::new([checkpoint_json("SUMMARY")]));
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+
+    let _ = run_async(async move {
+        summarize_entries(&entries, provider_dyn, "test-key", 0, None)
+            .await
+            .expect("summarize")
+    });
+
+    let prompt = provider.prompts().first().expect("prompt").clone();
+    assert!(prompt.contains("Truncated grep output omitted from replay"));
+    assert!(prompt.contains("/tmp/pi-grep-output.log"));
+    assert!(!prompt.contains("very large grep output"));
+    harness.log().info("prompt", prompt);
+}
+
+#[test]
 fn compact_seeds_file_ops_from_previous_compaction_details() {
     let harness = TestHarness::new("compact_seeds_file_ops_from_previous_compaction_details");
 

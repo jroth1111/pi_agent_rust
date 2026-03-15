@@ -2628,6 +2628,10 @@ impl Session {
             .map(ToOwned::to_owned)
     }
 
+    fn tool_output_was_truncated(details: Option<&Value>) -> bool {
+        details.and_then(|value| value.get("truncation")).is_some()
+    }
+
     fn is_verification_command(command: &str) -> bool {
         const PREFIXES: &[&str] = &[
             "cargo test",
@@ -2642,6 +2646,17 @@ impl Session {
         ];
         let normalized = command.trim().to_ascii_lowercase();
         PREFIXES.iter().any(|prefix| normalized.starts_with(prefix))
+    }
+
+    fn replay_artifact_notice(
+        tool_name: &str,
+        path: Option<&str>,
+        artifact_ref: &str,
+    ) -> Vec<ContentBlock> {
+        let scope = path.map_or_else(|| String::new(), |path| format!(" for {path}"));
+        vec![ContentBlock::Text(TextContent::new(format!(
+            "[Truncated {tool_name} output omitted from replay{scope}. Full results remain at {artifact_ref}; use bash to inspect that file if exact output is needed.]"
+        )))]
     }
 
     fn append_model_message_for_entry(
@@ -3720,6 +3735,7 @@ struct PromptVerificationRecord {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PromptAssemblyMetadata {
+    consumed_tool_results: HashSet<String>,
     verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
 }
 
@@ -3728,12 +3744,14 @@ struct PromptContextState {
     tool_calls: HashMap<String, PromptToolCall>,
     file_versions: HashMap<String, u64>,
     read_results: HashMap<(String, u64), PromptReadRecord>,
+    consumed_tool_results: HashSet<String>,
     verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
 }
 
 impl PromptContextState {
     fn with_metadata(metadata: PromptAssemblyMetadata) -> Self {
         Self {
+            consumed_tool_results: metadata.consumed_tool_results,
             verification_records: metadata.verification_records,
             ..Self::default()
         }
@@ -3829,6 +3847,26 @@ impl PromptContextState {
                             }
                         }
                     }
+                    "grep" | "find" | "ls" => {
+                        if self.consumed_tool_results.contains(tool_call_id)
+                            && Session::tool_output_was_truncated(details.as_ref())
+                            && let Some(artifact_ref) =
+                                Session::tool_full_output_path(details.as_ref())
+                        {
+                            return SessionMessage::ToolResult {
+                                tool_call_id: tool_call_id.to_string(),
+                                tool_name: tool_name.to_string(),
+                                content: Session::replay_artifact_notice(
+                                    &metadata.name,
+                                    metadata.path.as_deref(),
+                                    &artifact_ref,
+                                ),
+                                details,
+                                is_error,
+                                timestamp,
+                            };
+                        }
+                    }
                     "read" => {
                         if let Some(path) = &metadata.path {
                             let version = self.file_versions.get(path).copied().unwrap_or_default();
@@ -3893,8 +3931,24 @@ fn prompt_verification_status(status: EvidenceStatus) -> &'static str {
 pub(crate) fn prompt_metadata_from_entries<'a>(
     entries: impl IntoIterator<Item = &'a SessionEntry>,
 ) -> PromptAssemblyMetadata {
+    let entries: Vec<_> = entries.into_iter().collect();
     let mut metadata = PromptAssemblyMetadata::default();
-    for entry in entries {
+    let last_assistant_idx = entries.iter().rposition(|entry| {
+        matches!(
+            entry,
+            SessionEntry::Message(message_entry)
+                if matches!(message_entry.message, SessionMessage::Assistant { .. })
+        )
+    });
+
+    for (idx, entry) in entries.into_iter().enumerate() {
+        if last_assistant_idx.is_some_and(|last_assistant_idx| idx < last_assistant_idx)
+            && let SessionEntry::Message(message_entry) = entry
+            && let SessionMessage::ToolResult { tool_call_id, .. } = &message_entry.message
+        {
+            metadata.consumed_tool_results.insert(tool_call_id.clone());
+        }
+
         let SessionEntry::VerificationEvidence(entry) = entry else {
             continue;
         };
@@ -5178,6 +5232,21 @@ mod tests {
         }
     }
 
+    fn make_test_assistant_text(text: &str) -> SessionMessage {
+        SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                api: "test".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            },
+        }
+    }
+
     fn make_test_tool_result(call_id: &str, name: &str, text: &str) -> SessionMessage {
         SessionMessage::ToolResult {
             tool_call_id: call_id.to_string(),
@@ -6315,6 +6384,66 @@ mod tests {
         };
 
         assert_eq!(output, "failing cargo test output remains visible");
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_keeps_latest_truncated_grep_output() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("search the tree"));
+        session.append_message(make_test_tool_call("call-1", "grep", "src"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "grep".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "match output that the model still needs right now",
+            ))],
+            details: Some(serde_json::json!({
+                "truncation": { "totalBytes": 60000 },
+                "fullOutputPath": "/tmp/pi-grep-test.log",
+            })),
+            is_error: false,
+            timestamp: Some(0),
+        });
+
+        let messages = session.to_messages_for_current_path();
+        let output = match &messages[2] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected grep tool result, got {other:?}"),
+        };
+
+        assert_eq!(output, "match output that the model still needs right now");
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_elides_consumed_truncated_grep_output() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("search the tree"));
+        session.append_message(make_test_tool_call("call-1", "grep", "src"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "grep".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "large grep output that should not be replayed forever",
+            ))],
+            details: Some(serde_json::json!({
+                "truncation": { "totalBytes": 60000 },
+                "fullOutputPath": "/tmp/pi-grep-test.log",
+            })),
+            is_error: false,
+            timestamp: Some(0),
+        });
+        session.append_message(make_test_assistant_text("I found the relevant matches"));
+
+        let messages = session.to_messages_for_current_path();
+        let output = match &messages[2] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected grep tool result, got {other:?}"),
+        };
+
+        assert!(output.contains("Truncated grep output omitted from replay"));
+        assert!(output.contains("/tmp/pi-grep-test.log"));
+        assert!(output.contains("src"));
+        assert!(!output.contains("large grep output"));
     }
 
     #[test]

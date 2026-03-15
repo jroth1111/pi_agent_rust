@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::io::{BufRead, Read};
+use std::io::{BufRead, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -502,6 +502,34 @@ pub(super) fn format_size(bytes: usize) -> String {
         format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes}B")
+    }
+}
+
+fn persist_truncated_tool_output(tool_name: &str, output: &str) -> Option<String> {
+    let prefix = format!("pi-{tool_name}-");
+    let mut file = match tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".log")
+        .tempfile_in(std::env::temp_dir())
+    {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!("failed to create {tool_name} temp output file: {err}");
+            return None;
+        }
+    };
+
+    if let Err(err) = file.write_all(output.as_bytes()) {
+        tracing::warn!("failed to write {tool_name} temp output file: {err}");
+        return None;
+    }
+
+    match file.keep() {
+        Ok((_file, path)) => Some(path.display().to_string()),
+        Err(err) => {
+            tracing::warn!("failed to persist {tool_name} temp output file: {err}");
+            None
+        }
     }
 }
 
@@ -3534,6 +3562,9 @@ impl Tool for GrepTool {
 
         // Apply byte truncation (no line limit since we already have match limit).
         let raw_output = output_lines.join("\n");
+        let full_output_path = (raw_output.len() > DEFAULT_MAX_BYTES)
+            .then(|| persist_truncated_tool_output("grep", &raw_output))
+            .flatten();
         let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
         let mut output = truncation.content.clone();
@@ -3554,6 +3585,12 @@ impl Tool for GrepTool {
         if truncation.truncated {
             notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+            if let Some(path) = full_output_path {
+                details_map.insert(
+                    "fullOutputPath".to_string(),
+                    serde_json::Value::String(path),
+                );
+            }
         }
 
         if lines_truncated {
@@ -3827,6 +3864,9 @@ impl Tool for FindTool {
 
         let result_limit_reached = relativized.len() >= effective_limit;
         let raw_output = relativized.join("\n");
+        let full_output_path = (raw_output.len() > DEFAULT_MAX_BYTES)
+            .then(|| persist_truncated_tool_output("find", &raw_output))
+            .flatten();
         let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
         let mut result_output = truncation.content.clone();
@@ -3852,6 +3892,12 @@ impl Tool for FindTool {
         if truncation.truncated {
             notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+            if let Some(path) = full_output_path {
+                details_map.insert(
+                    "fullOutputPath".to_string(),
+                    serde_json::Value::String(path),
+                );
+            }
         }
 
         if !notices.is_empty() {
@@ -4021,6 +4067,9 @@ impl Tool for LsTool {
 
         // Apply byte truncation (no line limit since we already have entry limit).
         let raw_output = results.join("\n");
+        let full_output_path = (raw_output.len() > DEFAULT_MAX_BYTES)
+            .then(|| persist_truncated_tool_output("ls", &raw_output))
+            .flatten();
         let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
         let mut output = truncation.content.clone();
@@ -4051,6 +4100,12 @@ impl Tool for LsTool {
         if truncation.truncated {
             notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+            if let Some(path) = full_output_path {
+                details_map.insert(
+                    "fullOutputPath".to_string(),
+                    serde_json::Value::String(path),
+                );
+            }
         }
 
         if !notices.is_empty() {
@@ -4103,8 +4158,12 @@ pub fn cleanup_temp_files() {
                 continue;
             };
 
-            // Match "pi-bash-" or "pi-rpc-bash-" prefix and ".log" suffix.
-            if (file_name.starts_with("pi-bash-") || file_name.starts_with("pi-rpc-bash-"))
+            // Match known tool temp output prefixes and ".log" suffix.
+            if (file_name.starts_with("pi-bash-")
+                || file_name.starts_with("pi-rpc-bash-")
+                || file_name.starts_with("pi-grep-")
+                || file_name.starts_with("pi-find-")
+                || file_name.starts_with("pi-ls-"))
                 && std::path::Path::new(file_name)
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
@@ -6027,6 +6086,17 @@ mod tests {
 
             let text = get_text(&out.content);
             assert!(text.contains("needle_line_0"));
+            let details = out.details.expect("expected truncation details");
+            assert!(
+                details.get("truncation").is_some(),
+                "expected truncation metadata"
+            );
+            let full_output_path = details
+                .get("fullOutputPath")
+                .and_then(serde_json::Value::as_str)
+                .expect("expected fullOutputPath");
+            let spilled = std::fs::read_to_string(full_output_path).expect("read spilled output");
+            assert!(spilled.contains("needle_line_4999"));
         });
     }
 
