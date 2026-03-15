@@ -63,6 +63,8 @@ pub enum ControllerError {
     Transition(#[from] TransitionError),
     #[error("policy denied bootstrap: {0}")]
     PolicyDenied(String),
+    #[error("runtime controller must be bootstrapped before handling commands")]
+    Uninitialized,
 }
 
 pub struct RuntimeController<R, P> {
@@ -84,12 +86,42 @@ where
         }
     }
 
+    pub fn from_snapshot(snapshot: RunSnapshot, router: R, policy: P) -> Self {
+        Self {
+            state_machine: Some(RuntimeStateMachine::new(snapshot)),
+            router,
+            policy,
+        }
+    }
+
     pub fn state_machine(&self) -> Option<&RuntimeStateMachine> {
         self.state_machine.as_ref()
     }
 
     pub fn into_parts(self) -> (Option<RuntimeStateMachine>, R, P) {
         (self.state_machine, self.router, self.policy)
+    }
+
+    pub fn tick(&mut self) -> Result<ControllerOutput, ControllerError> {
+        let machine = self
+            .state_machine
+            .as_mut()
+            .ok_or(ControllerError::Uninitialized)?;
+        let snapshot = machine.snapshot().clone();
+        let events = derive_tick_event(&snapshot)
+            .map(|kind| RuntimeEvent::new(snapshot.spec.run_id.clone(), kind))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let transitions = apply_events(machine, &events)?;
+        let snapshot = machine.snapshot().clone();
+        let routed_phases = routed_phase_for(&self.router, snapshot.phase);
+        Ok(ControllerOutput {
+            snapshot,
+            events,
+            transitions,
+            routed_phases,
+            policy_decisions: Vec::new(),
+        })
     }
 
     pub fn handle(&mut self, command: RuntimeCommand) -> Result<ControllerOutput, ControllerError> {
@@ -125,17 +157,7 @@ where
 
                 let mut machine = RuntimeStateMachine::new(RunSnapshot::new(spec.clone()));
                 let run_id = spec.run_id.clone();
-                let route = self
-                    .router
-                    .route(&RouteRequest {
-                        phase: RunPhase::Planning,
-                        task_id: None,
-                    })
-                    .expect("planning route should exist");
-                routed_phases.push(RoutedPhase {
-                    phase: RunPhase::Planning,
-                    route,
-                });
+                routed_phases = routed_phase_for(&self.router, RunPhase::Planning);
 
                 events.push(RuntimeEvent::new(
                     run_id.clone(),
@@ -165,7 +187,7 @@ where
                 let machine = self
                     .state_machine
                     .as_mut()
-                    .expect("runtime controller must be bootstrapped before handling commands");
+                    .ok_or(ControllerError::Uninitialized)?;
                 let run_id = machine.snapshot().spec.run_id.clone();
                 let event = match command {
                     RuntimeCommand::SetPhase { phase, summary } => {
@@ -242,6 +264,81 @@ fn apply_events(
     Ok(transitions)
 }
 
+fn routed_phase_for<R>(router: &R, phase: RunPhase) -> Vec<RoutedPhase>
+where
+    R: ModelRouter,
+{
+    router
+        .route(&RouteRequest {
+            phase,
+            task_id: None,
+        })
+        .map(|route| vec![RoutedPhase { phase, route }])
+        .unwrap_or_default()
+}
+
+fn derive_tick_event(snapshot: &RunSnapshot) -> Option<RuntimeEventKind> {
+    if snapshot.phase.is_terminal() || snapshot.tasks.is_empty() {
+        return None;
+    }
+
+    let tasks = snapshot.tasks.values().collect::<Vec<_>>();
+    let approvals_pending = snapshot
+        .approvals
+        .values()
+        .any(|approval| approval.state == ApprovalState::Pending);
+    let awaiting_human = approvals_pending
+        || tasks
+            .iter()
+            .any(|task| task.runtime.state == TaskState::AwaitingHuman);
+    let recoverable = tasks
+        .iter()
+        .any(|task| task.runtime.state == TaskState::Recoverable);
+    let verifying = tasks
+        .iter()
+        .any(|task| task.runtime.state == TaskState::Verifying);
+    let active = tasks
+        .iter()
+        .any(|task| matches!(task.runtime.state, TaskState::Leased | TaskState::Executing));
+    let all_terminal = tasks.iter().all(|task| task.runtime.state.is_terminal());
+    let all_succeeded = tasks
+        .iter()
+        .all(|task| task.runtime.state == TaskState::Succeeded);
+
+    if all_terminal {
+        return if all_succeeded {
+            Some(RuntimeEventKind::RunCompleted)
+        } else {
+            Some(RuntimeEventKind::RunFailed {
+                reason: "one or more tasks reached a failed terminal state".to_string(),
+            })
+        };
+    }
+
+    let (phase, summary) = if awaiting_human {
+        (
+            RunPhase::AwaitingHuman,
+            Some("await human approval".to_string()),
+        )
+    } else if recoverable {
+        (
+            RunPhase::Recovering,
+            Some("retry recoverable work".to_string()),
+        )
+    } else if verifying {
+        (
+            RunPhase::Verifying,
+            Some("verify current outputs".to_string()),
+        )
+    } else if active {
+        (RunPhase::Running, Some("continue active work".to_string()))
+    } else {
+        return None;
+    };
+
+    (snapshot.phase != phase).then_some(RuntimeEventKind::PhaseChanged { phase, summary })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +387,8 @@ mod tests {
             root_workspace: PathBuf::from("/tmp/pi"),
             policy_profile: "default".to_string(),
             model_profile: "default".to_string(),
+            run_verify_command: Some("cargo test runtime".to_string()),
+            run_verify_timeout_sec: Some(60),
             budgets: RunBudgets::default(),
             constraints: RunConstraints::default(),
             created_at: Utc::now(),
@@ -367,5 +466,41 @@ mod tests {
             output.snapshot.tasks["task-1"].runtime.state,
             TaskState::Executing
         );
+    }
+
+    #[test]
+    fn tick_marks_completed_when_all_tasks_succeed() {
+        let mut snapshot = RunSnapshot::new(sample_spec());
+        snapshot.phase = RunPhase::Running;
+        let mut task = sample_task();
+        task.runtime.state = TaskState::Succeeded;
+        snapshot.tasks.insert(task.spec.task_id.clone(), task);
+        let router = PhaseModelRouter::new(sample_route());
+        let policy = PolicySet::new();
+        let mut controller = RuntimeController::from_snapshot(snapshot, router, policy);
+
+        let output = controller.tick().expect("tick");
+
+        assert_eq!(output.snapshot.phase, RunPhase::Completed);
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].label(), "run_completed");
+    }
+
+    #[test]
+    fn tick_moves_running_snapshot_to_awaiting_human() {
+        let mut snapshot = RunSnapshot::new(sample_spec());
+        snapshot.phase = RunPhase::Running;
+        let mut task = sample_task();
+        task.runtime.state = TaskState::AwaitingHuman;
+        snapshot.tasks.insert(task.spec.task_id.clone(), task);
+        let router = PhaseModelRouter::new(sample_route());
+        let policy = PolicySet::new();
+        let mut controller = RuntimeController::from_snapshot(snapshot, router, policy);
+
+        let output = controller.tick().expect("tick");
+
+        assert_eq!(output.snapshot.phase, RunPhase::AwaitingHuman);
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].label(), "phase_changed");
     }
 }

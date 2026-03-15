@@ -141,6 +141,10 @@ pub struct RunSpec {
     pub root_workspace: PathBuf,
     pub policy_profile: String,
     pub model_profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_verify_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_verify_timeout_sec: Option<u32>,
     pub budgets: RunBudgets,
     pub constraints: RunConstraints,
     pub created_at: DateTime<Utc>,
@@ -367,6 +371,8 @@ mod tests {
             root_workspace: PathBuf::from("/tmp/pi"),
             policy_profile: "default".to_string(),
             model_profile: "default".to_string(),
+            run_verify_command: Some("cargo test".to_string()),
+            run_verify_timeout_sec: Some(60),
             budgets: RunBudgets::default(),
             constraints: RunConstraints::default(),
             created_at: Utc::now(),
