@@ -381,20 +381,25 @@ pub fn handle_skill_doctor(
 
     let mut applied_amendments = Vec::new();
     if fix {
-        for report in &skills {
-            if report.status != SkillHealthStatus::NeedsAmendment
-                || report.proposed_guardrails.is_empty()
+        for index in 0..skills.len() {
+            if skills[index].status != SkillHealthStatus::NeedsAmendment
+                || skills[index].proposed_guardrails.is_empty()
             {
                 continue;
             }
 
             if let Some(amendment) = apply_guardrail_patch(
-                &report.skill_name,
-                &report.skill_path,
-                &report.proposed_guardrails,
-                &report.evidence,
+                &skills[index].skill_name,
+                &skills[index].skill_path,
+                &skills[index].proposed_guardrails,
+                &skills[index].evidence,
                 cwd,
             )? {
+                mark_report_pending_for_unobserved_revision(
+                    &mut skills[index],
+                    &criteria,
+                    amendment.new_digest.clone(),
+                );
                 applied_amendments.push(amendment);
             }
         }
@@ -437,21 +442,13 @@ fn build_skill_health_report(
         .rev()
         .take_while(|entry| !entry.outcome.is_success())
         .count();
-    let mut evidence = summarize_evidence(entries);
+    let evidence = summarize_evidence(entries);
     let mut proposed_guardrails = recommend_guardrails(entries);
 
     let has_unobserved_revision =
         current_digest != "missing" && current_digest != latest.skill_digest;
     if has_unobserved_revision {
-        evidence.insert(
-            0,
-            format!(
-                "Current skill revision has not been observed yet; collect at least {} post-amend runs before judging it.",
-                criteria.min_post_amend_runs
-            ),
-        );
-        proposed_guardrails.clear();
-        return SkillHealthReport {
+        let mut report = SkillHealthReport {
             skill_name: latest.skill_name.clone(),
             skill_path: latest.skill_path.clone(),
             latest_digest: latest.skill_digest.clone(),
@@ -465,6 +462,9 @@ fn build_skill_health_report(
             previous_success_rate: Some(success_rate),
             latest_success_rate: None,
         };
+        let pending_digest = report.current_digest.clone();
+        mark_report_pending_for_unobserved_revision(&mut report, criteria, pending_digest);
+        return report;
     }
 
     let unhealthy = run_count >= criteria.min_sample_size
@@ -494,6 +494,32 @@ fn build_skill_health_report(
         previous_success_rate,
         latest_success_rate,
     }
+}
+
+fn mark_report_pending_for_unobserved_revision(
+    report: &mut SkillHealthReport,
+    criteria: &SkillSuccessCriteria,
+    current_digest: String,
+) {
+    report.current_digest = current_digest;
+    report.status = SkillHealthStatus::PendingData;
+    report.proposed_guardrails.clear();
+    report
+        .previous_success_rate
+        .get_or_insert(report.success_rate);
+    report.latest_success_rate = None;
+
+    let evidence = pending_revision_evidence(criteria);
+    if !report.evidence.iter().any(|entry| entry == &evidence) {
+        report.evidence.insert(0, evidence);
+    }
+}
+
+fn pending_revision_evidence(criteria: &SkillSuccessCriteria) -> String {
+    format!(
+        "Current skill revision has not been observed yet; collect at least {} post-amend runs before judging it.",
+        criteria.min_post_amend_runs
+    )
 }
 
 fn evaluate_latest_revision(
@@ -1272,6 +1298,13 @@ mod tests {
         let fixed_report =
             handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
         assert_eq!(fixed_report.applied_amendments.len(), 1);
+        let fixed_skill = fixed_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "bug-triage")
+            .expect("fixed skill report");
+        assert_eq!(fixed_skill.status, SkillHealthStatus::PendingData);
+        assert_ne!(fixed_skill.current_digest, fixed_skill.latest_digest);
         let amended_skill = fs::read_to_string(&skill_path).expect("read amended skill");
         assert!(amended_skill.contains(GUARDRAIL_BLOCK_BEGIN));
 
