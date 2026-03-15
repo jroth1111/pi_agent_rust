@@ -168,7 +168,6 @@ pub mod session_store_v2;
 pub mod skills;
 pub mod sse;
 pub mod state;
-pub mod task_graph;
 pub mod terminal_images;
 pub mod theme;
 pub mod tools;
