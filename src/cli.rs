@@ -38,6 +38,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "config",
     "doctor",
     "account",
+    "skills",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -445,7 +446,7 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, parse_with_extension_flags};
+    use super::{Cli, Commands, SkillCommands, parse_with_extension_flags};
     use clap::Parser;
 
     // ── 1. Basic flag parsing ────────────────────────────────────────
@@ -807,6 +808,34 @@ mod tests {
                 assert_eq!(name, "auto-commit-on-exit");
             }
             other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_doctor_subcommand() {
+        let cli = Cli::parse_from(["pi", "skills", "doctor"]);
+        match cli.command {
+            Some(Commands::Skills {
+                command: SkillCommands::Doctor { format, fix },
+            }) => {
+                assert_eq!(format, "text");
+                assert!(!fix);
+            }
+            other => panic!("expected Skills::Doctor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_doctor_fix_json() {
+        let cli = Cli::parse_from(["pi", "skills", "doctor", "--fix", "--format", "json"]);
+        match cli.command {
+            Some(Commands::Skills {
+                command: SkillCommands::Doctor { format, fix },
+            }) => {
+                assert_eq!(format, "json");
+                assert!(fix);
+            }
+            other => panic!("expected Skills::Doctor --fix, got {other:?}"),
         }
     }
 
@@ -1605,6 +1634,12 @@ pub enum Commands {
         only: Option<String>,
     },
 
+    /// Observe, evaluate, and amend skills using persisted run evidence
+    Skills {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
+
     /// Migrate session files from JSONL v1 to v2 segment format
     Migrate {
         /// Path to specific session JSONL file (or directory to migrate all)
@@ -1688,6 +1723,20 @@ pub enum AccountCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Skill lifecycle subcommands
+#[derive(Subcommand, Debug)]
+pub enum SkillCommands {
+    /// Analyze recorded skill runs and optionally patch managed guardrails
+    Doctor {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Apply managed guardrail patches to unhealthy skills
+        #[arg(long)]
+        fix: bool,
     },
 }
 

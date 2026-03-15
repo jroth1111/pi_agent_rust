@@ -48,6 +48,7 @@ use crate::runtime::types::{
     RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState, VerifySpec,
 };
 use crate::session::{Session, SessionMessage};
+use crate::skills::{SkillRunTracker, persist_skill_tracker};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -66,6 +67,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -4570,7 +4572,8 @@ pub async fn run(
                         }
                     };
 
-                let expanded = options.resources.expand_input(&message);
+                let expansion = options.resources.expand_input_with_trace(&message);
+                let expanded = expansion.text;
 
                 if is_streaming.load(Ordering::SeqCst) {
                     if streaming_behavior.is_none() {
@@ -4625,6 +4628,12 @@ pub async fn run(
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let expanded = expanded.clone();
+                let tracker = Arc::new(StdMutex::new(SkillRunTracker::new(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    &message,
+                    options.resources.skills(),
+                    expansion.explicit_skill,
+                )));
                 let runtime_handle = options.runtime_handle.clone();
                 runtime_handle.spawn(async move {
                     let cx = AgentCx::for_request();
@@ -4639,6 +4648,7 @@ pub async fn run(
                         options,
                         expanded,
                         images,
+                        Some(tracker),
                         cx,
                     )
                     .await;
@@ -4656,7 +4666,8 @@ pub async fn run(
                     continue;
                 };
 
-                let expanded = options.resources.expand_input(&message);
+                let expansion = options.resources.expand_input_with_trace(&message);
+                let expanded = expansion.text;
                 if is_extension_command(&message, &expanded) {
                     let resp = response_error(
                         id,
@@ -4698,6 +4709,12 @@ pub async fn run(
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let expanded = expanded.clone();
+                let tracker = Arc::new(StdMutex::new(SkillRunTracker::new(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    &message,
+                    options.resources.skills(),
+                    expansion.explicit_skill,
+                )));
                 let runtime_handle = options.runtime_handle.clone();
                 runtime_handle.spawn(async move {
                     let cx = AgentCx::for_request();
@@ -4712,6 +4729,7 @@ pub async fn run(
                         options,
                         expanded,
                         Vec::new(),
+                        Some(tracker),
                         cx,
                     )
                     .await;
@@ -4729,7 +4747,8 @@ pub async fn run(
                     continue;
                 };
 
-                let expanded = options.resources.expand_input(&message);
+                let expansion = options.resources.expand_input_with_trace(&message);
+                let expanded = expansion.text;
                 if is_extension_command(&message, &expanded) {
                     let resp = response_error(
                         id,
@@ -4771,6 +4790,12 @@ pub async fn run(
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let expanded = expanded.clone();
+                let tracker = Arc::new(StdMutex::new(SkillRunTracker::new(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    &message,
+                    options.resources.skills(),
+                    expansion.explicit_skill,
+                )));
                 let runtime_handle = options.runtime_handle.clone();
                 runtime_handle.spawn(async move {
                     let cx = AgentCx::for_request();
@@ -4785,6 +4810,7 @@ pub async fn run(
                         options,
                         expanded,
                         Vec::new(),
+                        Some(tracker),
                         cx,
                     )
                     .await;
@@ -6728,6 +6754,7 @@ async fn run_prompt_with_retry(
     options: RpcOptions,
     message: String,
     images: Vec<ImageContent>,
+    tracker: Option<Arc<StdMutex<SkillRunTracker>>>,
     cx: AgentCx,
 ) {
     retry_abort.store(false, Ordering::SeqCst);
@@ -6765,7 +6792,13 @@ async fn run_prompt_with_retry(
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
+            let tracker_for_events = tracker.clone();
             let event_handler = move |event: AgentEvent| {
+                if let Some(tracker) = &tracker_for_events {
+                    if let Ok(mut guard) = tracker.lock() {
+                        guard.observe_event(&event);
+                    }
+                }
                 let serialized = if let AgentEvent::AgentEnd {
                     messages, error, ..
                 } = &event
@@ -6851,6 +6884,11 @@ async fn run_prompt_with_retry(
             }
             Err(err) => {
                 let err_str = err.to_string();
+                if let Some(tracker) = &tracker {
+                    if let Ok(mut guard) = tracker.lock() {
+                        guard.record_runtime_error(err_str.clone());
+                    }
+                }
                 // No usage/context_window from an Err (no response received),
                 // so pass None for both — text matching alone handles it.
                 if !crate::error::is_retryable_error(&err_str, None, None) {
@@ -6905,6 +6943,12 @@ async fn run_prompt_with_retry(
             "attempt": retry_count,
             "finalError": if success { Value::Null } else { json!(final_error.clone()) },
         })));
+    }
+
+    if let Some(tracker) = &tracker {
+        if let Ok(snapshot) = tracker.lock().map(|guard| guard.clone()) {
+            let _ = persist_skill_tracker(&snapshot, None);
+        }
     }
 
     is_streaming.store(false, Ordering::SeqCst);
@@ -7608,6 +7652,7 @@ mod retry_tests {
                 options,
                 "hello".to_string(),
                 Vec::new(),
+                None,
                 AgentCx::for_request(),
             )
             .await;
@@ -7717,6 +7762,7 @@ mod retry_tests {
                 options,
                 "hello".to_string(),
                 Vec::new(),
+                None,
                 AgentCx::for_request(),
             )
             .await;

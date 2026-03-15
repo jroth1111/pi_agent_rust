@@ -57,7 +57,9 @@ pub struct ResourceDiagnostic {
 // ============================================================================
 
 pub use crate::skills::loader::{LoadSkillsOptions, LoadSkillsResult};
-pub use crate::skills::schema::{MAX_SKILL_DESC_LEN, MAX_SKILL_NAME_LEN, Skill};
+pub use crate::skills::schema::{
+    ExplicitSkillInvocation, InputExpansion, MAX_SKILL_DESC_LEN, MAX_SKILL_NAME_LEN, Skill,
+};
 
 // ============================================================================
 // Prompt templates
@@ -427,11 +429,21 @@ impl ResourceLoader {
     }
 
     pub fn expand_input(&self, text: &str) -> String {
+        self.expand_input_with_trace(text).text
+    }
+
+    pub fn expand_input_with_trace(&self, text: &str) -> InputExpansion {
         let mut expanded = text.to_string();
+        let mut explicit_skill = None;
         if self.enable_skill_commands {
-            expanded = expand_skill_command(&expanded, &self.skills);
+            let expansion = crate::skills::expand_skill_command_with_trace(&expanded, &self.skills);
+            expanded = expansion.text;
+            explicit_skill = expansion.explicit_skill;
         }
-        expand_prompt_template(&expanded, &self.prompts)
+        InputExpansion {
+            text: expand_prompt_template(&expanded, &self.prompts),
+            explicit_skill,
+        }
     }
 }
 

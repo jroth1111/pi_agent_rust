@@ -25,6 +25,19 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitSkillInvocation {
+    pub skill_name: String,
+    pub skill_path: PathBuf,
+    pub args: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputExpansion {
+    pub text: String,
+    pub explicit_skill: Option<ExplicitSkillInvocation>,
+}
+
 pub fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -126,8 +139,15 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
 }
 
 pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+    expand_skill_command_with_trace(text, skills).text
+}
+
+pub fn expand_skill_command_with_trace(text: &str, skills: &[Skill]) -> InputExpansion {
     if !text.starts_with("/skill:") {
-        return text.to_string();
+        return InputExpansion {
+            text: text.to_string(),
+            explicit_skill: None,
+        };
     }
 
     let space_index = text.find(' ');
@@ -135,7 +155,10 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     let args = space_index.map_or("", |idx| text[idx + 1..].trim());
 
     let Some(skill) = skills.iter().find(|s| s.name == name) else {
-        return text.to_string();
+        return InputExpansion {
+            text: text.to_string(),
+            explicit_skill: None,
+        };
     };
 
     match fs::read_to_string(&skill.file_path) {
@@ -148,10 +171,18 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
                 skill.base_dir.display(),
                 body
             );
-            if args.is_empty() {
+            let text = if args.is_empty() {
                 block
             } else {
                 format!("{block}\n\n{args}")
+            };
+            InputExpansion {
+                text,
+                explicit_skill: Some(ExplicitSkillInvocation {
+                    skill_name: skill.name.clone(),
+                    skill_path: skill.file_path.clone(),
+                    args: args.to_string(),
+                }),
             }
         }
         Err(err) => {
@@ -159,7 +190,10 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
                 "Warning: Failed to read skill {}: {err}",
                 skill.file_path.display()
             );
-            text.to_string()
+            InputExpansion {
+                text: text.to_string(),
+                explicit_skill: None,
+            }
         }
     }
 }

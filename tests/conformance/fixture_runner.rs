@@ -393,6 +393,9 @@ fn command_value(command: Option<&Commands>) -> Value {
             "format": format,
             "policy": policy,
         }),
+        Some(Commands::Skills { .. }) => json!({
+            "name": "skills",
+        }),
         Some(Commands::Migrate { path, dry_run }) => json!({
             "name": "migrate",
             "path": path,

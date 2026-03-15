@@ -68,6 +68,7 @@ use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
+use pi::skills::{SkillDoctorFormat, SkillRunTracker, handle_skill_doctor, persist_skill_tracker};
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
 use serde::Serialize;
@@ -167,6 +168,14 @@ fn main_impl() -> Result<()> {
                     *fix,
                     only.as_deref(),
                 )?;
+                return Ok(());
+            }
+            cli::Commands::Skills { command } => {
+                match command {
+                    cli::SkillCommands::Doctor { format, fix } => {
+                        handle_skill_doctor(&cwd, SkillDoctorFormat::parse(format)?, *fix)?;
+                    }
+                }
                 return Ok(());
             }
             _ => {}
@@ -1347,6 +1356,11 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 only.as_deref(),
             )?;
         }
+        cli::Commands::Skills { command } => match command {
+            cli::SkillCommands::Doctor { format, fix } => {
+                handle_skill_doctor(cwd, SkillDoctorFormat::parse(&format)?, fix)?;
+            }
+        },
         cli::Commands::Migrate { path, dry_run } => {
             handle_session_migrate(&path, dry_run)?;
         }
@@ -3707,25 +3721,7 @@ async fn run_print_mode(
     let extensions = session.extensions.as_ref().map(|r| r.manager().clone());
     let emit_json_events = mode == "json";
     let runtime_for_events = runtime_handle.clone();
-    let make_event_handler = move || {
-        let extensions = extensions.clone();
-        let runtime_for_events = runtime_for_events.clone();
-        let coalescer = extensions
-            .as_ref()
-            .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
-        move |event: AgentEvent| {
-            if emit_json_events {
-                if let Ok(serialized) = serde_json::to_string(&event) {
-                    println!("{serialized}");
-                }
-            }
-            // Route non-lifecycle events through the coalescer for
-            // batched/coalesced dispatch with lazy serialization.
-            if let Some(coal) = &coalescer {
-                coal.dispatch_agent_event_lazy(&event, &runtime_for_events);
-            }
-        }
-    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (abort_handle, abort_signal) = AbortHandle::new();
     let abort_listener = abort_handle.clone();
     if let Err(err) = ctrlc::set_handler(move || {
@@ -3736,49 +3732,132 @@ async fn run_print_mode(
 
     let mut initial = initial;
     if let Some(ref mut initial) = initial {
-        initial.text = resources.expand_input(&initial.text);
-    }
-
-    let messages = messages
-        .into_iter()
-        .map(|message| resources.expand_input(&message))
-        .collect::<Vec<_>>();
-
-    let retry_enabled = config.retry_enabled();
-    let max_retries = config.retry_max_retries();
-    let is_json = mode == "json";
-
-    if let Some(initial) = initial {
-        let content = pi::app::build_initial_content(&initial);
-        last_message = Some(
-            run_print_prompt_with_retry(
-                session,
-                config,
-                &abort_signal,
-                &make_event_handler,
-                retry_enabled,
-                max_retries,
-                is_json,
-                PromptInput::Content(content),
-            )
-            .await?,
-        );
+        let original = initial.text.clone();
+        let expansion = resources.expand_input_with_trace(&original);
+        initial.text = expansion.text;
+        let tracker = Arc::new(StdMutex::new(SkillRunTracker::new(
+            cwd.clone(),
+            &original,
+            resources.skills(),
+            expansion.explicit_skill,
+        )));
+        let make_event_handler = {
+            let extensions = extensions.clone();
+            let runtime_for_events = runtime_for_events.clone();
+            let tracker = tracker.clone();
+            move || {
+                let extensions = extensions.clone();
+                let runtime_for_events = runtime_for_events.clone();
+                let tracker = tracker.clone();
+                let coalescer = extensions
+                    .as_ref()
+                    .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
+                move |event: AgentEvent| {
+                    if let Ok(mut guard) = tracker.lock() {
+                        guard.observe_event(&event);
+                    }
+                    if emit_json_events {
+                        if let Ok(serialized) = serde_json::to_string(&event) {
+                            println!("{serialized}");
+                        }
+                    }
+                    if let Some(coal) = &coalescer {
+                        coal.dispatch_agent_event_lazy(&event, &runtime_for_events);
+                    }
+                }
+            }
+        };
+        let content = pi::app::build_initial_content(initial);
+        let result = run_print_prompt_with_retry(
+            session,
+            config,
+            &abort_signal,
+            &make_event_handler,
+            config.retry_enabled(),
+            config.retry_max_retries(),
+            mode == "json",
+            PromptInput::Content(content),
+        )
+        .await;
+        if let Err(err) = &result {
+            if let Ok(mut guard) = tracker.lock() {
+                guard.record_runtime_error(err.to_string());
+            }
+        }
+        let snapshot = tracker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("skill tracker lock poisoned"))?
+            .clone();
+        let cx = pi::agent_cx::AgentCx::for_request();
+        if let Ok(mut guard) = session.session.lock(cx.cx()).await {
+            persist_skill_tracker(&snapshot, Some(&mut guard))?;
+        } else {
+            persist_skill_tracker(&snapshot, None)?;
+        }
+        last_message = Some(result?);
     }
 
     for message in messages {
-        last_message = Some(
-            run_print_prompt_with_retry(
-                session,
-                config,
-                &abort_signal,
-                &make_event_handler,
-                retry_enabled,
-                max_retries,
-                is_json,
-                PromptInput::Text(message),
-            )
-            .await?,
-        );
+        let expansion = resources.expand_input_with_trace(&message);
+        let tracker = Arc::new(StdMutex::new(SkillRunTracker::new(
+            cwd.clone(),
+            &message,
+            resources.skills(),
+            expansion.explicit_skill,
+        )));
+        let make_event_handler = {
+            let extensions = extensions.clone();
+            let runtime_for_events = runtime_for_events.clone();
+            let tracker = tracker.clone();
+            move || {
+                let extensions = extensions.clone();
+                let runtime_for_events = runtime_for_events.clone();
+                let tracker = tracker.clone();
+                let coalescer = extensions
+                    .as_ref()
+                    .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
+                move |event: AgentEvent| {
+                    if let Ok(mut guard) = tracker.lock() {
+                        guard.observe_event(&event);
+                    }
+                    if emit_json_events {
+                        if let Ok(serialized) = serde_json::to_string(&event) {
+                            println!("{serialized}");
+                        }
+                    }
+                    if let Some(coal) = &coalescer {
+                        coal.dispatch_agent_event_lazy(&event, &runtime_for_events);
+                    }
+                }
+            }
+        };
+        let result = run_print_prompt_with_retry(
+            session,
+            config,
+            &abort_signal,
+            &make_event_handler,
+            config.retry_enabled(),
+            config.retry_max_retries(),
+            mode == "json",
+            PromptInput::Text(expansion.text),
+        )
+        .await;
+        if let Err(err) = &result {
+            if let Ok(mut guard) = tracker.lock() {
+                guard.record_runtime_error(err.to_string());
+            }
+        }
+        let snapshot = tracker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("skill tracker lock poisoned"))?
+            .clone();
+        let cx = pi::agent_cx::AgentCx::for_request();
+        if let Ok(mut guard) = session.session.lock(cx.cx()).await {
+            persist_skill_tracker(&snapshot, Some(&mut guard))?;
+        } else {
+            persist_skill_tracker(&snapshot, None)?;
+        }
+        last_message = Some(result?);
     }
 
     let Some(last_message) = last_message else {

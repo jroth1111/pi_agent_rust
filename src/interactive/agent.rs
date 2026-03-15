@@ -757,7 +757,7 @@ impl PiApp {
     #[allow(clippy::too_many_lines)]
     fn submit_content(&mut self, content: Vec<ContentBlock>) -> Option<Cmd> {
         let display = content_blocks_to_text(&content);
-        self.submit_content_with_display(content, &display)
+        self.submit_content_with_display(content, &display, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -765,6 +765,7 @@ impl PiApp {
         &mut self,
         content: Vec<ContentBlock>,
         display: &str,
+        tracker: Option<Arc<StdMutex<crate::skills::SkillRunTracker>>>,
     ) -> Option<Cmd> {
         if content.is_empty() {
             return None;
@@ -797,6 +798,7 @@ impl PiApp {
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let extensions = self.extensions.clone();
+        let tracker = tracker.clone();
         let runtime_handle = self.runtime_handle.clone();
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
@@ -846,11 +848,17 @@ impl PiApp {
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
             let runtime_handle = runtime_handle_for_task.clone();
+            let tracker_for_events = tracker.clone();
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
             let result = agent_guard
                 .run_with_content_with_abort(content_for_agent, Some(abort_signal), move |event| {
+                    if let Some(tracker) = &tracker_for_events {
+                        if let Ok(mut guard) = tracker.lock() {
+                            guard.observe_event(&event);
+                        }
+                    }
                     let mapped = match &event {
                         AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
                         AgentEvent::MessageUpdate {
@@ -929,10 +937,24 @@ impl PiApp {
                 agent_guard.messages()[previous_len..].to_vec();
             drop(agent_guard);
 
+            if let Err(err) = &result {
+                if let Some(tracker) = &tracker {
+                    if let Ok(mut guard) = tracker.lock() {
+                        guard.record_runtime_error(err.to_string());
+                    }
+                }
+            }
+            let tracker_snapshot = tracker
+                .as_ref()
+                .and_then(|tracker| tracker.lock().ok().map(|guard| guard.clone()));
+
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
+                        if let Some(snapshot) = &tracker_snapshot {
+                            let _ = crate::skills::persist_skill_tracker(snapshot, None);
+                        }
                         let _ = event_tx
                             .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
                         return;
@@ -940,6 +962,9 @@ impl PiApp {
                 };
             for message in new_messages {
                 session_guard.append_model_message(message);
+            }
+            if let Some(snapshot) = &tracker_snapshot {
+                let _ = crate::skills::persist_skill_tracker(snapshot, Some(&mut session_guard));
             }
             let mut save_error = None;
 
@@ -1010,11 +1035,19 @@ impl PiApp {
 
         let message_owned = message.to_string();
         let (message_without_refs, file_refs) = self.extract_file_references(&message_owned);
-        let message_for_agent = if file_refs.is_empty() {
-            self.resources.expand_input(&message_owned)
+        let expansion = if file_refs.is_empty() {
+            self.resources.expand_input_with_trace(&message_owned)
         } else {
-            self.resources.expand_input(message_without_refs.trim())
+            self.resources
+                .expand_input_with_trace(message_without_refs.trim())
         };
+        let tracker = Arc::new(StdMutex::new(crate::skills::SkillRunTracker::new(
+            self.cwd.clone(),
+            &message_owned,
+            self.resources.skills(),
+            expansion.explicit_skill.clone(),
+        )));
+        let message_for_agent = expansion.text;
 
         if !file_refs.is_empty() {
             let auto_resize = self
@@ -1048,13 +1081,14 @@ impl PiApp {
             self.history.push(message_owned.clone());
 
             let display = content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display);
+            return self.submit_content_with_display(content, &display, Some(tracker));
         }
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let extensions = self.extensions.clone();
+        let tracker = tracker.clone();
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
@@ -1129,12 +1163,16 @@ impl PiApp {
 
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
+            let tracker_for_events = tracker.clone();
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
             let result = if input_images.is_empty() {
                 agent_guard
                     .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
+                        if let Ok(mut guard) = tracker_for_events.lock() {
+                            guard.observe_event(&event);
+                        }
                         let mapped = match &event {
                             AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
                             AgentEvent::MessageUpdate {
@@ -1216,6 +1254,9 @@ impl PiApp {
                         content_for_agent,
                         Some(abort_signal),
                         move |event| {
+                            if let Ok(mut guard) = tracker_for_events.lock() {
+                                guard.observe_event(&event);
+                            }
                             let mapped = match &event {
                                 AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
                                 AgentEvent::MessageUpdate {
@@ -1296,10 +1337,20 @@ impl PiApp {
                 agent_guard.messages()[previous_len..].to_vec();
             drop(agent_guard);
 
+            if let Err(err) = &result {
+                if let Ok(mut guard) = tracker.lock() {
+                    guard.record_runtime_error(err.to_string());
+                }
+            }
+            let tracker_snapshot = tracker.lock().ok().map(|guard| guard.clone());
+
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
+                        if let Some(snapshot) = &tracker_snapshot {
+                            let _ = crate::skills::persist_skill_tracker(snapshot, None);
+                        }
                         let _ = event_tx
                             .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
                         return;
@@ -1307,6 +1358,9 @@ impl PiApp {
                 };
             for message in new_messages {
                 session_guard.append_model_message(message);
+            }
+            if let Some(snapshot) = &tracker_snapshot {
+                let _ = crate::skills::persist_skill_tracker(snapshot, Some(&mut session_guard));
             }
             let mut save_error = None;
 
