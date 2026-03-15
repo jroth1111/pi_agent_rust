@@ -12,6 +12,7 @@
 //! - Output thinning for large tool outputs (g3 approach)
 
 pub mod cache_control;
+pub mod compact_manifest;
 pub mod dedup;
 mod processors;
 mod summary;
@@ -25,6 +26,7 @@ pub use cache_control::{
     CACHE_CONTROL_KEY, CacheControl, CacheControlConfig, CacheControlProcessor, CacheWarmerConfig,
     CacheableRole,
 };
+pub use compact_manifest::{CompactManifest, normalize_compact_value};
 pub use processors::{
     EssentialEvent, EssentialPreservationProcessor, FilterProcessor, HistoryProcessor,
     LastNProcessor, NoOpProcessor, ProcessorChain,

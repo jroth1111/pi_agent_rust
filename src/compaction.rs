@@ -18,10 +18,7 @@ use crate::model::{
     Usage, UserContent, UserMessage,
 };
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions};
-use crate::session::{
-    SessionEntry, SessionMessage, prompt_metadata_from_entries,
-    prompt_transform_messages_with_metadata, session_message_to_model,
-};
+use crate::session::{SessionEntry, SessionMessage, prompt_assembly_plan_from_entries};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1331,7 +1328,6 @@ fn compaction_cache_retention(
 
 async fn generate_summary(
     entries: &[SessionEntry],
-    messages: &[SessionMessage],
     provider: Arc<dyn Provider>,
     api_key: &str,
     settings: &ResolvedCompactionSettings,
@@ -1350,14 +1346,8 @@ async fn generate_summary(
         let _ = write!(prompt, "\n\nAdditional focus: {custom}");
     }
 
-    let prompt_messages = prompt_transform_messages_with_metadata(
-        messages,
-        prompt_metadata_from_entries(entries.iter()),
-    );
-    let llm_messages = prompt_messages
-        .iter()
-        .filter_map(session_message_to_model)
-        .collect::<Vec<_>>();
+    let llm_messages =
+        prompt_assembly_plan_from_entries(entries.iter(), None).into_model_messages();
     let conversation_text = serialize_conversation(&llm_messages);
 
     let mut prompt_text = format!("<conversation>\n{conversation_text}\n</conversation>\n\n");
@@ -1400,19 +1390,12 @@ async fn generate_summary(
 
 async fn generate_turn_prefix_summary(
     entries: &[SessionEntry],
-    messages: &[SessionMessage],
     provider: Arc<dyn Provider>,
     api_key: &str,
     settings: &ResolvedCompactionSettings,
 ) -> Result<String> {
-    let prompt_messages = prompt_transform_messages_with_metadata(
-        messages,
-        prompt_metadata_from_entries(entries.iter()),
-    );
-    let llm_messages = prompt_messages
-        .iter()
-        .filter_map(session_message_to_model)
-        .collect::<Vec<_>>();
+    let llm_messages =
+        prompt_assembly_plan_from_entries(entries.iter(), None).into_model_messages();
     let conversation_text = serialize_conversation(&llm_messages);
     let prompt_text = format!(
         "<conversation>\n{conversation_text}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
@@ -1644,7 +1627,6 @@ pub async fn summarize_entries(
 
     let mut summary = generate_summary(
         entries,
-        &messages,
         provider,
         api_key,
         &settings,
@@ -1671,7 +1653,6 @@ pub async fn compact(
         } else {
             generate_summary(
                 &preparation.entries_to_summarize,
-                &preparation.messages_to_summarize,
                 Arc::clone(&provider),
                 api_key,
                 &preparation.settings,
@@ -1684,7 +1665,6 @@ pub async fn compact(
 
         let turn_prefix_summary = generate_turn_prefix_summary(
             &preparation.turn_prefix_entries,
-            &preparation.turn_prefix_messages,
             Arc::clone(&provider),
             api_key,
             &preparation.settings,
@@ -1703,7 +1683,6 @@ pub async fn compact(
     } else {
         generate_summary(
             &preparation.entries_to_summarize,
-            &preparation.messages_to_summarize,
             Arc::clone(&provider),
             api_key,
             &preparation.settings,

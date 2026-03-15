@@ -18,7 +18,9 @@ use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
 use crate::config::{Config, ReliabilityEnforcementMode};
-use crate::context::assemble_reliability_runtime_context;
+use crate::context::{
+    CompactManifest, assemble_reliability_runtime_context, normalize_compact_value,
+};
 use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
@@ -38,6 +40,7 @@ use crate::reliability;
 use crate::reliability::ArtifactStore;
 use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
+use crate::retrieval::{RetrievalBundleOptions, RetrievalTarget, collect_retrieval_summary_rows};
 use crate::runtime::controller::{
     ControllerOutput as RuntimeControllerOutput, RuntimeCommand, RuntimeController,
 };
@@ -3092,203 +3095,60 @@ fn build_task_code_retrieval_bundle(workspace_path: &Path, task: &TaskContract) 
             .to_string();
     }
 
-    let mut sections = task
+    let targets = task
         .planned_touches
         .iter()
         .take(INLINE_WORKER_MAX_TARGET_FILES)
-        .map(|planned_touch| build_target_code_bundle(workspace_path, planned_touch))
+        .map(|planned_touch| RetrievalTarget {
+            path: planned_touch.clone(),
+            purpose: "planned_touch".to_string(),
+        })
         .collect::<Vec<_>>();
 
+    let rows = collect_retrieval_summary_rows(
+        workspace_path,
+        &targets,
+        &RetrievalBundleOptions {
+            max_targets: INLINE_WORKER_MAX_TARGET_FILES,
+            max_related_per_target: INLINE_WORKER_MAX_RELATED_FILES_PER_TARGET,
+            max_symbol_lines: INLINE_WORKER_MAX_SYMBOL_LINES,
+            budget_tokens: INLINE_WORKER_CODE_RETRIEVAL_BUDGET_TOKENS,
+        },
+    )
+    .into_iter()
+    .map(|row| vec![row.path, row.purpose, row.outline, row.related])
+    .collect::<Vec<_>>();
+
+    let mut manifest = CompactManifest::default();
+    manifest.push_table(
+        "code_retrieval",
+        vec![
+            "path".to_string(),
+            "purpose".to_string(),
+            "outline".to_string(),
+            "related".to_string(),
+        ],
+        rows,
+    );
     if task.planned_touches.len() > INLINE_WORKER_MAX_TARGET_FILES {
-        sections.push(format!(
-            "Additional planned touches omitted from the initial bundle: {}",
-            task.planned_touches[INLINE_WORKER_MAX_TARGET_FILES..].join(", ")
-        ));
+        manifest.push_fields(
+            "code_retrieval_omissions",
+            vec![(
+                "omitted".to_string(),
+                normalize_compact_value(
+                    &task.planned_touches[INLINE_WORKER_MAX_TARGET_FILES..].join(", "),
+                    120,
+                ),
+            )],
+        );
     }
 
-    sections.join("\n\n")
-}
-
-fn build_target_code_bundle(workspace_path: &Path, planned_touch: &str) -> String {
-    let target_path = workspace_path.join(planned_touch);
-    let mut lines = vec![format!("Target: {planned_touch}")];
-
-    if target_path.is_file() {
-        lines.push(format!(
-            "Local outline: {}",
-            symbol_outline_for_file(&target_path)
-        ));
-        match reliability::ContextFanout::gather(
-            &target_path,
-            workspace_path,
-            INLINE_WORKER_CODE_RETRIEVAL_BUDGET_TOKENS,
-        ) {
-            Ok(fanout) => {
-                lines.push(format!("Fanout: {}", fanout.summary()));
-                let related = render_related_file_bundles(&fanout, workspace_path, &target_path);
-                if !related.is_empty() {
-                    lines.push(format!("Related bundles:\n{}", related.join("\n")));
-                }
-            }
-            Err(err) => {
-                lines.push(format!("Fanout unavailable: {err}"));
-            }
-        }
-    } else if target_path.is_dir() {
-        lines.push(format!(
-            "Directory scope: {}",
-            directory_entry_hint(&target_path, workspace_path)
-        ));
+    if manifest.is_empty() {
+        "No planned touches supplied. Use direct reads on the exact file you choose before broad discovery."
+            .to_string()
     } else {
-        lines.push("Status: planned new file".to_string());
-        lines.push(format!(
-            "Nearby files: {}",
-            nearby_file_hint(workspace_path, planned_touch)
-        ));
+        manifest.render()
     }
-
-    lines.join("\n")
-}
-
-fn render_related_file_bundles(
-    fanout: &reliability::ContextFanout,
-    workspace_path: &Path,
-    target_path: &Path,
-) -> Vec<String> {
-    let mut remaining = INLINE_WORKER_MAX_RELATED_FILES_PER_TARGET;
-    let mut rendered = Vec::new();
-
-    for (priority, paths) in &fanout.files_by_priority {
-        if remaining == 0 {
-            break;
-        }
-        let mut hints = Vec::new();
-        for path in paths {
-            if remaining == 0 {
-                break;
-            }
-            let related_path = Path::new(path);
-            if related_path == target_path || !related_path.is_file() {
-                continue;
-            }
-            hints.push(format!(
-                "{} -> {}",
-                relative_path_label(workspace_path, related_path),
-                symbol_outline_for_file(related_path)
-            ));
-            remaining -= 1;
-        }
-        if !hints.is_empty() {
-            rendered.push(format!(
-                "- {}: {}",
-                retrieval_priority_label(*priority),
-                hints.join(" | ")
-            ));
-        }
-    }
-
-    rendered
-}
-
-fn retrieval_priority_label(priority: reliability::RetrievalPriority) -> &'static str {
-    match priority {
-        reliability::RetrievalPriority::DirectImports => "direct imports",
-        reliability::RetrievalPriority::TypeDefinitions => "type definitions",
-        reliability::RetrievalPriority::TestFiles => "tests",
-        reliability::RetrievalPriority::SimilarPatterns => "similar patterns",
-    }
-}
-
-fn symbol_outline_for_file(path: &Path) -> String {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return "unavailable".to_string();
-    };
-    let mut symbols = Vec::new();
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
-            continue;
-        }
-        let is_symbol = trimmed.starts_with("pub struct ")
-            || trimmed.starts_with("struct ")
-            || trimmed.starts_with("pub enum ")
-            || trimmed.starts_with("enum ")
-            || trimmed.starts_with("pub trait ")
-            || trimmed.starts_with("trait ")
-            || trimmed.starts_with("impl ")
-            || trimmed.starts_with("pub fn ")
-            || trimmed.starts_with("fn ")
-            || trimmed.starts_with("pub async fn ")
-            || trimmed.starts_with("async fn ")
-            || trimmed.starts_with("export function ")
-            || trimmed.starts_with("function ")
-            || trimmed.starts_with("export class ")
-            || trimmed.starts_with("class ")
-            || trimmed.starts_with("interface ")
-            || trimmed.starts_with("type ")
-            || trimmed.starts_with("def ");
-        if is_symbol {
-            symbols.push(trim_symbol_line(trimmed));
-        }
-        if symbols.len() >= INLINE_WORKER_MAX_SYMBOL_LINES {
-            break;
-        }
-    }
-
-    if symbols.is_empty() {
-        content
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(trim_symbol_line)
-            .unwrap_or_else(|| "no obvious top-level symbols".to_string())
-    } else {
-        symbols.join("; ")
-    }
-}
-
-fn trim_symbol_line(line: &str) -> String {
-    const MAX_LINE_CHARS: usize = 88;
-    let compact = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_LINE_CHARS {
-        compact
-    } else {
-        let trimmed = compact.chars().take(MAX_LINE_CHARS - 3).collect::<String>();
-        format!("{trimmed}...")
-    }
-}
-
-fn nearby_file_hint(workspace_path: &Path, planned_touch: &str) -> String {
-    let path = workspace_path.join(planned_touch);
-    let Some(parent) = path.parent() else {
-        return "none".to_string();
-    };
-    directory_entry_hint(parent, workspace_path)
-}
-
-fn directory_entry_hint(directory: &Path, workspace_path: &Path) -> String {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return "none".to_string();
-    };
-    let mut paths = entries
-        .flatten()
-        .map(|entry| relative_path_label(workspace_path, &entry.path()))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.truncate(INLINE_WORKER_MAX_RELATED_FILES_PER_TARGET);
-    if paths.is_empty() {
-        "none".to_string()
-    } else {
-        paths.join(", ")
-    }
-}
-
-fn relative_path_label(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }
 
 #[allow(dead_code)]
@@ -9519,11 +9379,11 @@ mod tests {
         assert!(
             prompt_context
                 .code_retrieval
-                .contains("Target: src/task_alpha.rs")
+                .contains("@table code_retrieval")
         );
         assert!(
-            prompt_context.code_retrieval.contains("direct imports"),
-            "expected retrieval bundle to include fanout priority labels: {}",
+            prompt_context.code_retrieval.contains("src/task_alpha.rs"),
+            "expected retrieval bundle to cite the planned touch: {}",
             prompt_context.code_retrieval
         );
         assert!(
@@ -9584,7 +9444,8 @@ mod tests {
                 .expect("captured prompt");
             assert!(prompt.contains("## critical_rules"));
             assert!(prompt.contains("## code_retrieval"));
-            assert!(prompt.contains("Target: src/task_alpha.rs"));
+            assert!(prompt.contains("@table code_retrieval"));
+            assert!(prompt.contains("src/task_alpha.rs"));
             assert!(prompt.contains(
                 "Start from the supplied code retrieval bundle before using grep/find/ls."
             ));

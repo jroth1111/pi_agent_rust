@@ -153,6 +153,7 @@ pub mod provider_metadata;
 pub mod providers;
 pub mod reliability;
 pub mod resources;
+pub mod retrieval;
 pub mod rpc;
 pub mod runtime;
 pub mod sandbox;

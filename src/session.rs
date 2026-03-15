@@ -6,7 +6,9 @@
 use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::context::{MessageMetadata, VISIBILITY_METADATA_KEY};
+use crate::context::{
+    CompactManifest, MessageMetadata, VISIBILITY_METADATA_KEY, normalize_compact_value,
+};
 use crate::error::{Error, Result};
 use crate::extensions::ExtensionSession;
 use crate::model::{
@@ -14,6 +16,7 @@ use crate::model::{
     UserMessage,
 };
 use crate::reliability::{ClosePayload, CloseResult, EvidenceRecord, EvidenceStatus, StateDigest};
+use crate::retrieval::{RetrievalBundleOptions, RetrievalTarget, collect_retrieval_summary_rows};
 use crate::session_index::{SessionIndex, enqueue_session_index_snapshot_update};
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -23,7 +26,7 @@ use async_trait::async_trait;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +47,7 @@ pub const RELIABILITY_CLOSE_DECISION_ENTRY_TYPE: &str = "reliability/close_decis
 pub const RELIABILITY_HUMAN_BLOCKER_RAISED_ENTRY_TYPE: &str = "reliability/human_blocker_raised.v1";
 pub const RELIABILITY_HUMAN_BLOCKER_RESOLVED_ENTRY_TYPE: &str =
     "reliability/human_blocker_resolved.v1";
+const PROMPT_MANIFEST_CUSTOM_TYPE: &str = "prompt_manifest";
 
 type JsonlSaveResult = std::result::Result<Vec<SessionEntry>, (Error, Vec<SessionEntry>)>;
 
@@ -2529,16 +2533,30 @@ impl Session {
     /// Convert session entries along the current path to model messages.
     /// This follows parent_id links from leaf_id back to root.
     pub fn to_messages_for_current_path(&self) -> Vec<Message> {
+        self.prompt_assembly_for_current_path()
+            .into_model_messages()
+    }
+
+    pub(crate) fn prompt_assembly_for_current_path(&self) -> PromptAssemblyPlan {
         if self.leaf_id.is_none() {
-            return Vec::new();
+            return PromptAssemblyPlan::default();
         }
 
+        let workspace_root = Path::new(&self.header.cwd);
         if self.is_linear {
-            return Self::to_messages_from_path(self.entries.len(), |idx| &self.entries[idx]);
+            let (prefix_messages, entries) =
+                Self::prompt_path_components(self.entries.len(), |idx| &self.entries[idx]);
+            return PromptAssemblyPlan::from_prefix_and_entries(
+                prefix_messages,
+                &entries,
+                Some(workspace_root),
+            );
         }
 
         let path_entries = self.entries_for_current_path();
-        Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
+        let (prefix_messages, entries) =
+            Self::prompt_path_components(path_entries.len(), |idx| path_entries[idx]);
+        PromptAssemblyPlan::from_prefix_and_entries(prefix_messages, &entries, Some(workspace_root))
     }
 
     fn text_from_blocks(blocks: &[ContentBlock]) -> String {
@@ -2659,35 +2677,10 @@ impl Session {
         )))]
     }
 
-    fn append_model_message_for_entry(
-        messages: &mut Vec<Message>,
-        entry: &SessionEntry,
-        context_state: &mut PromptContextState,
-    ) {
-        match entry {
-            SessionEntry::Message(msg_entry) => {
-                // Skip messages that are not visible to the agent
-                if !msg_entry.is_agent_visible() {
-                    return;
-                }
-                if let Some(message) = context_state.to_model_message(&msg_entry.message) {
-                    messages.push(message);
-                }
-            }
-            SessionEntry::BranchSummary(summary) => {
-                let summary_message = SessionMessage::BranchSummary {
-                    summary: summary.summary.clone(),
-                    from_id: summary.from_id.clone(),
-                };
-                if let Some(message) = session_message_to_model(&summary_message) {
-                    messages.push(message);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<Message>
+    fn prompt_path_components<'a, F>(
+        path_len: usize,
+        entry_at: F,
+    ) -> (Vec<SessionMessage>, Vec<&'a SessionEntry>)
     where
         F: Fn(usize) -> &'a SessionEntry,
     {
@@ -2700,14 +2693,10 @@ impl Session {
         }
 
         if let Some((compaction_idx, compaction)) = last_compaction {
-            let mut messages = Vec::new();
-            let summary_message = SessionMessage::CompactionSummary {
+            let prefix_messages = vec![SessionMessage::CompactionSummary {
                 summary: compaction.summary.clone(),
                 tokens_before: compaction.tokens_before,
-            };
-            if let Some(message) = session_message_to_model(&summary_message) {
-                messages.push(message);
-            }
+            }];
 
             let has_kept_entry = (0..path_len).any(|idx| {
                 entry_at(idx)
@@ -2746,23 +2735,10 @@ impl Session {
                 kept_entries.push(entry);
             }
 
-            let metadata = prompt_metadata_from_entries(kept_entries.iter().copied());
-            let mut context_state = PromptContextState::with_metadata(metadata);
-            for entry in kept_entries {
-                Self::append_model_message_for_entry(&mut messages, entry, &mut context_state);
-            }
-
-            return messages;
+            return (prefix_messages, kept_entries);
         }
 
-        let entries: Vec<_> = (0..path_len).map(entry_at).collect();
-        let mut messages = Vec::new();
-        let metadata = prompt_metadata_from_entries(entries.iter().copied());
-        let mut context_state = PromptContextState::with_metadata(metadata);
-        for entry in entries {
-            Self::append_model_message_for_entry(&mut messages, entry, &mut context_state);
-        }
-        messages
+        (Vec::new(), (0..path_len).map(entry_at).collect())
     }
 
     /// Find the nearest ancestor that is a fork point (has multiple children)
@@ -3737,6 +3713,444 @@ struct PromptVerificationRecord {
 pub(crate) struct PromptAssemblyMetadata {
     consumed_tool_results: HashSet<String>,
     verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
+}
+
+const PROMPT_MANIFEST_MAX_EVIDENCE_ROWS: usize = 4;
+const PROMPT_MANIFEST_MAX_RETRIEVAL_TARGETS: usize = 4;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PromptAssemblyPlan {
+    session_messages: Vec<SessionMessage>,
+    metadata: PromptAssemblyMetadata,
+}
+
+impl PromptAssemblyPlan {
+    fn from_prefix_and_entries(
+        prefix_messages: Vec<SessionMessage>,
+        entries: &[&SessionEntry],
+        workspace_root: Option<&Path>,
+    ) -> Self {
+        let metadata = prompt_metadata_from_entries(entries.iter().copied());
+        let mut session_messages = prefix_messages;
+        if let Some(manifest_message) = build_prompt_manifest(entries, workspace_root) {
+            session_messages.push(manifest_message);
+        }
+        for entry in entries {
+            append_prompt_session_message(&mut session_messages, entry);
+        }
+
+        Self {
+            session_messages,
+            metadata,
+        }
+    }
+
+    pub(crate) fn transformed_session_messages(&self) -> Vec<SessionMessage> {
+        prompt_transform_messages_with_metadata(&self.session_messages, self.metadata.clone())
+    }
+
+    pub(crate) fn into_model_messages(self) -> Vec<Message> {
+        prompt_transform_messages_with_metadata(&self.session_messages, self.metadata)
+            .iter()
+            .filter_map(session_message_to_model)
+            .collect()
+    }
+}
+
+pub(crate) fn prompt_assembly_plan_from_entries<'a>(
+    entries: impl IntoIterator<Item = &'a SessionEntry>,
+    workspace_root: Option<&Path>,
+) -> PromptAssemblyPlan {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    PromptAssemblyPlan::from_prefix_and_entries(Vec::new(), &entries, workspace_root)
+}
+
+#[derive(Debug, Default)]
+struct PromptManifestBuilder {
+    tool_calls: HashMap<String, PromptToolCall>,
+    retrieval_targets: BTreeMap<String, PromptRetrievalCandidate>,
+    tasks: HashMap<String, PromptTaskSnapshot>,
+    last_task_id: Option<String>,
+    state_digest: Option<StateDigest>,
+    evidence_by_task: HashMap<String, Vec<PromptManifestEvidence>>,
+}
+
+#[derive(Debug, Default)]
+struct PromptRetrievalCandidate {
+    reads: u32,
+    mutations: u32,
+    searches: u32,
+}
+
+impl PromptRetrievalCandidate {
+    fn observe(&mut self, tool_name: &str) {
+        match tool_name {
+            "read" => self.reads = self.reads.saturating_add(1),
+            "write" | "edit" => self.mutations = self.mutations.saturating_add(1),
+            "grep" | "find" | "ls" => self.searches = self.searches.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn score(&self) -> u32 {
+        self.mutations
+            .saturating_mul(4)
+            .saturating_add(self.reads.saturating_mul(2))
+            .saturating_add(self.searches)
+    }
+
+    fn purpose(&self) -> String {
+        let mut parts = Vec::new();
+        if self.mutations > 0 {
+            parts.push(format!("mutatex{}", self.mutations));
+        }
+        if self.reads > 0 {
+            parts.push(format!("readx{}", self.reads));
+        }
+        if self.searches > 0 {
+            parts.push(format!("searchx{}", self.searches));
+        }
+        if parts.is_empty() {
+            "working_set".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PromptTaskSnapshot {
+    objective: Option<String>,
+    phase: Option<String>,
+    checkpoint_summary: Option<String>,
+    blockers: Vec<String>,
+    close_outcome: Option<String>,
+    close_approved: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptManifestEvidence {
+    status: String,
+    command: String,
+    exit_code: i32,
+    artifacts: usize,
+}
+
+impl PromptManifestBuilder {
+    fn observe_entry(&mut self, entry: &SessionEntry) {
+        match entry {
+            SessionEntry::Message(message_entry) => self.observe_message(&message_entry.message),
+            SessionEntry::StateDigest(entry) => self.state_digest = Some(entry.digest.clone()),
+            SessionEntry::TaskCreated(entry) => {
+                let task = self.touch_task(&entry.task_id);
+                task.objective = Some(entry.objective.clone());
+            }
+            SessionEntry::TaskCheckpoint(entry) => {
+                let task = self.touch_task(&entry.task_id);
+                task.phase = Some(entry.phase.clone());
+                task.checkpoint_summary = Some(entry.summary.clone());
+            }
+            SessionEntry::TaskTransition(entry) => {
+                let task = self.touch_task(&entry.task_id);
+                task.phase = Some(entry.to.clone());
+            }
+            SessionEntry::VerificationEvidence(entry) => {
+                self.last_task_id = Some(entry.evidence.task_id.clone());
+                self.evidence_by_task
+                    .entry(entry.evidence.task_id.clone())
+                    .or_default()
+                    .push(PromptManifestEvidence {
+                        status: prompt_verification_status(entry.evidence.status).to_string(),
+                        command: entry.evidence.command.clone(),
+                        exit_code: entry.evidence.exit_code,
+                        artifacts: entry.evidence.artifact_ids.len(),
+                    });
+            }
+            SessionEntry::CloseDecision(entry) => {
+                let task = self.touch_task(&entry.payload.task_id);
+                task.close_outcome = Some(entry.payload.outcome.clone());
+                task.close_approved = Some(entry.result.approved);
+            }
+            SessionEntry::HumanBlockerRaised(entry) => {
+                let task = self.touch_task(&entry.task_id);
+                let reason = normalize_compact_value(&entry.reason, 72);
+                if !task.blockers.iter().any(|existing| existing == &reason) {
+                    task.blockers.push(reason);
+                }
+            }
+            SessionEntry::HumanBlockerResolved(entry) => {
+                let task = self.touch_task(&entry.task_id);
+                task.blockers.clear();
+                task.checkpoint_summary = Some(format!("blocker resolved: {}", entry.resolution));
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_message(&mut self, message: &SessionMessage) {
+        match message {
+            SessionMessage::Assistant { message } => {
+                for block in &message.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        self.tool_calls.insert(
+                            call.id.clone(),
+                            PromptToolCall {
+                                name: call.name.clone(),
+                                path: Session::tool_path_from_arguments(&call.arguments),
+                                command: Session::tool_command_from_arguments(&call.arguments),
+                            },
+                        );
+                    }
+                }
+            }
+            SessionMessage::ToolResult {
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                if *is_error {
+                    return;
+                }
+                let Some(tool_call) = self.tool_calls.get(tool_call_id) else {
+                    return;
+                };
+                let Some(path) = tool_call.path.as_ref() else {
+                    return;
+                };
+                self.retrieval_targets
+                    .entry(path.clone())
+                    .or_default()
+                    .observe(&tool_call.name);
+            }
+            _ => {}
+        }
+    }
+
+    fn touch_task(&mut self, task_id: &str) -> &mut PromptTaskSnapshot {
+        self.last_task_id = Some(task_id.to_string());
+        self.tasks.entry(task_id.to_string()).or_default()
+    }
+
+    fn into_session_message(self, workspace_root: Option<&Path>) -> Option<SessionMessage> {
+        let mut manifest = CompactManifest::default();
+        let active_task_id = self.last_task_id.clone();
+
+        let mut runtime_rows = Vec::new();
+        if let Some(task_id) = active_task_id.as_ref() {
+            runtime_rows.push(("task".to_string(), task_id.clone()));
+        }
+        if let Some(task_id) = active_task_id.as_ref()
+            && let Some(task) = self.tasks.get(task_id)
+        {
+            if let Some(objective) = task.objective.as_deref().or_else(|| {
+                self.state_digest
+                    .as_ref()
+                    .map(|digest| digest.objective.as_str())
+            }) {
+                runtime_rows.push((
+                    "objective".to_string(),
+                    normalize_compact_value(objective, 96),
+                ));
+            }
+            if let Some(phase) = task.phase.as_deref().or_else(|| {
+                self.state_digest
+                    .as_ref()
+                    .map(|digest| digest.phase.as_str())
+            }) {
+                runtime_rows.push(("phase".to_string(), normalize_compact_value(phase, 48)));
+            }
+            if !task.blockers.is_empty() {
+                runtime_rows.push((
+                    "blockers".to_string(),
+                    normalize_compact_value(&task.blockers.join("; "), 96),
+                ));
+            } else if let Some(digest) = self.state_digest.as_ref()
+                && !digest.blockers.is_empty()
+            {
+                runtime_rows.push((
+                    "blockers".to_string(),
+                    normalize_compact_value(&digest.blockers.join("; "), 96),
+                ));
+            }
+            if let Some(next_action) = self
+                .state_digest
+                .as_ref()
+                .and_then(|digest| digest.next_action.as_deref())
+            {
+                runtime_rows.push(("next".to_string(), normalize_compact_value(next_action, 96)));
+            } else if let Some(summary) = task.checkpoint_summary.as_deref() {
+                runtime_rows.push(("next".to_string(), normalize_compact_value(summary, 96)));
+            }
+            if let Some(outcome) = task.close_outcome.as_deref() {
+                let status = if task.close_approved.unwrap_or(false) {
+                    "approved"
+                } else {
+                    "rejected"
+                };
+                runtime_rows.push((
+                    "close".to_string(),
+                    normalize_compact_value(&format!("{status}: {outcome}"), 96),
+                ));
+            }
+        } else if let Some(digest) = self.state_digest.as_ref() {
+            runtime_rows.push((
+                "objective".to_string(),
+                normalize_compact_value(&digest.objective, 96),
+            ));
+            runtime_rows.push((
+                "phase".to_string(),
+                normalize_compact_value(&digest.phase, 48),
+            ));
+            if !digest.blockers.is_empty() {
+                runtime_rows.push((
+                    "blockers".to_string(),
+                    normalize_compact_value(&digest.blockers.join("; "), 96),
+                ));
+            }
+            if let Some(next_action) = digest.next_action.as_deref() {
+                runtime_rows.push(("next".to_string(), normalize_compact_value(next_action, 96)));
+            }
+        }
+        manifest.push_fields("task_runtime", runtime_rows);
+
+        if let Some(task_id) = active_task_id.as_ref()
+            && let Some(evidence_rows) = self.evidence_by_task.get(task_id)
+        {
+            let rows = evidence_rows
+                .iter()
+                .rev()
+                .take(PROMPT_MANIFEST_MAX_EVIDENCE_ROWS)
+                .map(|evidence| {
+                    vec![
+                        normalize_compact_value(&evidence.status, 16),
+                        normalize_compact_value(&evidence.command, 64),
+                        evidence.exit_code.to_string(),
+                        evidence.artifacts.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            manifest.push_table(
+                "evidence",
+                vec![
+                    "status".to_string(),
+                    "command".to_string(),
+                    "exit".to_string(),
+                    "artifacts".to_string(),
+                ],
+                rows,
+            );
+        }
+
+        let retrieval_targets = self
+            .retrieval_targets
+            .into_iter()
+            .filter(|(_, candidate)| candidate.score() > 0)
+            .collect::<Vec<_>>();
+        let mut retrieval_targets = retrieval_targets;
+        retrieval_targets.sort_by(|left, right| {
+            right
+                .1
+                .score()
+                .cmp(&left.1.score())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let retrieval_targets = retrieval_targets
+            .into_iter()
+            .take(PROMPT_MANIFEST_MAX_RETRIEVAL_TARGETS)
+            .map(|(path, candidate)| RetrievalTarget {
+                path,
+                purpose: candidate.purpose(),
+            })
+            .collect::<Vec<_>>();
+
+        let include_retrieval = !manifest.is_empty() || retrieval_targets.len() >= 2;
+
+        if include_retrieval
+            && let Some(workspace_root) = workspace_root
+            && !retrieval_targets.is_empty()
+        {
+            let rows = collect_retrieval_summary_rows(
+                workspace_root,
+                &retrieval_targets,
+                &RetrievalBundleOptions::default(),
+            )
+            .into_iter()
+            .map(|row| vec![row.path, row.purpose, row.outline, row.related])
+            .collect::<Vec<_>>();
+            manifest.push_table(
+                "code_retrieval",
+                vec![
+                    "path".to_string(),
+                    "purpose".to_string(),
+                    "outline".to_string(),
+                    "related".to_string(),
+                ],
+                rows,
+            );
+        } else if include_retrieval && !retrieval_targets.is_empty() {
+            let rows = retrieval_targets
+                .into_iter()
+                .map(|target| {
+                    vec![
+                        target.path,
+                        normalize_compact_value(&target.purpose, 72),
+                        "unavailable".to_string(),
+                        "unavailable".to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            manifest.push_table(
+                "code_retrieval",
+                vec![
+                    "path".to_string(),
+                    "purpose".to_string(),
+                    "outline".to_string(),
+                    "related".to_string(),
+                ],
+                rows,
+            );
+        }
+
+        if manifest.is_empty() {
+            return None;
+        }
+
+        Some(SessionMessage::Custom {
+            custom_type: PROMPT_MANIFEST_CUSTOM_TYPE.to_string(),
+            content: format!("Prompt assembly manifest\n{}", manifest.render()),
+            display: false,
+            details: Some(serde_json::json!({ "synthetic": true })),
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        })
+    }
+}
+
+fn build_prompt_manifest(
+    entries: &[&SessionEntry],
+    workspace_root: Option<&Path>,
+) -> Option<SessionMessage> {
+    let mut builder = PromptManifestBuilder::default();
+    for entry in entries {
+        builder.observe_entry(entry);
+    }
+    builder.into_session_message(workspace_root)
+}
+
+fn append_prompt_session_message(messages: &mut Vec<SessionMessage>, entry: &SessionEntry) {
+    match entry {
+        SessionEntry::Message(msg_entry) => {
+            if msg_entry.is_agent_visible() {
+                messages.push(msg_entry.message.clone());
+            }
+        }
+        SessionEntry::BranchSummary(summary) => {
+            messages.push(SessionMessage::BranchSummary {
+                summary: summary.summary.clone(),
+                from_id: summary.from_id.clone(),
+            });
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Default)]
@@ -6338,10 +6752,15 @@ mod tests {
         ));
 
         let messages = session.to_messages_for_current_path();
-        let output = match &messages[2] {
-            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
-            other => panic!("expected bash tool result, got {other:?}"),
-        };
+        let output = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "bash" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected bash tool result");
 
         assert!(output.contains("Verification output omitted"));
         assert!(output.contains("cargo test --lib"));
@@ -6378,10 +6797,15 @@ mod tests {
         ));
 
         let messages = session.to_messages_for_current_path();
-        let output = match &messages[2] {
-            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
-            other => panic!("expected bash tool result, got {other:?}"),
-        };
+        let output = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "bash" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected bash tool result");
 
         assert_eq!(output, "failing cargo test output remains visible");
     }
@@ -6444,6 +6868,55 @@ mod tests {
         assert!(output.contains("/tmp/pi-grep-test.log"));
         assert!(output.contains("src"));
         assert!(!output.contains("large grep output"));
+    }
+
+    #[test]
+    fn test_prompt_assembly_injects_task_aware_manifest_for_nontrivial_working_set() {
+        let mut session = Session::in_memory();
+        session.append_task_created_entry(
+            "task-1".to_string(),
+            "Improve prompt assembly".to_string(),
+            None,
+        );
+        session.append_task_transition_entry(
+            "task-1".to_string(),
+            Some("ready".to_string()),
+            "implementing".to_string(),
+            None,
+        );
+        let mut digest = StateDigest::new("Improve prompt assembly", "implementing");
+        digest.next_action = Some("Verify the prompt manifest".to_string());
+        session.append_state_digest_entry(digest);
+        session.append_verification_evidence_entry(EvidenceRecord::from_command_output(
+            "task-1",
+            "cargo test --lib",
+            0,
+            "ok",
+            "",
+            vec!["artifact://verify/stdout".to_string()],
+        ));
+        session.append_message(make_test_message("read and edit relevant files"));
+        session.append_message(make_test_tool_call("call-1", "read", "src/session.rs"));
+        session.append_message(make_test_tool_result("call-1", "read", "session context"));
+        session.append_message(make_test_tool_call("call-2", "edit", "src/agent.rs"));
+        session.append_message(make_test_tool_result("call-2", "edit", "agent context"));
+
+        let messages = session.to_messages_for_current_path();
+        let manifest = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Custom(custom) if custom.custom_type == PROMPT_MANIFEST_CUSTOM_TYPE => {
+                    Some(custom.content.as_str())
+                }
+                _ => None,
+            })
+            .expect("expected prompt manifest");
+
+        assert!(manifest.contains("@fields task_runtime"));
+        assert!(manifest.contains("task=task-1"));
+        assert!(manifest.contains("@table evidence"));
+        assert!(manifest.contains("@table code_retrieval"));
+        assert!(manifest.contains("src/session.rs"));
     }
 
     #[test]
