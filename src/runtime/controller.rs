@@ -4,8 +4,8 @@ use crate::runtime::policy::{PolicyDecision, PolicyRequest, PolicyTarget, Runtim
 use crate::runtime::scheduler;
 use crate::runtime::state_machine::{RuntimeStateMachine, RuntimeTransition, TransitionError};
 use crate::runtime::types::{
-    ApprovalCheckpoint, ApprovalId, ApprovalState, ContinuationReason, PlanArtifact, RunPhase,
-    RunSnapshot, RunSpec, TaskNode, TaskState,
+    ApprovalCheckpoint, ApprovalId, ApprovalState, ContinuationReason, LeaseRecord, PlanArtifact,
+    RunPhase, RunSnapshot, RunSpec, TaskNode, TaskState,
 };
 use chrono::{DateTime, Utc};
 
@@ -25,6 +25,7 @@ pub enum RuntimeCommand {
     MarkTaskState {
         task_id: String,
         state: TaskState,
+        lease: Option<LeaseRecord>,
         reason: Option<String>,
         retry_at: Option<DateTime<Utc>>,
         continuation_reason: Option<ContinuationReason>,
@@ -212,6 +213,7 @@ where
                     RuntimeCommand::MarkTaskState {
                         task_id,
                         state,
+                        lease,
                         reason,
                         retry_at,
                         continuation_reason,
@@ -220,6 +222,7 @@ where
                         RuntimeEventKind::TaskStateChanged {
                             task_id,
                             state,
+                            lease,
                             reason,
                             retry_at,
                             continuation_reason,
@@ -367,7 +370,11 @@ mod tests {
             task_id: "task-1".to_string(),
             title: "task".to_string(),
             objective: "do work".to_string(),
+            parent_goal_trace_id: None,
             planned_touches: vec![PathBuf::from("src/runtime/controller.rs")],
+            input_snapshot: None,
+            max_attempts: 1,
+            enforce_symbol_drift_check: false,
             verify: VerifySpec {
                 command: "cargo test runtime".to_string(),
                 timeout_sec: 60,
@@ -415,6 +422,7 @@ mod tests {
             .handle(RuntimeCommand::MarkTaskState {
                 task_id: "task-1".to_string(),
                 state: TaskState::Executing,
+                lease: None,
                 reason: None,
                 retry_at: None,
                 continuation_reason: Some(ContinuationReason::PlanExecution),

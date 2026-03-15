@@ -1,6 +1,6 @@
 use crate::runtime::types::{
-    ApprovalCheckpoint, ApprovalId, ApprovalState, ContinuationReason, PlanArtifact, RunId,
-    RunPhase, TaskId, TaskNode, TaskState,
+    ApprovalCheckpoint, ApprovalId, ApprovalState, ContinuationReason, LeaseRecord, PlanArtifact,
+    RunId, RunPhase, TaskId, TaskNode, TaskState,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ pub enum RuntimeEventKind {
     TaskStateChanged {
         task_id: TaskId,
         state: TaskState,
+        lease: Option<LeaseRecord>,
         reason: Option<String>,
         retry_at: Option<DateTime<Utc>>,
         continuation_reason: Option<ContinuationReason>,
@@ -112,7 +113,11 @@ mod tests {
             task_id: "task-a".to_string(),
             title: "task".to_string(),
             objective: "ship it".to_string(),
+            parent_goal_trace_id: None,
             planned_touches: Vec::new(),
+            input_snapshot: None,
+            max_attempts: 1,
+            enforce_symbol_drift_check: false,
             verify: crate::runtime::types::VerifySpec {
                 command: "cargo test".to_string(),
                 timeout_sec: 60,

@@ -1,6 +1,6 @@
 use crate::runtime::events::RuntimeEventKind;
 use crate::runtime::types::{
-    ApprovalState, ContinuationReason, RunPhase, RunSnapshot, TaskNode, TaskState,
+    ApprovalState, ContinuationReason, LeaseRecord, RunPhase, RunSnapshot, TaskNode, TaskState,
 };
 use chrono::{DateTime, Utc};
 
@@ -24,6 +24,7 @@ pub fn maintenance_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<Run
                 },
                 None,
                 None,
+                None,
                 Some(ContinuationReason::TaskReady),
             )),
             TaskState::Blocked if deps_satisfied => events.push(task_state_change(
@@ -31,11 +32,13 @@ pub fn maintenance_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<Run
                 TaskState::Ready,
                 None,
                 None,
+                None,
                 Some(ContinuationReason::TaskReady),
             )),
             TaskState::Ready if !deps_satisfied => events.push(task_state_change(
                 &task_id,
                 TaskState::Blocked,
+                None,
                 Some("waiting for prerequisite completion".to_string()),
                 None,
                 Some(ContinuationReason::TaskReady),
@@ -50,6 +53,7 @@ pub fn maintenance_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<Run
                 events.push(task_state_change(
                     &task_id,
                     TaskState::Recoverable,
+                    None,
                     Some("task lease expired during runtime scheduling".to_string()),
                     Some(now),
                     Some(ContinuationReason::WakeTimer),
@@ -68,6 +72,7 @@ pub fn maintenance_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<Run
                     } else {
                         TaskState::Blocked
                     },
+                    None,
                     None,
                     None,
                     Some(ContinuationReason::VerificationRetry),
@@ -186,6 +191,7 @@ fn phase_event(snapshot: &RunSnapshot, phase: RunPhase, summary: &str) -> Vec<Ru
 fn task_state_change(
     task_id: &str,
     state: TaskState,
+    lease: Option<LeaseRecord>,
     reason: Option<String>,
     retry_at: Option<DateTime<Utc>>,
     continuation_reason: Option<ContinuationReason>,
@@ -193,6 +199,7 @@ fn task_state_change(
     RuntimeEventKind::TaskStateChanged {
         task_id: task_id.to_string(),
         state,
+        lease,
         reason,
         retry_at,
         continuation_reason,
@@ -259,7 +266,11 @@ mod tests {
                 task_id: task_id.to_string(),
                 title: task_id.to_string(),
                 objective: "do work".to_string(),
+                parent_goal_trace_id: None,
                 planned_touches: Vec::new(),
+                input_snapshot: None,
+                max_attempts: 1,
+                enforce_symbol_drift_check: false,
                 verify: VerifySpec {
                     command: "cargo test runtime".to_string(),
                     timeout_sec: 60,
@@ -293,6 +304,7 @@ mod tests {
             vec![RuntimeEventKind::TaskStateChanged {
                 task_id: "task-b".to_string(),
                 state: TaskState::Ready,
+                lease: None,
                 reason: None,
                 retry_at: None,
                 continuation_reason: Some(ContinuationReason::TaskReady),

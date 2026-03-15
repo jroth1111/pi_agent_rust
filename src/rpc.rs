@@ -1514,10 +1514,7 @@ async fn runtime_model_profile_for_run(
             .thinking_level
             .as_deref()
             .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
-        (
-            current_model_entry(&inner_session, options).cloned(),
-            thinking,
-        )
+        (runtime_selected_model_entry(&inner_session, options), thinking)
     };
 
     let default_entry = current_entry
@@ -1570,6 +1567,17 @@ async fn runtime_model_profile_for_run(
         verifier: runtime_model_selector(&default_entry, current_thinking),
         summarizer: runtime_model_selector(&background_entry, None),
         background: runtime_model_selector(&background_entry, None),
+    })
+}
+
+fn runtime_selected_model_entry(
+    session: &crate::session::Session,
+    options: &RpcOptions,
+) -> Option<ModelEntry> {
+    current_model_entry(session, options).cloned().or_else(|| {
+        let provider = session.header.provider.as_deref()?;
+        let model_id = session.header.model_id.as_deref()?;
+        crate::models::ad_hoc_model_entry(provider, model_id)
     })
 }
 
@@ -1636,7 +1644,11 @@ fn build_runtime_task_nodes(
                 task_id: task.task_id.clone(),
                 title: task.task_id.clone(),
                 objective: task.objective.clone(),
+                parent_goal_trace_id: task.parent_goal_trace_id.clone(),
                 planned_touches: task.planned_touches.iter().map(PathBuf::from).collect(),
+                input_snapshot: task.input_snapshot.clone(),
+                max_attempts: task.max_attempts.unwrap_or(1),
+                enforce_symbol_drift_check: task.enforce_symbol_drift_check,
                 verify: VerifySpec {
                     command: verify_command,
                     timeout_sec: verify_timeout_sec,
@@ -4159,38 +4171,6 @@ async fn sync_task_runs(
     Ok(updated_runs)
 }
 
-async fn refresh_run_if_live(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    runtime_store: &RuntimeStore,
-    mut run: RunSnapshot,
-) -> Result<RunSnapshot> {
-    let original = run.clone();
-    let has_live_tasks = {
-        let mut reliability = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        refresh_live_run_from_reliability(&mut reliability, &mut run)
-    };
-
-    {
-        let mut orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(&run.spec.run_id, &run.task_ids());
-    }
-
-    if has_live_tasks && run != original {
-        persist_runtime_snapshot(cx, session, runtime_store, &run).await?;
-    }
-
-    Ok(run)
-}
-
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
     if images.is_empty() {
@@ -4934,13 +4914,7 @@ pub async fn run(
                 }
 
                 {
-                    let mut run = runtime_bootstrap.snapshot;
-                    {
-                        let rel = reliability_state.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("reliability lock failed: {err}"))
-                        })?;
-                        refresh_run_from_reliability(&rel, &mut run);
-                    }
+                    let run = runtime_bootstrap.snapshot;
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
@@ -4979,26 +4953,6 @@ pub async fn run(
                     };
 
                 if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
-                    let run = match refresh_run_if_live(
-                        &cx,
-                        &session,
-                        &reliability_state,
-                        &orchestration_state,
-                        &runtime_store,
-                        run,
-                    )
-                    .await
-                    {
-                        Ok(run) => run,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.get_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
                     let _ = out_tx.send(response_ok(
                         id,
                         "orchestration.get_run",
@@ -5052,7 +5006,7 @@ pub async fn run(
                     continue;
                 }
 
-                let mut output = if run.plan_accepted {
+                let output = if run.plan_accepted {
                     RuntimeControllerOutput {
                         snapshot: run,
                         events: Vec::new(),
@@ -5074,13 +5028,6 @@ pub async fn run(
                     }
                 };
 
-                {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    refresh_run_from_reliability(&rel, &mut output.snapshot);
-                }
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
@@ -9135,7 +9082,11 @@ mod tests {
             task_id: task_id.to_string(),
             title: format!("Task {task_id}"),
             objective: format!("Objective {task_id}"),
+            parent_goal_trace_id: Some(format!("goal:{task_id}")),
             planned_touches: Vec::new(),
+            input_snapshot: Some("snapshot".to_string()),
+            max_attempts: 3,
+            enforce_symbol_drift_check: false,
             verify: VerifySpec {
                 command: "true".to_string(),
                 timeout_sec: 30,
@@ -13368,6 +13319,19 @@ mod tests {
         let resolved = current_model_entry(&session, &options).expect("resolve aliased model");
         assert_eq!(resolved.model.provider, "openrouter");
         assert_eq!(resolved.model.id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn runtime_selected_model_entry_falls_back_to_ad_hoc_session_model() {
+        let options = rpc_options_with_models(Vec::new());
+        let mut session = Session::in_memory();
+        session.header.provider = Some("openai".to_string());
+        session.header.model_id = Some("gpt-4.1".to_string());
+
+        let resolved =
+            runtime_selected_model_entry(&session, &options).expect("resolve ad hoc model");
+        assert_eq!(resolved.model.provider, "openai");
+        assert_eq!(resolved.model.id, "gpt-4.1");
     }
 
     fn sample_start_run_request() -> StartRunRequest {

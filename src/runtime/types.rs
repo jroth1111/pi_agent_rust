@@ -343,11 +343,23 @@ pub struct TaskSpec {
     pub task_id: TaskId,
     pub title: String,
     pub objective: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_goal_trace_id: Option<String>,
     #[serde(default)]
     pub planned_touches: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_snapshot: Option<String>,
+    #[serde(default = "default_task_max_attempts")]
+    pub max_attempts: u8,
+    #[serde(default)]
+    pub enforce_symbol_drift_check: bool,
     pub verify: VerifySpec,
     pub autonomy: AutonomyLevel,
     pub constraints: TaskConstraints,
+}
+
+const fn default_task_max_attempts() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,6 +386,8 @@ pub struct TaskRuntime {
     pub state: TaskState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseRecord>,
+    #[serde(default)]
+    pub attempt: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -387,6 +401,7 @@ impl Default for TaskRuntime {
         Self {
             state: TaskState::Draft,
             lease: None,
+            attempt: 0,
             retry_at: None,
             continuation_reason: None,
             last_error: None,

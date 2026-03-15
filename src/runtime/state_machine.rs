@@ -97,6 +97,7 @@ impl RuntimeStateMachine {
             RuntimeEventKind::TaskStateChanged {
                 task_id,
                 state,
+                lease,
                 reason,
                 retry_at,
                 continuation_reason,
@@ -107,8 +108,20 @@ impl RuntimeStateMachine {
                     .get_mut(&task_id)
                     .ok_or_else(|| TransitionError::UnknownTask(task_id.clone()))?;
                 task.runtime.state = state;
+                task.runtime.lease = lease;
                 task.runtime.retry_at = retry_at;
                 task.runtime.continuation_reason = continuation_reason;
+                if matches!(
+                    state,
+                    TaskState::Recoverable
+                        | TaskState::AwaitingHuman
+                        | TaskState::Succeeded
+                        | TaskState::Failed
+                        | TaskState::Canceled
+                        | TaskState::Superseded
+                ) {
+                    task.runtime.attempt = task.runtime.attempt.saturating_add(1);
+                }
                 task.runtime.last_error = reason.map(|message| FailureRecord {
                     code: state_error_code(state).to_string(),
                     message,
@@ -293,7 +306,11 @@ mod tests {
             task_id: task_id.to_string(),
             title: task_id.to_string(),
             objective: "do work".to_string(),
+            parent_goal_trace_id: None,
             planned_touches: Vec::new(),
+            input_snapshot: None,
+            max_attempts: 1,
+            enforce_symbol_drift_check: false,
             verify: VerifySpec {
                 command: "cargo test".to_string(),
                 timeout_sec: 60,
