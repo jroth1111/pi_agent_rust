@@ -16,6 +16,7 @@ use crate::auth::AuthStorage;
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::config::{Config, ReliabilityEnforcementMode, RetrySettings};
+use crate::context::normalize_compact_value;
 use crate::error::{Error, Result};
 use crate::events::Action;
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
@@ -63,6 +64,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +73,16 @@ use std::time::Instant;
 const MAX_CONCURRENT_TOOLS: usize = 8;
 const RELIABILITY_OBJECTIVE_MAX_CHARS: usize = 160;
 const PROMPT_CACHE_AUTO_MIN_BYTES: usize = 4 * 1024;
+const TOOL_OUTPUT_COMPACTION_MIN_BYTES: usize = 1024;
+const TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashOutputFamily {
+    Verification,
+    GitStatus,
+    GitDiff,
+    Other,
+}
 
 // ============================================================================
 // Agent Configuration
@@ -175,6 +187,340 @@ fn estimate_context_bytes(context: &Context<'_>) -> usize {
         .map(estimate_tool_def_bytes)
         .sum::<usize>();
     system_bytes + message_bytes + tool_bytes
+}
+
+fn maybe_compact_tool_output(tool_call: &ToolCall, output: &mut ToolOutput, is_error: bool) {
+    if tool_call.name == "bash" {
+        compact_bash_tool_output(tool_call, output, is_error);
+    }
+}
+
+fn compact_bash_tool_output(tool_call: &ToolCall, output: &mut ToolOutput, is_error: bool) {
+    let Some(command) = tool_call
+        .arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    else {
+        return;
+    };
+    let Some(text) = text_output_from_tool_blocks(&output.content) else {
+        return;
+    };
+    let exit_code = tool_output_exit_code(output.details.as_ref(), is_error);
+    let family = classify_bash_output_family(command);
+    if !should_compact_bash_output(family, &text, output.details.as_ref(), exit_code) {
+        return;
+    }
+
+    let artifact_path = ensure_output_artifact_path("bash", &text, &mut output.details);
+    let Some(summary) = (match family {
+        BashOutputFamily::Verification => {
+            summarize_verification_bash_output(command, &text, exit_code, artifact_path.as_deref())
+        }
+        BashOutputFamily::GitStatus => {
+            summarize_git_status_output(command, &text, artifact_path.as_deref())
+        }
+        BashOutputFamily::GitDiff => {
+            summarize_git_diff_output(command, &text, artifact_path.as_deref())
+        }
+        BashOutputFamily::Other => None,
+    }) else {
+        return;
+    };
+
+    annotate_tool_output_compaction(&mut output.details, family, artifact_path.as_deref());
+    output.content = vec![ContentBlock::Text(TextContent::new(summary))];
+}
+
+fn classify_bash_output_family(command: &str) -> BashOutputFamily {
+    let normalized = command.trim().to_ascii_lowercase();
+    if [
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo nextest",
+        "pytest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "cargo build",
+        "npm run build",
+        "pnpm build",
+        "yarn build",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+    {
+        return BashOutputFamily::Verification;
+    }
+    if normalized.starts_with("git status") {
+        return BashOutputFamily::GitStatus;
+    }
+    if normalized.starts_with("git diff") {
+        return BashOutputFamily::GitDiff;
+    }
+    BashOutputFamily::Other
+}
+
+fn should_compact_bash_output(
+    family: BashOutputFamily,
+    text: &str,
+    details: Option<&Value>,
+    exit_code: i32,
+) -> bool {
+    let has_artifact = details
+        .and_then(|value| value.get("fullOutputPath"))
+        .is_some();
+    match family {
+        BashOutputFamily::Verification if exit_code == 0 => {
+            has_artifact || text.len() >= TOOL_OUTPUT_COMPACTION_MIN_BYTES / 2
+        }
+        BashOutputFamily::Verification => {
+            has_artifact || text.len() >= TOOL_OUTPUT_COMPACTION_MIN_BYTES
+        }
+        BashOutputFamily::GitStatus | BashOutputFamily::GitDiff => {
+            has_artifact || text.len() >= TOOL_OUTPUT_COMPACTION_MIN_BYTES / 2
+        }
+        BashOutputFamily::Other => false,
+    }
+}
+
+fn summarize_verification_bash_output(
+    command: &str,
+    text: &str,
+    exit_code: i32,
+    artifact_path: Option<&str>,
+) -> Option<String> {
+    let highlights = collect_highlight_lines(
+        text,
+        &[
+            "test result:",
+            "finished",
+            "failures:",
+            "error:",
+            "failed",
+            "passed",
+            "collected",
+        ],
+    );
+    if highlights.is_empty() && artifact_path.is_none() {
+        return None;
+    }
+
+    let status = if exit_code == 0 { "passed" } else { "failed" };
+    let summary = if highlights.is_empty() {
+        "no concise highlights captured".to_string()
+    } else {
+        highlights.join(" || ")
+    };
+    Some(match artifact_path {
+        Some(path) => format!(
+            "[Compacted bash output: {} {status} (exit {exit_code}); highlights={summary}; full={path}]",
+            normalize_compact_value(command, 96),
+        ),
+        None => format!(
+            "[Compacted bash output: {} {status} (exit {exit_code}); highlights={summary}]",
+            normalize_compact_value(command, 96),
+        ),
+    })
+}
+
+fn summarize_git_status_output(
+    command: &str,
+    text: &str,
+    artifact_path: Option<&str>,
+) -> Option<String> {
+    let files = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            line.starts_with("??")
+                || line.starts_with(" M")
+                || line.starts_with("M ")
+                || line.starts_with("A ")
+                || line.starts_with("D ")
+                || line.starts_with("R ")
+        })
+        .map(|line| normalize_compact_value(line, 88))
+        .take(TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS)
+        .collect::<Vec<_>>();
+    if files.is_empty() && artifact_path.is_none() {
+        return None;
+    }
+
+    let preview = if files.is_empty() {
+        "no changed files captured".to_string()
+    } else {
+        files.join(" || ")
+    };
+    Some(match artifact_path {
+        Some(path) => format!(
+            "[Compacted bash output: {} entries={}; full={path}]",
+            normalize_compact_value(command, 64),
+            preview,
+        ),
+        None => format!(
+            "[Compacted bash output: {} entries={preview}]",
+            normalize_compact_value(command, 64),
+        ),
+    })
+}
+
+fn summarize_git_diff_output(
+    command: &str,
+    text: &str,
+    artifact_path: Option<&str>,
+) -> Option<String> {
+    let files = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("diff --git a/"))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|path| normalize_compact_value(path, 88))
+        .take(TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS)
+        .collect::<Vec<_>>();
+    if files.is_empty() && artifact_path.is_none() {
+        return None;
+    }
+
+    let preview = if files.is_empty() {
+        "no changed files captured".to_string()
+    } else {
+        files.join(", ")
+    };
+    Some(match artifact_path {
+        Some(path) => format!(
+            "[Compacted bash output: {} files={preview}; full={path}]",
+            normalize_compact_value(command, 64),
+        ),
+        None => format!(
+            "[Compacted bash output: {} files={preview}]",
+            normalize_compact_value(command, 64),
+        ),
+    })
+}
+
+fn text_output_from_tool_blocks(blocks: &[ContentBlock]) -> Option<String> {
+    let mut out = String::new();
+    let mut saw_text = false;
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text) => {
+                if saw_text {
+                    out.push('\n');
+                }
+                out.push_str(&text.text);
+                saw_text = true;
+            }
+            _ => return None,
+        }
+    }
+    saw_text.then_some(out)
+}
+
+fn collect_highlight_lines(text: &str, patterns: &[&str]) -> Vec<String> {
+    let mut seen = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !patterns.iter().any(|pattern| lower.contains(pattern)) {
+            continue;
+        }
+        let normalized = normalize_compact_value(trimmed, 120);
+        if seen.iter().any(|existing| existing == &normalized) {
+            continue;
+        }
+        seen.push(normalized);
+        if seen.len() >= TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS {
+            break;
+        }
+    }
+    seen
+}
+
+fn tool_output_exit_code(details: Option<&Value>, is_error: bool) -> i32 {
+    details
+        .and_then(|value| value.get("exitCode"))
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
+        .unwrap_or_else(|| i32::from(is_error))
+}
+
+fn ensure_output_artifact_path(
+    tool_name: &str,
+    text: &str,
+    details: &mut Option<Value>,
+) -> Option<String> {
+    if let Some(path) = details
+        .as_ref()
+        .and_then(|value| value.get("fullOutputPath"))
+        .and_then(Value::as_str)
+    {
+        return Some(path.to_string());
+    }
+    if text.len() < TOOL_OUTPUT_COMPACTION_MIN_BYTES {
+        return None;
+    }
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!("pi-{tool_name}-"))
+        .suffix(".log")
+        .tempfile()
+        .ok()?;
+    temp.write_all(text.as_bytes()).ok()?;
+    let path = temp.into_temp_path().keep().ok()?;
+    let path_string = path.display().to_string();
+    ensure_tool_output_details_object(details).insert(
+        "fullOutputPath".to_string(),
+        Value::String(path_string.clone()),
+    );
+    Some(path_string)
+}
+
+fn annotate_tool_output_compaction(
+    details: &mut Option<Value>,
+    family: BashOutputFamily,
+    artifact_path: Option<&str>,
+) {
+    let family = match family {
+        BashOutputFamily::Verification => "verification",
+        BashOutputFamily::GitStatus => "git_status",
+        BashOutputFamily::GitDiff => "git_diff",
+        BashOutputFamily::Other => "other",
+    };
+    ensure_tool_output_details_object(details).insert(
+        "outputCompaction".to_string(),
+        json!({
+            "family": family,
+            "strategy": "semantic_summary",
+            "artifactBacked": artifact_path.is_some(),
+        }),
+    );
+}
+
+fn ensure_tool_output_details_object(
+    details: &mut Option<Value>,
+) -> &mut serde_json::Map<String, Value> {
+    let replacement = match details.take() {
+        Some(Value::Object(map)) => Value::Object(map),
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("originalDetails".to_string(), other);
+            Value::Object(map)
+        }
+        None => Value::Object(serde_json::Map::new()),
+    };
+    *details = Some(replacement);
+    details
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("details should be an object")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1885,6 +2231,8 @@ impl Agent {
             self.execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
                 .await
         };
+
+        maybe_compact_tool_output(&tool_call, &mut output, is_error);
 
         if let Some(extensions) = &extensions {
             Self::record_builtin_bash_mediation(extensions, &tool_call, &output);
@@ -7338,6 +7686,100 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0].name, "read");
         assert_eq!(tool_calls[1].name, "bash");
+    }
+
+    #[test]
+    fn compact_bash_output_summarizes_successful_verification_logs() {
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({"command": "cargo test --lib"}),
+            thought_signature: None,
+        };
+        let verbose = format!(
+            "{}\ntest result: ok. 48 passed; 0 failed\nFinished `test` profile",
+            "running detailed cargo output".repeat(64)
+        );
+        let mut output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(verbose))],
+            details: Some(json!({
+                "exitCode": 0,
+                "fullOutputPath": "/tmp/pi-cargo-test.log",
+            })),
+            is_error: false,
+        };
+
+        maybe_compact_tool_output(&tool_call, &mut output, false);
+
+        let text = text_output_from_tool_blocks(&output.content).expect("text output");
+        assert!(text.contains("Compacted bash output"));
+        assert!(text.contains("cargo test --lib passed"));
+        assert!(text.contains("test result: ok."));
+        assert_eq!(
+            output
+                .details
+                .as_ref()
+                .and_then(|details| details.get("outputCompaction"))
+                .and_then(|value| value.get("family"))
+                .and_then(Value::as_str),
+            Some("verification")
+        );
+    }
+
+    #[test]
+    fn compact_bash_output_summarizes_git_diff() {
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({"command": "git diff -- src/agent.rs src/session.rs"}),
+            thought_signature: None,
+        };
+        let mut output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(
+                "diff --git a/src/agent.rs b/src/agent.rs\n@@ -1,1 +1,1 @@\n\
+                 diff --git a/src/session.rs b/src/session.rs\n@@ -1,1 +1,1 @@\n",
+            ))],
+            details: Some(json!({
+                "exitCode": 0,
+                "fullOutputPath": "/tmp/pi-git-diff.log",
+            })),
+            is_error: false,
+        };
+
+        maybe_compact_tool_output(&tool_call, &mut output, false);
+
+        let text = text_output_from_tool_blocks(&output.content).expect("text output");
+        assert!(text.contains("Compacted bash output"));
+        assert!(text.contains("git diff -- src/agent.rs src/session.rs"));
+        assert!(text.contains("src/agent.rs"));
+        assert!(text.contains("src/session.rs"));
+    }
+
+    #[test]
+    fn compact_bash_output_leaves_small_generic_command_unchanged() {
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({"command": "echo hello"}),
+            thought_signature: None,
+        };
+        let mut output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("hello"))],
+            details: Some(json!({ "exitCode": 0 })),
+            is_error: false,
+        };
+
+        maybe_compact_tool_output(&tool_call, &mut output, false);
+
+        let text = text_output_from_tool_blocks(&output.content).expect("text output");
+        assert_eq!(text, "hello");
+        assert!(
+            output
+                .details
+                .as_ref()
+                .and_then(|details| details.get("outputCompaction"))
+                .is_none()
+        );
     }
 
     #[test]
