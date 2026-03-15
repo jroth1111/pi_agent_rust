@@ -1292,12 +1292,6 @@ fn normalize_command_type(command_type: &str) -> &str {
         "reliability.getStateDigest" | "reliability_get_state_digest" => {
             "reliability.get_state_digest"
         }
-        "orchestration.startRun" | "orchestration_start_run" => "orchestration.start_run",
-        "orchestration.acceptPlan" | "orchestration_accept_plan" => "orchestration.accept_plan",
-        "orchestration.getRun" | "orchestration_get_run" => "orchestration.get_run",
-        "orchestration.dispatchRun" | "orchestration_dispatch_run" => "orchestration.dispatch_run",
-        "orchestration.cancelRun" | "orchestration_cancel_run" => "orchestration.cancel_run",
-        "orchestration.resumeRun" | "orchestration_resume_run" => "orchestration.resume_run",
         _ => command_type,
     }
 }
@@ -12653,46 +12647,35 @@ mod tests {
     }
 
     #[test]
-    fn normalize_command_type_orchestration_aliases() {
+    fn normalize_command_type_orchestration_requires_canonical_names() {
+        assert_eq!(
+            normalize_command_type("orchestration.start_run"),
+            "orchestration.start_run"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration.accept_plan"),
+            "orchestration.accept_plan"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration.get_run"),
+            "orchestration.get_run"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration.dispatch_run"),
+            "orchestration.dispatch_run"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration.cancel_run"),
+            "orchestration.cancel_run"
+        );
+        assert_eq!(
+            normalize_command_type("orchestration.resume_run"),
+            "orchestration.resume_run"
+        );
+
         assert_eq!(
             normalize_command_type("orchestration.startRun"),
-            "orchestration.start_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration_start_run"),
-            "orchestration.start_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration.getRun"),
-            "orchestration.get_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration_get_run"),
-            "orchestration.get_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration.dispatchRun"),
-            "orchestration.dispatch_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration_dispatch_run"),
-            "orchestration.dispatch_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration.cancelRun"),
-            "orchestration.cancel_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration_cancel_run"),
-            "orchestration.cancel_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration.resumeRun"),
-            "orchestration.resume_run"
-        );
-        assert_eq!(
-            normalize_command_type("orchestration_resume_run"),
-            "orchestration.resume_run"
+            "orchestration.startRun"
         );
     }
 
