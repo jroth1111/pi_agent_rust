@@ -126,6 +126,7 @@ pub enum ContinuationReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RunBudgets {
     pub max_parallelism: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +146,7 @@ impl Default for RunBudgets {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RunConstraints {
     #[serde(default)]
     pub invariants: Vec<String>,
@@ -155,6 +157,7 @@ pub struct RunConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSpec {
     pub run_id: RunId,
     pub objective: String,
@@ -171,6 +174,7 @@ pub struct RunSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -383,6 +387,7 @@ impl RunStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanArtifact {
     pub plan_id: PlanId,
     pub digest: String,
@@ -399,6 +404,7 @@ pub struct PlanArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct VerifySpec {
     pub command: String,
     pub timeout_sec: u32,
@@ -407,6 +413,7 @@ pub struct VerifySpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskConstraints {
     #[serde(default)]
     pub invariants: Vec<String>,
@@ -417,6 +424,7 @@ pub struct TaskConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskSpec {
     pub task_id: TaskId,
     pub title: String,
@@ -429,6 +437,7 @@ pub struct TaskSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct LeaseRecord {
     pub lease_id: String,
     pub owner: String,
@@ -437,6 +446,7 @@ pub struct LeaseRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FailureRecord {
     pub code: String,
     pub message: String,
@@ -445,6 +455,7 @@ pub struct FailureRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskRuntime {
     pub state: TaskState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -470,6 +481,7 @@ impl Default for TaskRuntime {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskNode {
     pub spec: TaskSpec,
     pub runtime: TaskRuntime,
@@ -494,12 +506,14 @@ impl TaskNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ArtifactRef {
     pub artifact_id: String,
     pub location: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct JobRecord {
     pub job_id: JobId,
     pub kind: JobKind,
@@ -513,6 +527,7 @@ pub struct JobRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ApprovalCheckpoint {
     pub approval_id: ApprovalId,
     pub reason: String,
@@ -522,6 +537,7 @@ pub struct ApprovalCheckpoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelSelector {
     pub provider: String,
     pub model: String,
@@ -530,6 +546,7 @@ pub struct ModelSelector {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelProfile {
     pub planner: ModelSelector,
     pub executor: ModelSelector,
@@ -539,6 +556,7 @@ pub struct ModelProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSnapshot {
     pub spec: RunSpec,
     pub phase: RunPhase,
