@@ -121,6 +121,7 @@ pub struct SkillHealthReport {
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub latest_digest: String,
+    pub current_digest: String,
     pub run_count: usize,
     pub success_rate: f64,
     pub consecutive_failures: usize,
@@ -251,6 +252,14 @@ impl SkillRunTracker {
                     if let Some(path) = resolve_tool_path(&self.cwd, args) {
                         let canonical = canonicalize_with_fallback(&path);
                         if self.skills_by_path.contains_key(&canonical) {
+                            if let Some(skill) = self.skills_by_path.get(&canonical).cloned() {
+                                self.activations.entry(skill.name.clone()).or_insert(
+                                    ActivatedSkill {
+                                        skill,
+                                        source: SkillActivationSource::ReadTool,
+                                    },
+                                );
+                            }
                             self.pending_skill_reads
                                 .insert(tool_call_id.clone(), canonical);
                         }
@@ -420,6 +429,7 @@ fn build_skill_health_report(
     criteria: &SkillSuccessCriteria,
 ) -> SkillHealthReport {
     let latest = entries.last().expect("skill entries should not be empty");
+    let current_digest = file_digest(&latest.skill_path);
     let run_count = entries.len();
     let success_rate = success_rate(entries);
     let consecutive_failures = entries
@@ -427,8 +437,35 @@ fn build_skill_health_report(
         .rev()
         .take_while(|entry| !entry.outcome.is_success())
         .count();
-    let evidence = summarize_evidence(entries);
-    let proposed_guardrails = recommend_guardrails(entries);
+    let mut evidence = summarize_evidence(entries);
+    let mut proposed_guardrails = recommend_guardrails(entries);
+
+    let has_unobserved_revision =
+        current_digest != "missing" && current_digest != latest.skill_digest;
+    if has_unobserved_revision {
+        evidence.insert(
+            0,
+            format!(
+                "Current skill revision has not been observed yet; collect at least {} post-amend runs before judging it.",
+                criteria.min_post_amend_runs
+            ),
+        );
+        proposed_guardrails.clear();
+        return SkillHealthReport {
+            skill_name: latest.skill_name.clone(),
+            skill_path: latest.skill_path.clone(),
+            latest_digest: latest.skill_digest.clone(),
+            current_digest,
+            run_count,
+            success_rate,
+            consecutive_failures,
+            status: SkillHealthStatus::PendingData,
+            evidence,
+            proposed_guardrails,
+            previous_success_rate: Some(success_rate),
+            latest_success_rate: None,
+        };
+    }
 
     let unhealthy = run_count >= criteria.min_sample_size
         && (success_rate < criteria.min_success_rate
@@ -436,11 +473,18 @@ fn build_skill_health_report(
 
     let (status, previous_success_rate, latest_success_rate) =
         evaluate_latest_revision(entries, criteria, unhealthy);
+    if matches!(
+        status,
+        SkillHealthStatus::Healthy | SkillHealthStatus::Improved
+    ) {
+        proposed_guardrails.clear();
+    }
 
     SkillHealthReport {
         skill_name: latest.skill_name.clone(),
         skill_path: latest.skill_path.clone(),
         latest_digest: latest.skill_digest.clone(),
+        current_digest,
         run_count,
         success_rate,
         consecutive_failures,
@@ -715,6 +759,13 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
             .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             writeln!(out, "  path: {}", skill.skill_path.display())
                 .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            if skill.current_digest != skill.latest_digest {
+                writeln!(
+                    out,
+                    "  revision: current digest differs from latest observed digest; awaiting fresh observations"
+                )
+                .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            }
             if !skill.evidence.is_empty() {
                 writeln!(out, "  evidence: {}", skill.evidence.join("; "))
                     .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
@@ -1097,5 +1148,202 @@ mod tests {
             observations[0].activation_source,
             SkillActivationSource::ReadTool
         );
+    }
+
+    #[test]
+    fn tracker_records_failed_skill_read_as_observation() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir.path().join("summarize").join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: summarize\ndescription: summarize text\n---\nDo it\n",
+        )
+        .expect("write skill");
+        let skills = vec![Skill {
+            name: "summarize".to_string(),
+            description: "summarize text".to_string(),
+            file_path: skill_path.clone(),
+            base_dir: skill_path.parent().expect("parent").to_path_buf(),
+            source: "project".to_string(),
+            disable_model_invocation: false,
+        }];
+        let mut tracker =
+            SkillRunTracker::new(dir.path().to_path_buf(), "summarize this", &skills, None);
+        tracker.observe_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "read-1".to_string(),
+            tool_name: "read".to_string(),
+            args: json!({ "file_path": skill_path.display().to_string() }),
+        });
+        tracker.observe_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "read-1".to_string(),
+            tool_name: "read".to_string(),
+            result: sample_tool_error("No such file or directory"),
+            is_error: true,
+        });
+        let observations = tracker.observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].activation_source,
+            SkillActivationSource::ReadTool
+        );
+        assert_eq!(observations[0].outcome, SkillRunOutcome::ToolFailure);
+        assert!(
+            observations[0]
+                .tool_failures
+                .iter()
+                .any(|failure| failure.tool_name == "read")
+        );
+    }
+
+    #[test]
+    fn doctor_fix_then_pending_then_improved() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("bug-triage")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: bug-triage\ndescription: triage bugs\n---\nUse bash\n",
+        )
+        .expect("write skill");
+        let original_digest = file_digest(&skill_path);
+
+        let failing_entries = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                session_id: None,
+                skill_name: "bug-triage".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "fix".to_string(),
+                outcome: SkillRunOutcome::ToolFailure,
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "bash".to_string(),
+                    signature: "cargo: command not found".to_string(),
+                    message: "cargo: command not found".to_string(),
+                }],
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                session_id: None,
+                skill_name: "bug-triage".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "fix again".to_string(),
+                outcome: SkillRunOutcome::ToolFailure,
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "bash".to_string(),
+                    signature: "cargo: command not found".to_string(),
+                    message: "cargo: command not found".to_string(),
+                }],
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                session_id: None,
+                skill_name: "bug-triage".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "fix once more".to_string(),
+                outcome: SkillRunOutcome::ToolFailure,
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "bash".to_string(),
+                    signature: "cargo: command not found".to_string(),
+                    message: "cargo: command not found".to_string(),
+                }],
+                agent_error: None,
+            },
+        ];
+        append_jsonl_records(&skill_observation_ledger_path(dir.path()), &failing_entries)
+            .expect("write failing observations");
+
+        let fixed_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
+        assert_eq!(fixed_report.applied_amendments.len(), 1);
+        let amended_skill = fs::read_to_string(&skill_path).expect("read amended skill");
+        assert!(amended_skill.contains(GUARDRAIL_BLOCK_BEGIN));
+
+        let pending_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let pending_skill = pending_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "bug-triage")
+            .expect("pending skill report");
+        assert_eq!(pending_skill.status, SkillHealthStatus::PendingData);
+        assert_ne!(pending_skill.current_digest, pending_skill.latest_digest);
+        assert!(pending_skill.proposed_guardrails.is_empty());
+
+        let amended_digest = file_digest(&skill_path);
+        let successful_entries = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
+                session_id: None,
+                skill_name: "bug-triage".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "fix after amendment".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
+                session_id: None,
+                skill_name: "bug-triage".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "fix after amendment again".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
+                session_id: None,
+                skill_name: "bug-triage".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest,
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "fix after amendment one more time".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+        ];
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &successful_entries,
+        )
+        .expect("write successful observations");
+
+        let improved_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let improved_skill = improved_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "bug-triage")
+            .expect("improved skill report");
+        assert_eq!(improved_skill.status, SkillHealthStatus::Improved);
+        assert_eq!(improved_skill.previous_success_rate, Some(0.0));
+        assert_eq!(improved_skill.latest_success_rate, Some(1.0));
+        assert!(improved_skill.proposed_guardrails.is_empty());
     }
 }

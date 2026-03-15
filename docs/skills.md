@@ -88,6 +88,8 @@ pi skills doctor --fix
 
 Applied amendments are written to `.pi/skill-amendments.jsonl`.
 
+If a skill has been amended but the new revision has not been observed yet, `pi skills doctor` reports that skill as `PendingData` instead of continuing to judge the old revision as current.
+
 ### Success Criteria
 
 - Minimum sample size: 3 observed runs per skill version
