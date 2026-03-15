@@ -9422,6 +9422,7 @@ mod tests {
     fn orchestration_run_id_availability_rejects_cached_and_persisted_runs() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let store = RunStore::new(temp_dir.path().to_path_buf());
+        let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
         let mut orchestration = RpcOrchestrationState::default();
         let cached_run = RunStatus::new("run-cached", "Cached", ExecutionTier::Inline);
         orchestration.register_run(cached_run);
@@ -9429,15 +9430,38 @@ mod tests {
         let persisted_run = RunStatus::new("run-persisted", "Persisted", ExecutionTier::Inline);
         store.save(&persisted_run).expect("save persisted run");
 
-        let cached_err = ensure_run_id_available(&orchestration, &store, "run-cached")
-            .expect_err("cached run should conflict");
+        let cached_err =
+            ensure_run_id_available(&orchestration, &store, &runtime_store, "run-cached")
+                .expect_err("cached run should conflict");
         assert!(cached_err.to_string().contains("already exists"));
 
-        let persisted_err = ensure_run_id_available(&orchestration, &store, "run-persisted")
-            .expect_err("persisted run should conflict");
+        let persisted_err =
+            ensure_run_id_available(&orchestration, &store, &runtime_store, "run-persisted")
+                .expect_err("persisted run should conflict");
         assert!(persisted_err.to_string().contains("already exists"));
 
-        assert!(ensure_run_id_available(&orchestration, &store, "run-new").is_ok());
+        let runtime_snapshot = RunSnapshot::new(RunSpec {
+            run_id: "run-runtime".to_string(),
+            objective: "Runtime".to_string(),
+            root_workspace: PathBuf::from("/tmp/runtime"),
+            policy_profile: "default".to_string(),
+            model_profile: "default".to_string(),
+            run_verify_command: Some("cargo test".to_string()),
+            run_verify_timeout_sec: Some(60),
+            budgets: RunBudgets::default(),
+            constraints: RunConstraints::default(),
+            created_at: Utc::now(),
+        });
+        runtime_store
+            .save_snapshot(&runtime_snapshot)
+            .expect("save runtime snapshot");
+
+        let runtime_err =
+            ensure_run_id_available(&orchestration, &store, &runtime_store, "run-runtime")
+                .expect_err("runtime run should conflict");
+        assert!(runtime_err.to_string().contains("already exists"));
+
+        assert!(ensure_run_id_available(&orchestration, &store, &runtime_store, "run-new").is_ok());
     }
 
     #[test]
