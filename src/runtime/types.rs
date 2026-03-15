@@ -542,6 +542,12 @@ pub struct ModelProfile {
 pub struct RunSnapshot {
     pub spec: RunSpec,
     pub phase: RunPhase,
+    #[serde(default)]
+    pub plan_required: bool,
+    #[serde(default)]
+    pub plan_accepted: bool,
+    #[serde(default = "RunSnapshot::default_auto_proceed_after_planning")]
+    pub auto_proceed_after_planning: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanArtifact>,
     #[serde(default)]
@@ -563,11 +569,18 @@ pub struct RunSnapshot {
 }
 
 impl RunSnapshot {
+    const fn default_auto_proceed_after_planning() -> bool {
+        true
+    }
+
     pub fn new(spec: RunSpec) -> Self {
         let now = Utc::now();
         Self {
             spec,
             phase: RunPhase::Created,
+            plan_required: false,
+            plan_accepted: false,
+            auto_proceed_after_planning: Self::default_auto_proceed_after_planning(),
             plan: None,
             tasks: BTreeMap::new(),
             jobs: BTreeMap::new(),
@@ -580,6 +593,10 @@ impl RunSnapshot {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    pub fn task_ids(&self) -> Vec<String> {
+        self.tasks.keys().cloned().collect()
     }
 }
 

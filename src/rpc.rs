@@ -1725,7 +1725,7 @@ async fn bootstrap_runtime_run(
         budgets: RunBudgets {
             max_parallelism: req
                 .max_parallelism
-                .unwrap_or(RunStatus::DEFAULT_MAX_PARALLELISM),
+                .unwrap_or(RunBudgets::default().max_parallelism),
             max_steps: None,
             max_cost_microusd: None,
         },
@@ -1737,7 +1737,12 @@ async fn bootstrap_runtime_run(
     let route = ModelRoute::from_profile(&model_profile);
     let mut controller = RuntimeController::new(PhaseModelRouter::new(route), PolicySet::new());
     let mut output = controller
-        .handle(RuntimeCommand::BootstrapRun { spec, plan, tasks })
+        .handle(RuntimeCommand::BootstrapRun {
+            spec,
+            plan,
+            tasks,
+            auto_proceed_after_planning: true,
+        })
         .map_err(|err| Error::session(format!("runtime bootstrap failed: {err}")))?;
     output.snapshot.dispatch.selected_tier = selected_tier;
     Ok(output)

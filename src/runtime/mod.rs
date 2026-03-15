@@ -8,6 +8,7 @@ pub mod controller;
 pub mod events;
 pub mod model_routing;
 pub mod policy;
+pub mod scheduler;
 pub mod state_machine;
 pub mod store;
 pub mod types;

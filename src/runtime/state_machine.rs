@@ -64,20 +64,38 @@ impl RuntimeStateMachine {
         match event.kind {
             RuntimeEventKind::RunCreated => {
                 self.snapshot.phase = RunPhase::Created;
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.next_action = Some("start planning".to_string());
             }
             RuntimeEventKind::PlanningStarted => {
                 self.snapshot.phase = RunPhase::Planning;
+                self.snapshot.plan_required = true;
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.next_action = Some("materialize plan".to_string());
             }
             RuntimeEventKind::PlanAccepted { plan, tasks } => {
-                self.snapshot.phase = RunPhase::Dispatching;
+                self.snapshot.plan_required = true;
+                self.snapshot.plan_accepted = true;
+                self.snapshot.phase = if self.snapshot.auto_proceed_after_planning {
+                    RunPhase::Dispatching
+                } else {
+                    RunPhase::Planning
+                };
                 self.snapshot.plan = Some(plan);
                 self.install_tasks(tasks);
-                self.snapshot.summary.next_action = Some("dispatch ready tasks".to_string());
+                self.snapshot.wake_at = None;
+                self.snapshot.summary.next_action = Some(
+                    if self.snapshot.auto_proceed_after_planning {
+                        "dispatch ready tasks"
+                    } else {
+                        "await explicit dispatch after planning"
+                    }
+                    .to_string(),
+                );
             }
             RuntimeEventKind::PhaseChanged { phase, summary } => {
                 self.snapshot.phase = phase;
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.next_action = summary;
             }
             RuntimeEventKind::TaskStateChanged {
@@ -104,6 +122,8 @@ impl RuntimeStateMachine {
                     self.snapshot.phase = RunPhase::AwaitingHuman;
                 } else if matches!(state, TaskState::Recoverable) {
                     self.snapshot.phase = RunPhase::Recovering;
+                } else {
+                    self.snapshot.wake_at = None;
                 }
                 self.rebuild_ready_queue();
                 self.snapshot.summary.next_action =
@@ -111,6 +131,7 @@ impl RuntimeStateMachine {
             }
             RuntimeEventKind::ApprovalRequested { checkpoint } => {
                 self.snapshot.phase = RunPhase::AwaitingHuman;
+                self.snapshot.wake_at = None;
                 self.snapshot
                     .approvals
                     .insert(checkpoint.approval_id.clone(), checkpoint);
@@ -128,6 +149,7 @@ impl RuntimeStateMachine {
                 } else {
                     RunPhase::AwaitingHuman
                 };
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.next_action = if matches!(state, ApprovalState::Approved) {
                     Some("resume recovered work".to_string())
                 } else {
@@ -140,15 +162,18 @@ impl RuntimeStateMachine {
             }
             RuntimeEventKind::RunCompleted => {
                 self.snapshot.phase = RunPhase::Completed;
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.next_action = None;
             }
             RuntimeEventKind::RunFailed { reason } => {
                 self.snapshot.phase = RunPhase::Failed;
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.blockers.push(reason);
                 self.snapshot.summary.next_action = None;
             }
             RuntimeEventKind::RunCanceled { reason } => {
                 self.snapshot.phase = RunPhase::Canceled;
+                self.snapshot.wake_at = None;
                 self.snapshot.summary.blockers.push(reason);
                 self.snapshot.summary.next_action = None;
             }
