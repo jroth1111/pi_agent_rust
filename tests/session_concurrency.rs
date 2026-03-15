@@ -157,7 +157,7 @@ fn test_concurrent_writers_no_corruption() {
                     loop {
                         match session.save().await {
                             Ok(()) => break,
-                            Err(e) if retry_count < 10 => {
+                            Err(_e) if retry_count < 10 => {
                                 retry_count += 1;
                                 thread::sleep(Duration::from_millis(10));
                                 continue;

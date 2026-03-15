@@ -37,6 +37,16 @@ use crate::reliability;
 use crate::reliability::ArtifactStore;
 use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
+use crate::runtime::controller::{
+    ControllerOutput as RuntimeControllerOutput, RuntimeCommand, RuntimeController,
+};
+use crate::runtime::model_routing::{ModelRoute, PhaseModelRouter};
+use crate::runtime::policy::PolicySet;
+use crate::runtime::store::RuntimeStore;
+use crate::runtime::types::{
+    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints, RunSpec,
+    TaskConstraints, TaskNode, TaskSpec, VerifySpec,
+};
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
@@ -44,12 +54,13 @@ use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
+use chrono::Utc;
 use memchr::memchr_iter;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -1346,6 +1357,250 @@ async fn persist_run_status(
     }
     guard.persist_session().await?;
     Ok(())
+}
+
+async fn persist_runtime_bootstrap(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    runtime_store: &RuntimeStore,
+    output: &RuntimeControllerOutput,
+) -> Result<()> {
+    runtime_store.append_events(&output.events)?;
+    runtime_store.save_snapshot(&output.snapshot)?;
+
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        inner_session.append_custom_entry(
+            "runtime_run_snapshot".to_string(),
+            Some(json!(output.snapshot.clone())),
+        );
+    }
+    guard.persist_session().await?;
+    Ok(())
+}
+
+fn runtime_model_selector(
+    entry: &ModelEntry,
+    thinking_level: Option<crate::model::ThinkingLevel>,
+) -> ModelSelector {
+    let thinking_level = thinking_level
+        .map(|level| entry.clamp_thinking_level(level))
+        .filter(|level| *level != crate::model::ThinkingLevel::Off)
+        .map(|level| level.to_string());
+    ModelSelector {
+        provider: entry.model.provider.clone(),
+        model: entry.model.id.clone(),
+        thinking_level,
+    }
+}
+
+async fn runtime_model_profile_for_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    options: &RpcOptions,
+) -> Result<ModelProfile> {
+    let (current_entry, current_thinking) = {
+        let guard = session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        let inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        let thinking = inner_session
+            .header
+            .thinking_level
+            .as_deref()
+            .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
+        (
+            current_model_entry(&inner_session, options).cloned(),
+            thinking,
+        )
+    };
+
+    let default_entry = current_entry
+        .clone()
+        .or_else(|| {
+            options
+                .scoped_models
+                .first()
+                .map(|scoped| scoped.model.clone())
+        })
+        .or_else(|| options.available_models.first().cloned())
+        .ok_or_else(|| {
+            Error::validation(
+                "No available models configured for runtime orchestration".to_string(),
+            )
+        })?;
+
+    let planner_entry = current_entry
+        .clone()
+        .filter(|entry| entry.model.reasoning)
+        .or_else(|| {
+            options
+                .scoped_models
+                .iter()
+                .find(|scoped| scoped.model.model.reasoning)
+                .map(|scoped| scoped.model.clone())
+        })
+        .or_else(|| {
+            options
+                .available_models
+                .iter()
+                .find(|entry| entry.model.reasoning)
+                .cloned()
+        })
+        .unwrap_or_else(|| default_entry.clone());
+
+    let background_entry = options
+        .available_models
+        .iter()
+        .find(|entry| !entry.model.reasoning)
+        .cloned()
+        .unwrap_or_else(|| default_entry.clone());
+
+    Ok(ModelProfile {
+        planner: runtime_model_selector(
+            &planner_entry,
+            current_thinking.or(Some(crate::model::ThinkingLevel::High)),
+        ),
+        executor: runtime_model_selector(&default_entry, current_thinking),
+        verifier: runtime_model_selector(&default_entry, current_thinking),
+        summarizer: runtime_model_selector(&background_entry, None),
+        background: runtime_model_selector(&background_entry, None),
+    })
+}
+
+fn runtime_plan_digest(req: &StartRunRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(req.objective.as_bytes());
+    hasher.update(req.run_verify_command.as_bytes());
+    for task in &req.tasks {
+        hasher.update(task.task_id.as_bytes());
+        hasher.update(task.objective.as_bytes());
+        hasher.update(task.verify_command.as_bytes());
+        for prereq in &task.prerequisites {
+            hasher.update(prereq.task_id.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn build_runtime_plan_artifact(run_id: &str, req: &StartRunRequest) -> PlanArtifact {
+    let mut test_strategy = BTreeSet::new();
+    test_strategy.insert(req.run_verify_command.clone());
+    for task in &req.tasks {
+        if !task.verify_command.trim().is_empty() {
+            test_strategy.insert(task.verify_command.clone());
+        }
+    }
+
+    PlanArtifact {
+        plan_id: format!("{run_id}-plan"),
+        digest: runtime_plan_digest(req),
+        objective: req.objective.clone(),
+        task_drafts: req
+            .tasks
+            .iter()
+            .map(|task| format!("{}: {}", task.task_id, task.objective))
+            .collect(),
+        touched_paths: req
+            .tasks
+            .iter()
+            .flat_map(|task| task.planned_touches.iter().map(PathBuf::from))
+            .collect(),
+        test_strategy: test_strategy.into_iter().collect(),
+        evidence_refs: Vec::new(),
+        produced_at: Utc::now(),
+    }
+}
+
+fn build_runtime_task_nodes(
+    req: &StartRunRequest,
+    default_verify_timeout_sec: u32,
+) -> Vec<TaskNode> {
+    req.tasks
+        .iter()
+        .map(|task| {
+            let verify_command = if task.verify_command.trim().is_empty() {
+                req.run_verify_command.clone()
+            } else {
+                task.verify_command.clone()
+            };
+            let verify_timeout_sec = task
+                .verify_timeout_sec
+                .unwrap_or(default_verify_timeout_sec);
+            let mut node = TaskNode::new(TaskSpec {
+                task_id: task.task_id.clone(),
+                title: task.task_id.clone(),
+                objective: task.objective.clone(),
+                planned_touches: task.planned_touches.iter().map(PathBuf::from).collect(),
+                verify: VerifySpec {
+                    command: verify_command,
+                    timeout_sec: verify_timeout_sec,
+                    acceptance_ids: task.acceptance_ids.clone(),
+                },
+                autonomy: AutonomyLevel::Guarded,
+                constraints: TaskConstraints {
+                    invariants: task.invariants.clone(),
+                    max_touched_files: task.max_touched_files,
+                    forbid_paths: task.forbid_paths.clone(),
+                },
+            });
+            node.deps = task
+                .prerequisites
+                .iter()
+                .map(|prereq| prereq.task_id.clone())
+                .collect();
+            node
+        })
+        .collect()
+}
+
+async fn bootstrap_runtime_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    options: &RpcOptions,
+    run_id: &str,
+    req: &StartRunRequest,
+) -> Result<RuntimeControllerOutput> {
+    let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
+    let run_verify_timeout_sec = req
+        .run_verify_timeout_sec
+        .unwrap_or(options.config.reliability_verify_timeout_sec_default());
+    let spec = RunSpec {
+        run_id: run_id.to_string(),
+        objective: req.objective.clone(),
+        root_workspace: std::env::current_dir().map_err(|err| Error::Io(Box::new(err)))?,
+        policy_profile: "default".to_string(),
+        model_profile: "current_session".to_string(),
+        budgets: RunBudgets {
+            max_parallelism: req
+                .max_parallelism
+                .unwrap_or(RunStatus::DEFAULT_MAX_PARALLELISM),
+            max_steps: None,
+            max_cost_microusd: None,
+        },
+        constraints: RunConstraints::default(),
+        created_at: Utc::now(),
+    };
+    let plan = build_runtime_plan_artifact(run_id, req);
+    let tasks = build_runtime_task_nodes(req, run_verify_timeout_sec);
+    let route = ModelRoute::from_profile(&model_profile);
+    let mut controller = RuntimeController::new(PhaseModelRouter::new(route), PolicySet::new());
+    controller
+        .handle(RuntimeCommand::BootstrapRun { spec, plan, tasks })
+        .map_err(|err| Error::session(format!("runtime bootstrap failed: {err}")))
 }
 
 async fn append_dispatch_grants_session_entries(
@@ -4029,6 +4284,7 @@ pub async fn run(
     let reliability_state = Arc::new(Mutex::new(RpcReliabilityState::new(&options.config)?));
     let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
     let run_store = RunStore::from_global_dir();
+    let runtime_store = RuntimeStore::from_global_dir();
 
     {
         use futures::future::BoxFuture;
@@ -4559,6 +4815,30 @@ pub async fn run(
                     Ok::<(), Error>(())
                 };
                 if let Err(err) = result {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.start_run",
+                        &err,
+                    ));
+                    continue;
+                }
+
+                let runtime_bootstrap =
+                    match bootstrap_runtime_run(&cx, &session, &options, &run_id, &req).await {
+                        Ok(output) => output,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.start_run",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+                if let Err(err) =
+                    persist_runtime_bootstrap(&cx, &session, &runtime_store, &runtime_bootstrap)
+                        .await
+                {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.start_run",
@@ -12748,6 +13028,87 @@ mod tests {
         let resolved = current_model_entry(&session, &options).expect("resolve aliased model");
         assert_eq!(resolved.model.provider, "openrouter");
         assert_eq!(resolved.model.id, "gpt-4o-mini");
+    }
+
+    fn sample_start_run_request() -> StartRunRequest {
+        StartRunRequest {
+            run_id: Some("run-123".to_string()),
+            objective: "Ship runtime bootstrap".to_string(),
+            tasks: vec![
+                TaskContract {
+                    task_id: "task-a".to_string(),
+                    objective: "Build the runtime snapshot".to_string(),
+                    parent_goal_trace_id: Some("goal-1".to_string()),
+                    invariants: vec!["keep it durable".to_string()],
+                    max_touched_files: Some(3),
+                    forbid_paths: vec!["target/".to_string()],
+                    verify_command: String::new(),
+                    verify_timeout_sec: None,
+                    max_attempts: Some(2),
+                    input_snapshot: None,
+                    acceptance_ids: vec!["acc-a".to_string()],
+                    planned_touches: vec!["src/runtime/controller.rs".to_string()],
+                    prerequisites: Vec::new(),
+                    enforce_symbol_drift_check: false,
+                },
+                TaskContract {
+                    task_id: "task-b".to_string(),
+                    objective: "Persist runtime events".to_string(),
+                    parent_goal_trace_id: None,
+                    invariants: Vec::new(),
+                    max_touched_files: None,
+                    forbid_paths: Vec::new(),
+                    verify_command: "cargo test runtime_store".to_string(),
+                    verify_timeout_sec: Some(90),
+                    max_attempts: None,
+                    input_snapshot: None,
+                    acceptance_ids: vec!["acc-b".to_string()],
+                    planned_touches: vec!["src/runtime/store.rs".to_string()],
+                    prerequisites: vec![TaskPrerequisite {
+                        task_id: "task-a".to_string(),
+                        trigger: reliability::EdgeTrigger::OnSuccess,
+                    }],
+                    enforce_symbol_drift_check: false,
+                },
+            ],
+            run_verify_command: "cargo test runtime".to_string(),
+            run_verify_timeout_sec: Some(45),
+            max_parallelism: Some(2),
+        }
+    }
+
+    #[test]
+    fn build_runtime_plan_artifact_collects_tasks_and_verify_commands() {
+        let request = sample_start_run_request();
+        let plan = build_runtime_plan_artifact("run-123", &request);
+
+        assert_eq!(plan.plan_id, "run-123-plan");
+        assert_eq!(plan.task_drafts.len(), 2);
+        assert!(plan.digest.len() >= 32);
+        assert!(
+            plan.test_strategy
+                .iter()
+                .any(|command| command == "cargo test runtime")
+        );
+        assert!(
+            plan.test_strategy
+                .iter()
+                .any(|command| command == "cargo test runtime_store")
+        );
+    }
+
+    #[test]
+    fn build_runtime_task_nodes_preserves_dependencies_and_verify_defaults() {
+        let request = sample_start_run_request();
+        let tasks = build_runtime_task_nodes(&request, 45);
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].spec.verify.command, "cargo test runtime");
+        assert_eq!(tasks[0].spec.verify.timeout_sec, 45);
+        assert_eq!(tasks[0].spec.constraints.max_touched_files, Some(3));
+        assert_eq!(tasks[1].deps, vec!["task-a".to_string()]);
+        assert_eq!(tasks[1].spec.verify.command, "cargo test runtime_store");
+        assert_eq!(tasks[1].spec.verify.timeout_sec, 90);
     }
 
     #[test]
