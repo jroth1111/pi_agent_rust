@@ -18,6 +18,7 @@ use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
 use crate::config::{Config, ReliabilityEnforcementMode};
+use crate::context::assemble_reliability_runtime_context;
 use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
@@ -2699,6 +2700,12 @@ async fn cancel_live_run_tasks_and_sync(
 const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const MAX_AUTOMATED_RECOVERABLE_WAIT: Duration = Duration::from_secs(60);
 const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
+const INLINE_WORKER_CONTEXT_BUDGET_TOKENS: usize = 900;
+const INLINE_WORKER_CODE_RETRIEVAL_BUDGET_TOKENS: usize = 220;
+const INLINE_WORKER_MAX_TARGET_FILES: usize = 3;
+const INLINE_WORKER_MAX_RELATED_FILES_PER_TARGET: usize = 4;
+const INLINE_WORKER_MAX_SYMBOL_LINES: usize = 6;
+const INLINE_WORKER_MAX_EVIDENCE_ITEMS: usize = 3;
 
 fn next_recoverable_retry_delay(
     reliability: &RpcReliabilityState,
@@ -2778,7 +2785,12 @@ struct TaskVerificationOutcome {
 #[allow(dead_code)]
 #[async_trait]
 trait OrchestrationInlineWorker: Send + Sync {
-    async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String>;
+    async fn execute(
+        &self,
+        workspace_path: &Path,
+        task: &TaskContract,
+        prompt_context: &InlineTaskPromptContext,
+    ) -> Result<String>;
 }
 
 #[allow(dead_code)]
@@ -2797,7 +2809,12 @@ impl RpcSessionInlineWorker {
 #[allow(dead_code)]
 #[async_trait]
 impl OrchestrationInlineWorker for RpcSessionInlineWorker {
-    async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+    async fn execute(
+        &self,
+        workspace_path: &Path,
+        task: &TaskContract,
+        prompt_context: &InlineTaskPromptContext,
+    ) -> Result<String> {
         let tools = crate::tools::ToolRegistry::new(
             &INLINE_WORKER_TOOLS,
             workspace_path,
@@ -2813,10 +2830,17 @@ impl OrchestrationInlineWorker for RpcSessionInlineWorker {
             false,
             ResolvedCompactionSettings::default(),
         );
-        let prompt = automation_worker_prompt(task);
+        let prompt = automation_worker_prompt(task, prompt_context);
         let message = session.run_text(prompt, |_| {}).await?;
         Ok(assistant_message_summary(&message))
     }
+}
+
+#[derive(Debug, Clone)]
+struct InlineTaskPromptContext {
+    latest_evidence: String,
+    compacted_state_digest: String,
+    code_retrieval: String,
 }
 
 #[allow(dead_code)]
@@ -2834,7 +2858,51 @@ fn assistant_message_summary(message: &AssistantMessage) -> String {
 }
 
 #[allow(dead_code)]
-fn automation_worker_prompt(task: &TaskContract) -> String {
+fn automation_worker_prompt(
+    task: &TaskContract,
+    prompt_context: &InlineTaskPromptContext,
+) -> String {
+    let critical_rules = [
+        "You are executing one isolated orchestration task inside a git worktree.",
+        "Complete only the assigned task and keep the diff minimal.",
+        "Start from the supplied code retrieval bundle before using grep/find/ls.",
+        "Prefer direct reads on the cited files and only widen search when the bundle leaves a real gap.",
+        "Run the verify command after edits when the workspace is consistent.",
+        "Finish with a short plain-language summary of changed files and verification status.",
+    ]
+    .join("\n");
+    let active_task_contract = render_active_task_contract(task);
+    let runtime_context = assemble_reliability_runtime_context(
+        INLINE_WORKER_CONTEXT_BUDGET_TOKENS,
+        reliability::RetrievalContextInput {
+            critical_rules,
+            active_task_contract,
+            latest_evidence: prompt_context.latest_evidence.clone(),
+            compacted_state_digest: prompt_context.compacted_state_digest.clone(),
+            code_retrieval: prompt_context.code_retrieval.clone(),
+        },
+    );
+    let truncation_note = if runtime_context.truncated_sections.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nContext budget note: truncated {}.",
+            runtime_context.truncated_sections.join(", ")
+        )
+    };
+    format!(
+        "Use the supplied runtime context as ground truth. Do the work instead of restating the plan.\n\n{runtime_context}\n\n\
+         Execution requirements:\n\
+         - Stay inside the task scope and planned touches.\n\
+         - Use tools only to close gaps not already covered by the retrieval bundle.\n\
+         - Verify before finishing when possible.\n\
+         - End with a short summary of what changed and whether verification passed.{truncation_note}",
+        runtime_context = runtime_context.rendered,
+        truncation_note = truncation_note,
+    )
+}
+
+fn render_active_task_contract(task: &TaskContract) -> String {
     let invariants = if task.invariants.is_empty() {
         "none".to_string()
     } else {
@@ -2856,28 +2924,371 @@ fn automation_worker_prompt(task: &TaskContract) -> String {
         task.acceptance_ids.join(", ")
     };
     format!(
-        "You are executing one isolated orchestration task inside a git worktree.\n\
-         Complete only the task below and keep the diff minimal.\n\n\
-         Task ID: {task_id}\n\
+        "Task ID: {task_id}\n\
          Objective: {objective}\n\
+         Parent goal trace: {parent_goal_trace}\n\
          Acceptance IDs: {acceptance}\n\
          Planned touches: {planned_touches}\n\
          Invariants: {invariants}\n\
          Forbidden paths: {forbidden}\n\
-         Verify command: {verify_command}\n\n\
-         Requirements:\n\
-         - Stay inside the task scope.\n\
-         - Prefer the built-in edit/write/bash/read tools.\n\
-         - Run the verify command before finishing if possible.\n\
-         - End with a short plain-language summary of what changed and whether verification passed.\n",
+         Verify command: {verify_command}\n\
+         Verify timeout sec: {verify_timeout_sec}\n\
+         Input snapshot: {input_snapshot}\n\
+         Max touched files: {max_touched_files}\n\
+         Symbol drift check: {symbol_drift}\n",
         task_id = task.task_id,
         objective = task.objective,
+        parent_goal_trace = task.parent_goal_trace_id.as_deref().unwrap_or("none"),
         acceptance = acceptance,
         planned_touches = planned_touches,
         invariants = invariants,
         forbidden = forbidden,
         verify_command = task.verify_command,
+        verify_timeout_sec = task
+            .verify_timeout_sec
+            .map_or_else(|| "default".to_string(), |timeout| timeout.to_string()),
+        input_snapshot = task.input_snapshot.as_deref().unwrap_or("none"),
+        max_touched_files = task
+            .max_touched_files
+            .map_or_else(|| "default".to_string(), |max| max.to_string()),
+        symbol_drift = if task.enforce_symbol_drift_check {
+            "required"
+        } else {
+            "not required"
+        },
     )
+}
+
+fn build_inline_task_prompt_context(
+    reliability: &mut RpcReliabilityState,
+    workspace_path: &Path,
+    task: &TaskContract,
+) -> InlineTaskPromptContext {
+    InlineTaskPromptContext {
+        latest_evidence: render_task_evidence_summary(reliability, &task.task_id),
+        compacted_state_digest: render_task_state_digest(reliability, task),
+        code_retrieval: build_task_code_retrieval_bundle(workspace_path, task),
+    }
+}
+
+fn render_task_evidence_summary(reliability: &RpcReliabilityState, task_id: &str) -> String {
+    let Some(records) = reliability.evidence_by_task.get(task_id) else {
+        return "No prior verification evidence recorded for this task.".to_string();
+    };
+    if records.is_empty() {
+        return "No prior verification evidence recorded for this task.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for record in records.iter().rev().take(INLINE_WORKER_MAX_EVIDENCE_ITEMS) {
+        let status = if record.is_success() {
+            "passed"
+        } else {
+            "failed"
+        };
+        lines.push(format!(
+            "{status}: `{command}` exit={exit_code} artifacts={artifacts} at {timestamp}",
+            status = status,
+            command = record.command,
+            exit_code = record.exit_code,
+            artifacts = record.artifact_ids.len(),
+            timestamp = record.timestamp_utc.to_rfc3339(),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_task_state_digest(reliability: &mut RpcReliabilityState, task: &TaskContract) -> String {
+    let digest = reliability
+        .get_state_digest(&task.task_id)
+        .unwrap_or_else(|_| fallback_task_state_digest(task));
+    let blockers = if digest.blockers.is_empty() {
+        "none".to_string()
+    } else {
+        digest.blockers.join(", ")
+    };
+    let recent_actions = if digest.recent_actions.is_empty() {
+        "none".to_string()
+    } else {
+        digest.recent_actions.join("; ")
+    };
+    let prerequisites = task_prerequisite_summary(reliability, &task.task_id);
+    format!(
+        "Objective: {objective}\n\
+         Phase: {phase}\n\
+         Blockers: {blockers}\n\
+         Recent actions: {recent_actions}\n\
+         Next action: {next_action}\n\
+         Prerequisites: {prerequisites}\n\
+         Max attempts: {max_attempts}\n\
+         Verify command: {verify_command}\n\
+         Symbol drift check: {symbol_drift}",
+        objective = digest.objective,
+        phase = digest.phase,
+        blockers = blockers,
+        recent_actions = recent_actions,
+        next_action = digest.next_action.as_deref().unwrap_or("none"),
+        prerequisites = prerequisites,
+        max_attempts = task
+            .max_attempts
+            .map_or_else(|| "default".to_string(), |attempts| attempts.to_string()),
+        verify_command = task.verify_command,
+        symbol_drift = if task.enforce_symbol_drift_check {
+            "required"
+        } else {
+            "not required"
+        },
+    )
+}
+
+fn fallback_task_state_digest(task: &TaskContract) -> StateDigest {
+    let mut digest = StateDigest::new(task.objective.clone(), "leased");
+    digest
+        .recent_actions
+        .push("orchestration worker preparing isolated workspace".to_string());
+    digest.next_action = Some("Apply edits and run verification".to_string());
+    digest
+}
+
+fn task_prerequisite_summary(reliability: &RpcReliabilityState, task_id: &str) -> String {
+    let mut prerequisites = reliability
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.to != task_id {
+                return None;
+            }
+            let reliability::EdgeKind::Prerequisite { trigger } = &edge.kind else {
+                return None;
+            };
+            let trigger_suffix = match trigger {
+                reliability::EdgeTrigger::OnSuccess => String::new(),
+                reliability::EdgeTrigger::Always => " (always)".to_string(),
+                reliability::EdgeTrigger::OnFailure(mask) => {
+                    let mut classes = mask
+                        .classes
+                        .iter()
+                        .map(|class| format!("{class:?}"))
+                        .collect::<Vec<_>>();
+                    classes.sort();
+                    format!(" (on failure: {})", classes.join(", "))
+                }
+            };
+            Some(format!("{}{}", edge.from, trigger_suffix))
+        })
+        .collect::<Vec<_>>();
+    prerequisites.sort();
+    prerequisites.dedup();
+    if prerequisites.is_empty() {
+        "none".to_string()
+    } else {
+        prerequisites.join(", ")
+    }
+}
+
+fn build_task_code_retrieval_bundle(workspace_path: &Path, task: &TaskContract) -> String {
+    if task.planned_touches.is_empty() {
+        return "No planned touches supplied. Use direct reads on the exact file you choose before broad discovery."
+            .to_string();
+    }
+
+    let mut sections = task
+        .planned_touches
+        .iter()
+        .take(INLINE_WORKER_MAX_TARGET_FILES)
+        .map(|planned_touch| build_target_code_bundle(workspace_path, planned_touch))
+        .collect::<Vec<_>>();
+
+    if task.planned_touches.len() > INLINE_WORKER_MAX_TARGET_FILES {
+        sections.push(format!(
+            "Additional planned touches omitted from the initial bundle: {}",
+            task.planned_touches[INLINE_WORKER_MAX_TARGET_FILES..].join(", ")
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn build_target_code_bundle(workspace_path: &Path, planned_touch: &str) -> String {
+    let target_path = workspace_path.join(planned_touch);
+    let mut lines = vec![format!("Target: {planned_touch}")];
+
+    if target_path.is_file() {
+        lines.push(format!(
+            "Local outline: {}",
+            symbol_outline_for_file(&target_path)
+        ));
+        match reliability::ContextFanout::gather(
+            &target_path,
+            workspace_path,
+            INLINE_WORKER_CODE_RETRIEVAL_BUDGET_TOKENS,
+        ) {
+            Ok(fanout) => {
+                lines.push(format!("Fanout: {}", fanout.summary()));
+                let related = render_related_file_bundles(&fanout, workspace_path, &target_path);
+                if !related.is_empty() {
+                    lines.push(format!("Related bundles:\n{}", related.join("\n")));
+                }
+            }
+            Err(err) => {
+                lines.push(format!("Fanout unavailable: {err}"));
+            }
+        }
+    } else if target_path.is_dir() {
+        lines.push(format!(
+            "Directory scope: {}",
+            directory_entry_hint(&target_path, workspace_path)
+        ));
+    } else {
+        lines.push("Status: planned new file".to_string());
+        lines.push(format!(
+            "Nearby files: {}",
+            nearby_file_hint(workspace_path, planned_touch)
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn render_related_file_bundles(
+    fanout: &reliability::ContextFanout,
+    workspace_path: &Path,
+    target_path: &Path,
+) -> Vec<String> {
+    let mut remaining = INLINE_WORKER_MAX_RELATED_FILES_PER_TARGET;
+    let mut rendered = Vec::new();
+
+    for (priority, paths) in &fanout.files_by_priority {
+        if remaining == 0 {
+            break;
+        }
+        let mut hints = Vec::new();
+        for path in paths {
+            if remaining == 0 {
+                break;
+            }
+            let related_path = Path::new(path);
+            if related_path == target_path || !related_path.is_file() {
+                continue;
+            }
+            hints.push(format!(
+                "{} -> {}",
+                relative_path_label(workspace_path, related_path),
+                symbol_outline_for_file(related_path)
+            ));
+            remaining -= 1;
+        }
+        if !hints.is_empty() {
+            rendered.push(format!(
+                "- {}: {}",
+                retrieval_priority_label(*priority),
+                hints.join(" | ")
+            ));
+        }
+    }
+
+    rendered
+}
+
+fn retrieval_priority_label(priority: reliability::RetrievalPriority) -> &'static str {
+    match priority {
+        reliability::RetrievalPriority::DirectImports => "direct imports",
+        reliability::RetrievalPriority::TypeDefinitions => "type definitions",
+        reliability::RetrievalPriority::TestFiles => "tests",
+        reliability::RetrievalPriority::SimilarPatterns => "similar patterns",
+    }
+}
+
+fn symbol_outline_for_file(path: &Path) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return "unavailable".to_string();
+    };
+    let mut symbols = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        let is_symbol = trimmed.starts_with("pub struct ")
+            || trimmed.starts_with("struct ")
+            || trimmed.starts_with("pub enum ")
+            || trimmed.starts_with("enum ")
+            || trimmed.starts_with("pub trait ")
+            || trimmed.starts_with("trait ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub async fn ")
+            || trimmed.starts_with("async fn ")
+            || trimmed.starts_with("export function ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("export class ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("interface ")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("def ");
+        if is_symbol {
+            symbols.push(trim_symbol_line(trimmed));
+        }
+        if symbols.len() >= INLINE_WORKER_MAX_SYMBOL_LINES {
+            break;
+        }
+    }
+
+    if symbols.is_empty() {
+        content
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(trim_symbol_line)
+            .unwrap_or_else(|| "no obvious top-level symbols".to_string())
+    } else {
+        symbols.join("; ")
+    }
+}
+
+fn trim_symbol_line(line: &str) -> String {
+    const MAX_LINE_CHARS: usize = 88;
+    let compact = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_LINE_CHARS {
+        compact
+    } else {
+        let trimmed = compact.chars().take(MAX_LINE_CHARS - 3).collect::<String>();
+        format!("{trimmed}...")
+    }
+}
+
+fn nearby_file_hint(workspace_path: &Path, planned_touch: &str) -> String {
+    let path = workspace_path.join(planned_touch);
+    let Some(parent) = path.parent() else {
+        return "none".to_string();
+    };
+    directory_entry_hint(parent, workspace_path)
+}
+
+fn directory_entry_hint(directory: &Path, workspace_path: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return "none".to_string();
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| relative_path_label(workspace_path, &entry.path()))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.truncate(INLINE_WORKER_MAX_RELATED_FILES_PER_TARGET);
+    if paths.is_empty() {
+        "none".to_string()
+    } else {
+        paths.join(", ")
+    }
+}
+
+fn relative_path_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 #[allow(dead_code)]
@@ -3300,7 +3711,16 @@ async fn capture_dispatch_grant_execution_with_base_patches(
         workspace.commit_staged_changes("pi orchestration replay base")?;
     }
 
-    let summary = worker.execute(workspace.workspace_path(), &contract).await;
+    let prompt_context = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        build_inline_task_prompt_context(&mut rel, workspace.workspace_path(), &contract)
+    };
+    let summary = worker
+        .execute(workspace.workspace_path(), &contract, &prompt_context)
+        .await;
     let diff = if layered_base {
         workspace.get_changes_since_head()
     } else {
@@ -8858,6 +9278,7 @@ mod tests {
     use std::pin::Pin;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -8925,6 +9346,11 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct PromptCaptureProvider {
+        prompt: Arc<StdMutex<Option<String>>>,
+    }
+
     #[async_trait]
     impl Provider for CountingProvider {
         fn name(&self) -> &str {
@@ -8969,6 +9395,200 @@ mod tests {
                 }),
             ])))
         }
+    }
+
+    #[async_trait]
+    impl Provider for PromptCaptureProvider {
+        fn name(&self) -> &str {
+            "prompt-capture"
+        }
+
+        fn api(&self) -> &str {
+            "prompt-capture"
+        }
+
+        fn model_id(&self) -> &str {
+            "prompt-capture-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let prompt = context
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    crate::model::Message::User(user) => match &user.content {
+                        UserContent::Text(text) => Some(text.clone()),
+                        UserContent::Blocks(blocks) => Some(
+                            blocks
+                                .iter()
+                                .filter_map(|block| match block {
+                                    ContentBlock::Text(text) => Some(text.text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                    },
+                    _ => None,
+                })
+                .unwrap_or_default();
+            *self.prompt.lock().expect("prompt lock") = Some(prompt);
+
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("captured"))],
+                api: "prompt-capture".to_string(),
+                provider: "prompt-capture".to_string(),
+                model: "prompt-capture-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 1_700_000_000,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    #[test]
+    fn build_inline_task_prompt_context_collects_runtime_evidence_and_code_fanout() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp_dir.path();
+        fs::create_dir_all(repo_root.join("src")).expect("create src");
+        fs::create_dir_all(repo_root.join("tests")).expect("create tests");
+        fs::write(
+            repo_root.join("src/task_alpha.rs"),
+            "use crate::helper;\n\npub fn task_alpha() {\n    helper::run();\n}\n",
+        )
+        .expect("write task file");
+        fs::write(
+            repo_root.join("src/helper.rs"),
+            "pub struct Helper;\n\npub fn run() {}\n",
+        )
+        .expect("write helper file");
+        fs::write(
+            repo_root.join("tests/task_alpha.rs"),
+            "#[test]\nfn task_alpha_smoke() {}\n",
+        )
+        .expect("write test file");
+
+        let mut reliability =
+            reliability_state_for_tests(ReliabilityEnforcementMode::Soft, false, true);
+        let contract = reliability_contract("task_alpha", Vec::new());
+        reliability
+            .request_dispatch(&contract, "agent", 300)
+            .expect("dispatch");
+        reliability
+            .append_evidence(AppendEvidenceRequest {
+                task_id: contract.task_id.clone(),
+                command: "cargo test task_alpha".to_string(),
+                exit_code: 0,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                artifact_ids: Vec::new(),
+                env_id: Some("orchestration:test".to_string()),
+            })
+            .expect("append evidence");
+
+        let prompt_context =
+            build_inline_task_prompt_context(&mut reliability, repo_root, &contract);
+
+        assert!(
+            prompt_context
+                .latest_evidence
+                .contains("cargo test task_alpha")
+        );
+        assert!(
+            prompt_context
+                .compacted_state_digest
+                .contains("Phase: leased")
+        );
+        assert!(
+            prompt_context
+                .code_retrieval
+                .contains("Target: src/task_alpha.rs")
+        );
+        assert!(
+            prompt_context.code_retrieval.contains("direct imports"),
+            "expected retrieval bundle to include fanout priority labels: {}",
+            prompt_context.code_retrieval
+        );
+        assert!(
+            prompt_context.code_retrieval.contains("src/helper.rs"),
+            "expected retrieval bundle to cite imported helper file: {}",
+            prompt_context.code_retrieval
+        );
+    }
+
+    #[test]
+    fn rpc_session_inline_worker_sends_retrieval_first_prompt() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let repo_root = temp_dir.path();
+            fs::create_dir_all(repo_root.join("src")).expect("create src");
+            fs::write(
+                repo_root.join("src/task_alpha.rs"),
+                "use crate::helper;\n\npub fn task_alpha() {\n    helper::run();\n}\n",
+            )
+            .expect("write task file");
+            fs::write(
+                repo_root.join("src/helper.rs"),
+                "pub struct Helper;\n\npub fn run() {}\n",
+            )
+            .expect("write helper file");
+
+            let mut reliability =
+                reliability_state_for_tests(ReliabilityEnforcementMode::Soft, false, true);
+            let contract = reliability_contract("task_alpha", Vec::new());
+            reliability
+                .request_dispatch(&contract, "agent", 300)
+                .expect("dispatch");
+            let prompt_context =
+                build_inline_task_prompt_context(&mut reliability, repo_root, &contract);
+
+            let captured_prompt = Arc::new(StdMutex::new(None));
+            let worker = RpcSessionInlineWorker::new(
+                Arc::new(PromptCaptureProvider {
+                    prompt: Arc::clone(&captured_prompt),
+                }),
+                Config::default(),
+            );
+
+            let summary = worker
+                .execute(repo_root, &contract, &prompt_context)
+                .await
+                .expect("worker execute");
+            assert_eq!(summary, "captured");
+
+            let prompt = captured_prompt
+                .lock()
+                .expect("prompt lock")
+                .clone()
+                .expect("captured prompt");
+            assert!(prompt.contains("## critical_rules"));
+            assert!(prompt.contains("## code_retrieval"));
+            assert!(prompt.contains("Target: src/task_alpha.rs"));
+            assert!(prompt.contains(
+                "Start from the supplied code retrieval bundle before using grep/find/ls."
+            ));
+        });
     }
 
     fn queued_user_message(text: &str) -> Message {
@@ -9193,7 +9813,12 @@ mod tests {
 
     #[async_trait]
     impl OrchestrationInlineWorker for FixtureInlineWorker {
-        async fn execute(&self, workspace_path: &Path, _task: &TaskContract) -> Result<String> {
+        async fn execute(
+            &self,
+            workspace_path: &Path,
+            _task: &TaskContract,
+            _prompt_context: &InlineTaskPromptContext,
+        ) -> Result<String> {
             let target = workspace_path.join(&self.target);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|err| Error::Io(Box::new(err)))?;
@@ -9211,7 +9836,12 @@ mod tests {
 
     #[async_trait]
     impl OrchestrationInlineWorker for ConcurrentFixtureInlineWorker {
-        async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+        async fn execute(
+            &self,
+            workspace_path: &Path,
+            task: &TaskContract,
+            _prompt_context: &InlineTaskPromptContext,
+        ) -> Result<String> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
 
@@ -9245,7 +9875,12 @@ mod tests {
 
     #[async_trait]
     impl OrchestrationInlineWorker for OverlapReplayFixtureWorker {
-        async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+        async fn execute(
+            &self,
+            workspace_path: &Path,
+            task: &TaskContract,
+            _prompt_context: &InlineTaskPromptContext,
+        ) -> Result<String> {
             let target = workspace_path.join(&self.target);
             let mut contents =
                 fs::read_to_string(&target).map_err(|err| Error::Io(Box::new(err)))?;
@@ -9277,7 +9912,12 @@ mod tests {
 
     #[async_trait]
     impl OrchestrationInlineWorker for FailingInlineWorker {
-        async fn execute(&self, _workspace_path: &Path, _task: &TaskContract) -> Result<String> {
+        async fn execute(
+            &self,
+            _workspace_path: &Path,
+            _task: &TaskContract,
+            _prompt_context: &InlineTaskPromptContext,
+        ) -> Result<String> {
             Err(Error::validation(self.message.clone()))
         }
     }
@@ -9288,7 +9928,12 @@ mod tests {
 
     #[async_trait]
     impl OrchestrationInlineWorker for PartialWaveFailureWorker {
-        async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
+        async fn execute(
+            &self,
+            workspace_path: &Path,
+            task: &TaskContract,
+            _prompt_context: &InlineTaskPromptContext,
+        ) -> Result<String> {
             if task.task_id == self.failing_task_id {
                 return Err(Error::validation(format!(
                     "fixture partial wave failure for {}",
