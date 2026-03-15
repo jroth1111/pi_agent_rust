@@ -2541,14 +2541,47 @@ impl Session {
         Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
     }
 
-    fn append_model_message_for_entry(messages: &mut Vec<Message>, entry: &SessionEntry) {
+    fn text_from_blocks(blocks: &[ContentBlock]) -> String {
+        let mut text = String::new();
+        let mut first = true;
+        for block in blocks {
+            if let ContentBlock::Text(content) = block {
+                if !first {
+                    text.push('\n');
+                }
+                text.push_str(&content.text);
+                first = false;
+            }
+        }
+        text
+    }
+
+    fn tool_path_from_arguments(arguments: &Value) -> Option<String> {
+        arguments
+            .as_object()
+            .and_then(|args| args.get("path"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
+    fn repeated_read_notice(path: &str, repeat_count: u32) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(TextContent::new(format!(
+            "[Repeated read omitted: {path} already appears earlier in this session at the same file version (repeat #{repeat_count})]"
+        )))]
+    }
+
+    fn append_model_message_for_entry(
+        messages: &mut Vec<Message>,
+        entry: &SessionEntry,
+        context_state: &mut PromptContextState,
+    ) {
         match entry {
             SessionEntry::Message(msg_entry) => {
                 // Skip messages that are not visible to the agent
                 if !msg_entry.is_agent_visible() {
                     return;
                 }
-                if let Some(message) = session_message_to_model(&msg_entry.message) {
+                if let Some(message) = context_state.to_model_message(&msg_entry.message) {
                     messages.push(message);
                 }
             }
@@ -2579,6 +2612,7 @@ impl Session {
 
         if let Some((compaction_idx, compaction)) = last_compaction {
             let mut messages = Vec::new();
+            let mut context_state = PromptContextState::default();
             let summary_message = SessionMessage::CompactionSummary {
                 summary: compaction.summary.clone(),
                 tokens_before: compaction.tokens_before,
@@ -2620,15 +2654,16 @@ impl Session {
                         continue;
                     }
                 }
-                Self::append_model_message_for_entry(&mut messages, entry);
+                Self::append_model_message_for_entry(&mut messages, entry, &mut context_state);
             }
 
             return messages;
         }
 
         let mut messages = Vec::new();
+        let mut context_state = PromptContextState::default();
         for idx in 0..path_len {
-            Self::append_model_message_for_entry(&mut messages, entry_at(idx));
+            Self::append_model_message_for_entry(&mut messages, entry_at(idx), &mut context_state);
         }
         messages
     }
@@ -3578,6 +3613,131 @@ pub struct CustomEntry {
     pub custom_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptToolCall {
+    name: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptReadRecord {
+    content: String,
+    repeat_count: u32,
+}
+
+#[derive(Debug, Default)]
+struct PromptContextState {
+    tool_calls: HashMap<String, PromptToolCall>,
+    file_versions: HashMap<String, u64>,
+    read_results: HashMap<(String, u64), PromptReadRecord>,
+}
+
+impl PromptContextState {
+    fn to_model_message(&mut self, message: &SessionMessage) -> Option<Message> {
+        match message {
+            SessionMessage::Assistant { message: assistant } => {
+                for block in &assistant.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        self.tool_calls.insert(
+                            call.id.clone(),
+                            PromptToolCall {
+                                name: call.name.clone(),
+                                path: Session::tool_path_from_arguments(&call.arguments),
+                            },
+                        );
+                    }
+                }
+                session_message_to_model(message)
+            }
+            SessionMessage::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+                details,
+                is_error,
+                timestamp,
+            } => {
+                let transformed = self.transform_tool_result(
+                    tool_call_id,
+                    tool_name,
+                    content,
+                    details.clone(),
+                    *is_error,
+                    *timestamp,
+                );
+                session_message_to_model(&transformed)
+            }
+            _ => session_message_to_model(message),
+        }
+    }
+
+    fn transform_tool_result(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        content: &[ContentBlock],
+        details: Option<Value>,
+        is_error: bool,
+        timestamp: Option<i64>,
+    ) -> SessionMessage {
+        let metadata = self.tool_calls.get(tool_call_id).cloned();
+        if !is_error {
+            if let Some(metadata) = &metadata {
+                match metadata.name.as_str() {
+                    "write" | "edit" => {
+                        if let Some(path) = &metadata.path {
+                            *self.file_versions.entry(path.clone()).or_insert(0) += 1;
+                        }
+                    }
+                    "read" => {
+                        if let Some(path) = &metadata.path {
+                            let version = self.file_versions.get(path).copied().unwrap_or_default();
+                            let key = (path.clone(), version);
+                            let text = Session::text_from_blocks(content);
+                            if let Some(existing) = self.read_results.get_mut(&key) {
+                                if existing.content == text {
+                                    existing.repeat_count = existing.repeat_count.saturating_add(1);
+                                    return SessionMessage::ToolResult {
+                                        tool_call_id: tool_call_id.to_string(),
+                                        tool_name: tool_name.to_string(),
+                                        content: Session::repeated_read_notice(
+                                            path,
+                                            existing.repeat_count,
+                                        ),
+                                        details,
+                                        is_error,
+                                        timestamp,
+                                    };
+                                }
+                                existing.content = text;
+                                existing.repeat_count = 1;
+                            } else {
+                                self.read_results.insert(
+                                    key,
+                                    PromptReadRecord {
+                                        content: text,
+                                        repeat_count: 1,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        SessionMessage::ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            content: content.to_vec(),
+            details,
+            is_error,
+            timestamp,
+        }
+    }
 }
 
 // ============================================================================
@@ -4787,6 +4947,37 @@ mod tests {
         }
     }
 
+    fn make_test_tool_call(call_id: &str, name: &str, path: &str) -> SessionMessage {
+        SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments: serde_json::json!({ "path": path }),
+                    thought_signature: None,
+                })],
+                api: "test".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            },
+        }
+    }
+
+    fn make_test_tool_result(call_id: &str, name: &str, text: &str) -> SessionMessage {
+        SessionMessage::ToolResult {
+            tool_call_id: call_id.to_string(),
+            tool_name: name.to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: None,
+            is_error: false,
+            timestamp: Some(0),
+        }
+    }
+
     fn run_async<T>(future: impl Future<Output = T>) -> T {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -5736,6 +5927,54 @@ mod tests {
                 panic!("expected ToolResult");
             }
         }
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_dedups_identical_repeated_reads() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("read the file twice"));
+        session.append_message(make_test_tool_call("call-1", "read", "src/lib.rs"));
+        session.append_message(make_test_tool_result("call-1", "read", "same contents"));
+        session.append_message(make_test_tool_call("call-2", "read", "src/lib.rs"));
+        session.append_message(make_test_tool_result("call-2", "read", "same contents"));
+
+        let messages = session.to_messages_for_current_path();
+        assert_eq!(messages.len(), 5);
+
+        let first = match &messages[2] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected first tool result, got {other:?}"),
+        };
+        let second = match &messages[4] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected second tool result, got {other:?}"),
+        };
+
+        assert_eq!(first, "same contents");
+        assert!(second.contains("Repeated read omitted"));
+        assert!(second.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_keeps_read_after_edit_version_change() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("read edit read"));
+        session.append_message(make_test_tool_call("call-1", "read", "src/lib.rs"));
+        session.append_message(make_test_tool_result("call-1", "read", "same contents"));
+        session.append_message(make_test_tool_call("call-2", "edit", "src/lib.rs"));
+        session.append_message(make_test_tool_result("call-2", "edit", "applied patch"));
+        session.append_message(make_test_tool_call("call-3", "read", "src/lib.rs"));
+        session.append_message(make_test_tool_result("call-3", "read", "same contents"));
+
+        let messages = session.to_messages_for_current_path();
+        assert_eq!(messages.len(), 7);
+
+        let reread = match &messages[6] {
+            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
+            other => panic!("expected reread tool result, got {other:?}"),
+        };
+
+        assert_eq!(reread, "same contents");
     }
 
     #[test]
