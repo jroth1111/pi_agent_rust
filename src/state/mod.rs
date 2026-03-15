@@ -19,8 +19,6 @@
 mod discovery;
 mod events;
 mod gates;
-mod handoff;
-mod ledger;
 
 pub use discovery::{
     Discovery, DiscoveryPriority, DiscoverySummary, DiscoveryTracker, ScopeBudget,
@@ -30,8 +28,6 @@ pub use gates::{
     CompletionGate, CompletionGates, EvidenceGate, FnGate, GateBuilder, GateRecord, GateResult,
     GateSeverity, GateSummary,
 };
-pub use handoff::{ArtifactRef, HandoffContext};
-pub use ledger::{Attempt, AttemptOutcome, TaskLedger, TodoItem, TodoStatus};
 
 use serde::{Deserialize, Serialize};
 
