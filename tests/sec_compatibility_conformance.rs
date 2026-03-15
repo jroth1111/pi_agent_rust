@@ -131,7 +131,7 @@ fn write_verdict(checks: &[ConformanceCheck]) {
 fn all_profiles() -> Vec<(&'static str, PolicyProfile)> {
     vec![
         ("safe", PolicyProfile::Safe),
-        ("standard", PolicyProfile::Standard),
+        ("balanced", PolicyProfile::Balanced),
         ("permissive", PolicyProfile::Permissive),
     ]
 }
@@ -247,8 +247,8 @@ fn ws4_benign_caps_allowed_in_all_profiles() {
 }
 
 #[test]
-fn ws4_dangerous_caps_denied_in_safe_and_standard() {
-    for profile in [PolicyProfile::Safe, PolicyProfile::Standard] {
+fn ws4_dangerous_caps_denied_in_safe_and_balanced() {
+    for profile in [PolicyProfile::Safe, PolicyProfile::Balanced] {
         let policy = profile.to_policy();
         for cap in dangerous_capabilities() {
             let check = policy.evaluate(cap);
@@ -278,7 +278,7 @@ fn ws4_dangerous_caps_allowed_in_permissive() {
 fn ws4_per_extension_override_cannot_bypass_deny_caps() {
     for (profile_name, profile) in [
         ("safe", PolicyProfile::Safe),
-        ("standard", PolicyProfile::Standard),
+        ("balanced", PolicyProfile::Balanced),
     ] {
         let mut policy = profile.to_policy();
         policy.per_extension.insert(
@@ -352,13 +352,13 @@ fn ws4_explain_effective_policy_covers_all_capabilities() {
 
 #[test]
 fn ws4_profile_transition_downgrade_validation() {
-    // Permissive → Standard is a valid downgrade (tightening)
+    // Permissive → Balanced is a valid downgrade (tightening)
     let permissive = PolicyProfile::Permissive.to_policy();
-    let standard = PolicyProfile::Standard.to_policy();
-    let check = ExtensionPolicy::is_valid_downgrade(&permissive, &standard);
+    let balanced = PolicyProfile::Balanced.to_policy();
+    let check = ExtensionPolicy::is_valid_downgrade(&permissive, &balanced);
     assert!(
         check.is_valid_downgrade,
-        "Permissive → Standard must be a valid downgrade"
+        "Permissive → Balanced must be a valid downgrade"
     );
 
     // Permissive → Safe is a valid downgrade
@@ -369,11 +369,11 @@ fn ws4_profile_transition_downgrade_validation() {
         "Permissive → Safe must be a valid downgrade"
     );
 
-    // Standard → Safe is a valid downgrade
-    let check = ExtensionPolicy::is_valid_downgrade(&standard, &safe);
+    // Balanced → Safe is a valid downgrade
+    let check = ExtensionPolicy::is_valid_downgrade(&balanced, &safe);
     assert!(
         check.is_valid_downgrade,
-        "Standard → Safe must be a valid downgrade"
+        "Balanced → Safe must be a valid downgrade"
     );
 
     // Safe → Permissive is NOT a valid downgrade (loosening)
@@ -546,17 +546,17 @@ fn cross_profile_benign_cap_consistency() {
 
 #[test]
 fn cross_profile_dangerous_cap_matrix() {
-    // Dangerous caps must be denied in safe/standard, allowed in permissive
+    // Dangerous caps must be denied in safe/balanced, allowed in permissive
     for cap in dangerous_capabilities() {
         let safe = PolicyProfile::Safe.to_policy().evaluate(cap).decision;
-        let std = PolicyProfile::Standard.to_policy().evaluate(cap).decision;
+        let balanced = PolicyProfile::Balanced.to_policy().evaluate(cap).decision;
         let perm = PolicyProfile::Permissive.to_policy().evaluate(cap).decision;
 
         assert_eq!(safe, PolicyDecision::Deny, "{cap} must be denied in safe");
         assert_eq!(
-            std,
+            balanced,
             PolicyDecision::Deny,
-            "{cap} must be denied in standard"
+            "{cap} must be denied in balanced"
         );
         assert_eq!(
             perm,
@@ -569,21 +569,21 @@ fn cross_profile_dangerous_cap_matrix() {
 #[test]
 fn cross_profile_mode_strictness_ordering() {
     let safe = PolicyProfile::Safe.to_policy();
-    let standard = PolicyProfile::Standard.to_policy();
+    let balanced = PolicyProfile::Balanced.to_policy();
     let permissive = PolicyProfile::Permissive.to_policy();
 
     assert_eq!(safe.mode, ExtensionPolicyMode::Strict);
-    assert_eq!(standard.mode, ExtensionPolicyMode::Prompt);
+    assert_eq!(balanced.mode, ExtensionPolicyMode::Prompt);
     assert_eq!(permissive.mode, ExtensionPolicyMode::Permissive);
 }
 
 #[test]
-fn cross_profile_default_policy_matches_standard() {
-    let standard = PolicyProfile::Standard.to_policy();
+fn cross_profile_default_policy_matches_balanced() {
+    let balanced = PolicyProfile::Balanced.to_policy();
     let default = ExtensionPolicy::default();
-    assert_eq!(standard.mode, default.mode);
-    assert_eq!(standard.default_caps, default.default_caps);
-    assert_eq!(standard.deny_caps, default.deny_caps);
+    assert_eq!(balanced.mode, default.mode);
+    assert_eq!(balanced.default_caps, default.default_caps);
+    assert_eq!(balanced.deny_caps, default.deny_caps);
 }
 
 // ============================================================================
@@ -599,8 +599,8 @@ fn regression_safe_profile_always_denies_exec() {
 }
 
 #[test]
-fn regression_standard_profile_always_denies_exec() {
-    let policy = PolicyProfile::Standard.to_policy();
+fn regression_balanced_profile_always_denies_exec() {
+    let policy = PolicyProfile::Balanced.to_policy();
     let check = policy.evaluate("exec");
     assert_eq!(check.decision, PolicyDecision::Deny);
     assert_eq!(check.reason, "deny_caps");
@@ -608,7 +608,7 @@ fn regression_standard_profile_always_denies_exec() {
 
 #[test]
 fn regression_deny_caps_layer_precedes_extension_allow() {
-    for profile in [PolicyProfile::Safe, PolicyProfile::Standard] {
+    for profile in [PolicyProfile::Safe, PolicyProfile::Balanced] {
         let mut policy = profile.to_policy();
         policy.per_extension.insert(
             "sneaky".to_string(),
@@ -820,7 +820,7 @@ fn generate_sec_conformance_verdict() {
     for cap in dangerous_capabilities() {
         for (pname, profile) in &[
             ("safe", PolicyProfile::Safe),
-            ("standard", PolicyProfile::Standard),
+            ("balanced", PolicyProfile::Balanced),
         ] {
             let result = profile.to_policy().evaluate(cap);
             let status = if result.decision == PolicyDecision::Deny {
@@ -878,21 +878,21 @@ fn generate_sec_conformance_verdict() {
 
     // Category 4: Profile transition validation
     let transitions = [
-        ("permissive", "standard", true),
+        ("permissive", "balanced", true),
         ("permissive", "safe", true),
-        ("standard", "safe", true),
+        ("balanced", "safe", true),
         ("safe", "permissive", false),
-        ("standard", "permissive", false),
+        ("balanced", "permissive", false),
     ];
     for (from_name, to_name, expect_valid) in transitions {
         let from_profile = match from_name {
             "safe" => PolicyProfile::Safe,
-            "standard" => PolicyProfile::Standard,
+            "balanced" => PolicyProfile::Balanced,
             _ => PolicyProfile::Permissive,
         };
         let to_profile = match to_name {
             "safe" => PolicyProfile::Safe,
-            "standard" => PolicyProfile::Standard,
+            "balanced" => PolicyProfile::Balanced,
             _ => PolicyProfile::Permissive,
         };
         let check =
@@ -918,7 +918,7 @@ fn generate_sec_conformance_verdict() {
     // Category 5: Deny-cap precedence (per-extension override cannot bypass)
     for (pname, profile) in &[
         ("safe", PolicyProfile::Safe),
-        ("standard", PolicyProfile::Standard),
+        ("balanced", PolicyProfile::Balanced),
     ] {
         let mut policy = profile.to_policy();
         policy.per_extension.insert(

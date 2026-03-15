@@ -1449,14 +1449,14 @@ mod policy_profiles {
     }
 
     #[test]
-    fn standard_profile_prompts_for_unknown_caps() {
-        let policy = PolicyProfile::Standard.to_policy();
+    fn balanced_profile_prompts_for_unknown_caps() {
+        let policy = PolicyProfile::Balanced.to_policy();
         for cap in ["ui", "log", "tool"] {
             let check = policy.evaluate(cap);
             assert_eq!(
                 check.decision,
                 PolicyDecision::Prompt,
-                "Standard should prompt for {cap}"
+                "Balanced should prompt for {cap}"
             );
         }
     }
@@ -1480,7 +1480,7 @@ mod policy_profiles {
         let safe_caps = ["read", "write", "http", "events", "session"];
         for profile in [
             PolicyProfile::Safe,
-            PolicyProfile::Standard,
+            PolicyProfile::Balanced,
             PolicyProfile::Permissive,
         ] {
             let policy = profile.to_policy();

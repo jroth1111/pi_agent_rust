@@ -412,7 +412,7 @@ pub enum SettingsScope {
 const fn effective_profile_str(profile: crate::extensions::PolicyProfile) -> &'static str {
     match profile {
         crate::extensions::PolicyProfile::Safe => "safe",
-        crate::extensions::PolicyProfile::Standard => "balanced",
+        crate::extensions::PolicyProfile::Balanced => "balanced",
         crate::extensions::PolicyProfile::Permissive => "permissive",
     }
 }
@@ -846,7 +846,7 @@ impl Config {
         } else if normalized_profile == "permissive" {
             PolicyProfile::Permissive
         } else if normalized_profile == "balanced" {
-            PolicyProfile::Standard
+            PolicyProfile::Balanced
         } else {
             // Unknown values fail closed to the safe profile.
             tracing::warn!(

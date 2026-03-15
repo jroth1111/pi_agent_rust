@@ -61,8 +61,8 @@ fn safe_policy() -> ExtensionPolicy {
     PolicyProfile::Safe.to_policy()
 }
 
-fn standard_policy() -> ExtensionPolicy {
-    PolicyProfile::Standard.to_policy()
+fn balanced_policy() -> ExtensionPolicy {
+    PolicyProfile::Balanced.to_policy()
 }
 
 const fn default_risk_config() -> RuntimeRiskConfig {
@@ -634,7 +634,7 @@ fn scenario_quota_breach_enforcement() {
 }
 
 // ============================================================================
-// Scenario 5: Policy profile transition (safe → standard → permissive)
+// Scenario 5: Policy profile transition (safe → balanced → permissive)
 // ============================================================================
 
 /// Validates that changing policy profiles affects enforcement decisions
@@ -670,18 +670,18 @@ fn scenario_policy_profile_escalation() {
         safe_check.decision
     );
 
-    // Phase 2: Standard profile
-    let standard = standard_policy();
-    let standard_check = standard.evaluate(&exec_call.capability);
+    // Phase 2: Balanced profile
+    let balanced = balanced_policy();
+    let balanced_check = balanced.evaluate(&exec_call.capability);
     log_scenario_event(
         &harness,
         "execution",
-        "Standard profile exec check",
+        "Balanced profile exec check",
         ext_id,
         &[
             ("policy_profile", "balanced".to_string()),
             ("capability", "exec".to_string()),
-            ("decision", format!("{:?}", standard_check.decision)),
+            ("decision", format!("{:?}", balanced_check.decision)),
         ],
     );
 

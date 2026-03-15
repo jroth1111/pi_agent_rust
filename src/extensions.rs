@@ -1915,9 +1915,9 @@ pub enum PolicyProfile {
     /// Safe defaults: only non-dangerous capabilities allowed, dangerous
     /// denied. Mode = Strict.
     Safe,
-    /// Standard defaults (current production behaviour): non-dangerous
+    /// Balanced defaults (current production behaviour): non-dangerous
     /// allowed, dangerous prompt. Mode = Prompt.
-    Standard,
+    Balanced,
     /// Everything allowed, nothing denied. Mode = Permissive.
     Permissive,
 }
@@ -1941,7 +1941,7 @@ impl PolicyProfile {
                 exec_mediation: ExecMediationPolicy::strict(),
                 secret_broker: SecretBrokerPolicy::default(),
             },
-            Self::Standard => ExtensionPolicy::default(),
+            Self::Balanced => ExtensionPolicy::default(),
             Self::Permissive => ExtensionPolicy {
                 mode: ExtensionPolicyMode::Permissive,
                 max_memory_mb: 256,
@@ -46523,12 +46523,12 @@ mod tests {
     }
 
     #[test]
-    fn explain_effective_policy_standard_profile() {
-        let policy = PolicyProfile::Standard.to_policy();
+    fn explain_effective_policy_balanced_profile() {
+        let policy = PolicyProfile::Balanced.to_policy();
         let explanation = policy.explain_effective_policy(None);
 
         assert_eq!(explanation.mode, ExtensionPolicyMode::Prompt);
-        // Standard denies exec/env via deny_caps.
+        // Balanced denies exec/env via deny_caps.
         assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
         assert!(explanation.dangerous_denied.contains(&"env".to_string()));
     }
@@ -46607,24 +46607,24 @@ mod tests {
     }
 
     #[test]
-    fn downgrade_permissive_to_standard_is_valid() {
+    fn downgrade_permissive_to_balanced_is_valid() {
         let from = PolicyProfile::Permissive.to_policy();
-        let to = PolicyProfile::Standard.to_policy();
+        let to = PolicyProfile::Balanced.to_policy();
         let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
         assert!(
             check.is_valid_downgrade,
-            "Permissive → Standard should be a valid downgrade"
+            "Permissive → Balanced should be a valid downgrade"
         );
     }
 
     #[test]
-    fn downgrade_standard_to_safe_is_valid() {
-        let from = PolicyProfile::Standard.to_policy();
+    fn downgrade_balanced_to_safe_is_valid() {
+        let from = PolicyProfile::Balanced.to_policy();
         let to = PolicyProfile::Safe.to_policy();
         let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
         assert!(
             check.is_valid_downgrade,
-            "Standard → Safe should be a valid downgrade"
+            "Balanced → Safe should be a valid downgrade"
         );
     }
 
@@ -46640,13 +46640,13 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_safe_to_standard_is_not_downgrade() {
+    fn upgrade_safe_to_balanced_is_not_downgrade() {
         let from = PolicyProfile::Safe.to_policy();
-        let to = PolicyProfile::Standard.to_policy();
+        let to = PolicyProfile::Balanced.to_policy();
         let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
         assert!(
             !check.is_valid_downgrade,
-            "Safe → Standard should NOT be a valid downgrade"
+            "Safe → Balanced should NOT be a valid downgrade"
         );
     }
 
@@ -46698,8 +46698,8 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_caps_not_enabled_by_standard_profile() {
-        let policy = PolicyProfile::Standard.to_policy();
+    fn dangerous_caps_not_enabled_by_balanced_profile() {
+        let policy = PolicyProfile::Balanced.to_policy();
         assert_eq!(policy.evaluate("exec").decision, PolicyDecision::Deny);
         assert_eq!(policy.evaluate("env").decision, PolicyDecision::Deny);
     }
@@ -46707,12 +46707,12 @@ mod tests {
     #[test]
     fn dangerous_caps_only_enabled_by_permissive_profile() {
         let safe = PolicyProfile::Safe.to_policy();
-        let standard = PolicyProfile::Standard.to_policy();
+        let balanced = PolicyProfile::Balanced.to_policy();
         let permissive = PolicyProfile::Permissive.to_policy();
 
         // Only permissive allows dangerous caps.
         assert_eq!(safe.evaluate("exec").decision, PolicyDecision::Deny);
-        assert_eq!(standard.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(balanced.evaluate("exec").decision, PolicyDecision::Deny);
         assert_eq!(permissive.evaluate("exec").decision, PolicyDecision::Allow);
     }
 
@@ -46774,7 +46774,7 @@ mod tests {
         // the dangerous capabilities.
         for profile in [
             PolicyProfile::Safe,
-            PolicyProfile::Standard,
+            PolicyProfile::Balanced,
             PolicyProfile::Permissive,
         ] {
             let policy = profile.to_policy();

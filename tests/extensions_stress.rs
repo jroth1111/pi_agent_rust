@@ -1142,7 +1142,7 @@ fn stress_policy_profile_rotation() {
 
     for (profile_name, profile) in [
         ("safe", PolicyProfile::Safe),
-        ("balanced", PolicyProfile::Standard),
+        ("balanced", PolicyProfile::Balanced),
         ("permissive", PolicyProfile::Permissive),
     ] {
         let policy = ExtensionPolicy::from_profile(profile);

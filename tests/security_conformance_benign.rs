@@ -170,12 +170,12 @@ const BENIGN_CAPABILITIES: &[&str] = &["read", "write", "http", "events", "sessi
 const DANGEROUS_CAPABILITIES: &[&str] = &["exec", "env"];
 
 /// All hardened profiles to test.
-const HARDENED_PROFILES: &[PolicyProfile] = &[PolicyProfile::Safe, PolicyProfile::Standard];
+const HARDENED_PROFILES: &[PolicyProfile] = &[PolicyProfile::Safe, PolicyProfile::Balanced];
 
 const fn profile_name(p: PolicyProfile) -> &'static str {
     match p {
         PolicyProfile::Safe => "safe",
-        PolicyProfile::Standard => "standard",
+        PolicyProfile::Balanced => "balanced",
         PolicyProfile::Permissive => "permissive",
     }
 }
@@ -198,14 +198,14 @@ fn benign_capabilities_allowed_under_safe_profile() {
 }
 
 #[test]
-fn benign_capabilities_allowed_under_standard_profile() {
-    let policy = PolicyProfile::Standard.to_policy();
+fn benign_capabilities_allowed_under_balanced_profile() {
+    let policy = PolicyProfile::Balanced.to_policy();
     for cap in BENIGN_CAPABILITIES {
         let check = policy.evaluate(cap);
-        // Standard mode uses Prompt fallback, but benign caps should be in default_caps
+        // Balanced mode uses Prompt fallback, but benign caps should be in default_caps
         assert!(
             check.decision == PolicyDecision::Allow || check.decision == PolicyDecision::Prompt,
-            "Standard profile should allow or prompt benign capability '{cap}', got {:?}",
+            "Balanced profile should allow or prompt benign capability '{cap}', got {:?}",
             check.decision
         );
     }
@@ -226,14 +226,14 @@ fn dangerous_capabilities_denied_under_safe_profile() {
 }
 
 #[test]
-fn dangerous_capabilities_denied_under_standard_profile() {
-    let policy = PolicyProfile::Standard.to_policy();
+fn dangerous_capabilities_denied_under_balanced_profile() {
+    let policy = PolicyProfile::Balanced.to_policy();
     for cap in DANGEROUS_CAPABILITIES {
         let check = policy.evaluate(cap);
         assert_eq!(
             check.decision,
             PolicyDecision::Deny,
-            "Standard profile must deny dangerous capability '{cap}'"
+            "Balanced profile must deny dangerous capability '{cap}'"
         );
         assert_eq!(check.reason, "deny_caps");
     }
@@ -317,8 +317,8 @@ fn safe_profile_explanation_accurate() {
 }
 
 #[test]
-fn standard_profile_explanation_accurate() {
-    let policy = PolicyProfile::Standard.to_policy();
+fn balanced_profile_explanation_accurate() {
+    let policy = PolicyProfile::Balanced.to_policy();
     let explanation = policy.explain_effective_policy(None);
 
     assert_eq!(explanation.mode, ExtensionPolicyMode::Prompt);
@@ -354,24 +354,24 @@ fn permissive_to_safe_is_valid_downgrade() {
 }
 
 #[test]
-fn permissive_to_standard_is_valid_downgrade() {
+fn permissive_to_balanced_is_valid_downgrade() {
     let from = PolicyProfile::Permissive.to_policy();
-    let to = PolicyProfile::Standard.to_policy();
+    let to = PolicyProfile::Balanced.to_policy();
     let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
     assert!(
         check.is_valid_downgrade,
-        "Permissive → Standard should be a valid security downgrade"
+        "Permissive → Balanced should be a valid security downgrade"
     );
 }
 
 #[test]
-fn standard_to_safe_is_valid_downgrade() {
-    let from = PolicyProfile::Standard.to_policy();
+fn balanced_to_safe_is_valid_downgrade() {
+    let from = PolicyProfile::Balanced.to_policy();
     let to = PolicyProfile::Safe.to_policy();
     let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
     assert!(
         check.is_valid_downgrade,
-        "Standard → Safe should be a valid security downgrade"
+        "Balanced → Safe should be a valid security downgrade"
     );
 }
 
@@ -391,9 +391,9 @@ fn run_full_compatibility_matrix() -> Vec<CompatCheck> {
         for cap in BENIGN_CAPABILITIES {
             let result = policy.evaluate(cap);
             let expected = PolicyDecision::Allow;
-            // Standard mode may prompt for some capabilities, which is acceptable
+            // Balanced mode may prompt for some capabilities, which is acceptable
             let passed = result.decision == expected
-                || (profile == PolicyProfile::Standard
+                || (profile == PolicyProfile::Balanced
                     && result.decision == PolicyDecision::Prompt);
             checks.push(CompatCheck {
                 name: format!("{name}:{cap}:benign_access"),
@@ -650,7 +650,7 @@ fn compat_dashboard_roundtrip() {
         schema: COMPAT_DASHBOARD_SCHEMA.to_string(),
         generated_at: "2026-02-14T12:00:00.000Z".to_string(),
         bead: "bd-1a2cu".to_string(),
-        profiles_tested: vec!["safe".to_string(), "standard".to_string()],
+        profiles_tested: vec!["safe".to_string(), "balanced".to_string()],
         total_checks: checks.len(),
         total_passed: checks.iter().filter(|c| c.passed).count(),
         total_failed: checks.iter().filter(|c| !c.passed).count(),

@@ -42,8 +42,8 @@ fn safe_profile_allows_non_dangerous_capabilities() {
 }
 
 #[test]
-fn standard_profile_denies_dangerous_via_deny_caps() {
-    let policy = PolicyProfile::Standard.to_policy();
+fn balanced_profile_denies_dangerous_via_deny_caps() {
+    let policy = PolicyProfile::Balanced.to_policy();
     assert_eq!(policy.mode, ExtensionPolicyMode::Prompt);
 
     // Even in prompt mode, deny_caps takes precedence
@@ -69,7 +69,7 @@ fn permissive_profile_allows_everything() {
 fn profile_serde_roundtrip() {
     for profile in [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ] {
         let json = serde_json::to_string(&profile).expect("serialize");
@@ -82,7 +82,7 @@ fn profile_serde_roundtrip() {
 fn from_profile_equivalent_to_to_policy() {
     for profile in [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ] {
         let via_to = profile.to_policy();
@@ -137,8 +137,8 @@ fn allow_dangerous_removes_from_deny_caps() {
 }
 
 #[test]
-fn allow_dangerous_with_standard_mode_enables_prompt() {
-    let mut policy = PolicyProfile::Standard.to_policy();
+fn allow_dangerous_with_balanced_mode_enables_prompt() {
+    let mut policy = PolicyProfile::Balanced.to_policy();
     // Remove dangerous caps from deny list
     policy.deny_caps.retain(|c| c != "exec" && c != "env");
 
@@ -147,7 +147,7 @@ fn allow_dangerous_with_standard_mode_enables_prompt() {
     assert_eq!(
         exec_check.decision,
         PolicyDecision::Prompt,
-        "With allow_dangerous in standard mode, dangerous caps should prompt"
+        "With allow_dangerous in balanced mode, dangerous caps should prompt"
     );
 }
 
@@ -258,7 +258,7 @@ fn explain_serializes_to_json() {
 
 #[test]
 fn explain_roundtrip() {
-    let policy = PolicyProfile::Standard.to_policy();
+    let policy = PolicyProfile::Balanced.to_policy();
     let explanation = policy.explain_effective_policy(None);
 
     let json = serde_json::to_string(&explanation).expect("serialize");
@@ -288,16 +288,16 @@ fn downgrade_permissive_to_safe_is_valid() {
 }
 
 #[test]
-fn downgrade_permissive_to_standard_is_valid() {
+fn downgrade_permissive_to_balanced_is_valid() {
     let from = PolicyProfile::Permissive.to_policy();
-    let to = PolicyProfile::Standard.to_policy();
+    let to = PolicyProfile::Balanced.to_policy();
     let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
     assert!(check.is_valid_downgrade);
 }
 
 #[test]
-fn downgrade_standard_to_safe_is_valid() {
-    let from = PolicyProfile::Standard.to_policy();
+fn downgrade_balanced_to_safe_is_valid() {
+    let from = PolicyProfile::Balanced.to_policy();
     let to = PolicyProfile::Safe.to_policy();
     let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
     assert!(check.is_valid_downgrade);
@@ -312,9 +312,9 @@ fn upgrade_safe_to_permissive_is_not_valid_downgrade() {
 }
 
 #[test]
-fn upgrade_safe_to_standard_is_not_valid_downgrade() {
+fn upgrade_safe_to_balanced_is_not_valid_downgrade() {
     let from = PolicyProfile::Safe.to_policy();
-    let to = PolicyProfile::Standard.to_policy();
+    let to = PolicyProfile::Balanced.to_policy();
     let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
     assert!(!check.is_valid_downgrade);
 }
@@ -323,7 +323,7 @@ fn upgrade_safe_to_standard_is_not_valid_downgrade() {
 fn identity_transition_is_valid() {
     for profile in [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ] {
         let policy = profile.to_policy();
@@ -408,7 +408,7 @@ fn permissive_profile_uses_permissive_exec_mediation() {
 fn all_profiles_enable_secret_broker() {
     for profile in [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ] {
         let policy = profile.to_policy();
@@ -529,12 +529,12 @@ fn evaluate_empty_capability_denied() {
 }
 
 #[test]
-fn policy_default_is_standard() {
+fn policy_default_is_balanced() {
     let default_policy = ExtensionPolicy::default();
-    let standard = PolicyProfile::Standard.to_policy();
-    assert_eq!(default_policy.mode, standard.mode);
-    assert_eq!(default_policy.deny_caps, standard.deny_caps);
-    assert_eq!(default_policy.default_caps, standard.default_caps);
+    let balanced = PolicyProfile::Balanced.to_policy();
+    assert_eq!(default_policy.mode, balanced.mode);
+    assert_eq!(default_policy.deny_caps, balanced.deny_caps);
+    assert_eq!(default_policy.default_caps, balanced.default_caps);
 }
 
 #[test]

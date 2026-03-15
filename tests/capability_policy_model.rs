@@ -122,12 +122,12 @@ fn profile_safe_is_strict_with_safe_defaults() {
 }
 
 #[test]
-fn profile_standard_matches_default() {
-    let standard = PolicyProfile::Standard.to_policy();
+fn profile_balanced_matches_default() {
+    let balanced = PolicyProfile::Balanced.to_policy();
     let default_policy = ExtensionPolicy::default();
-    assert_eq!(standard.mode, default_policy.mode);
-    assert_eq!(standard.default_caps, default_policy.default_caps);
-    assert_eq!(standard.deny_caps, default_policy.deny_caps);
+    assert_eq!(balanced.mode, default_policy.mode);
+    assert_eq!(balanced.default_caps, default_policy.default_caps);
+    assert_eq!(balanced.deny_caps, default_policy.deny_caps);
 }
 
 #[test]
@@ -530,7 +530,7 @@ fn capability_serde_roundtrip() {
 fn profile_serde_roundtrip() {
     for profile in &[
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ] {
         let json = serde_json::to_string(profile).unwrap();

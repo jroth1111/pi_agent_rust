@@ -793,7 +793,7 @@ fn risk_tier_serde_roundtrip() {
 fn all_policy_profiles_have_valid_sec43_config() {
     for profile in [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ] {
         let policy = profile.to_policy();

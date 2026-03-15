@@ -181,15 +181,15 @@ fn invariant_precedence_per_extension_allow_overrides_mode_fallback() {
 fn invariant_precedence_chain_exhaustive_across_profiles() {
     let profiles = [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ];
 
     for profile in profiles {
         let policy = profile.to_policy();
 
-        // Dangerous caps (exec, env) should be denied in Safe and Standard
-        if matches!(profile, PolicyProfile::Safe | PolicyProfile::Standard) {
+        // Dangerous caps (exec, env) should be denied in Safe and Balanced
+        if matches!(profile, PolicyProfile::Safe | PolicyProfile::Balanced) {
             let exec_check = policy.evaluate_for("exec", None);
             assert_eq!(
                 exec_check.decision,
@@ -220,7 +220,7 @@ fn invariant_precedence_chain_exhaustive_across_profiles() {
 fn invariant_empty_capability_always_denied() {
     let profiles = [
         PolicyProfile::Safe,
-        PolicyProfile::Standard,
+        PolicyProfile::Balanced,
         PolicyProfile::Permissive,
     ];
 
@@ -665,37 +665,37 @@ fn invariant_exec_mediation_disabled_allows_everything() {
 }
 
 // ============================================================================
-// Invariant 8: Profile security ordering (Safe >= Standard >= Permissive)
+// Invariant 8: Profile security ordering (Safe >= Balanced >= Permissive)
 // ============================================================================
 
 #[test]
-fn invariant_profile_downgrade_safe_to_standard_valid() {
+fn invariant_profile_downgrade_safe_to_balanced_valid() {
     let safe = PolicyProfile::Safe.to_policy();
-    let standard = PolicyProfile::Standard.to_policy();
+    let balanced = PolicyProfile::Balanced.to_policy();
 
-    // Safe → Standard is NOT a valid downgrade (Standard is less strict)
-    let check = ExtensionPolicy::is_valid_downgrade(&safe, &standard);
+    // Safe → Balanced is NOT a valid downgrade (Balanced is less strict)
+    let check = ExtensionPolicy::is_valid_downgrade(&safe, &balanced);
     assert!(!check.is_valid_downgrade);
 }
 
 #[test]
-fn invariant_profile_downgrade_standard_to_safe_valid() {
+fn invariant_profile_downgrade_balanced_to_safe_valid() {
     let safe = PolicyProfile::Safe.to_policy();
-    let standard = PolicyProfile::Standard.to_policy();
+    let balanced = PolicyProfile::Balanced.to_policy();
 
-    // Standard → Safe IS a valid downgrade (Safe is stricter)
-    let check = ExtensionPolicy::is_valid_downgrade(&standard, &safe);
+    // Balanced → Safe IS a valid downgrade (Safe is stricter)
+    let check = ExtensionPolicy::is_valid_downgrade(&balanced, &safe);
     assert!(check.is_valid_downgrade);
 }
 
 #[test]
 fn invariant_profile_downgrade_permissive_to_anything_valid() {
     let permissive = PolicyProfile::Permissive.to_policy();
-    let standard = PolicyProfile::Standard.to_policy();
+    let balanced = PolicyProfile::Balanced.to_policy();
     let safe = PolicyProfile::Safe.to_policy();
 
-    let to_standard = ExtensionPolicy::is_valid_downgrade(&permissive, &standard);
-    assert!(to_standard.is_valid_downgrade);
+    let to_balanced = ExtensionPolicy::is_valid_downgrade(&permissive, &balanced);
+    assert!(to_balanced.is_valid_downgrade);
 
     let to_safe = ExtensionPolicy::is_valid_downgrade(&permissive, &safe);
     assert!(to_safe.is_valid_downgrade);
@@ -703,7 +703,7 @@ fn invariant_profile_downgrade_permissive_to_anything_valid() {
 
 #[test]
 fn invariant_all_profiles_deny_dangerous_caps_except_permissive() {
-    for profile in [PolicyProfile::Safe, PolicyProfile::Standard] {
+    for profile in [PolicyProfile::Safe, PolicyProfile::Balanced] {
         let policy = profile.to_policy();
         for cap in ALL_CAPABILITIES.iter().filter(|c| c.is_dangerous()) {
             let check = policy.evaluate_for(cap.as_str(), None);
@@ -877,7 +877,7 @@ fn invariant_strict_mode_denies_unknown_caps() {
 
 #[test]
 fn invariant_prompt_mode_prompts_unknown_caps() {
-    let policy = PolicyProfile::Standard.to_policy();
+    let policy = PolicyProfile::Balanced.to_policy();
     assert_eq!(policy.mode, ExtensionPolicyMode::Prompt);
 
     let check = policy.evaluate_for("custom_unknown_cap", None);

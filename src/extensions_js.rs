@@ -23156,7 +23156,7 @@ export default ConfigLoader;
     fn pijs_exec_sync_global_deny_overrides_per_extension_allow() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
-            let mut policy = crate::extensions::PolicyProfile::Standard.to_policy();
+            let mut policy = crate::extensions::PolicyProfile::Balanced.to_policy();
             policy.per_extension.insert(
                 "ext.exec.allowed".to_string(),
                 crate::extensions::ExtensionOverride {

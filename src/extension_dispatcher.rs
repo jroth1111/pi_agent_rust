@@ -3613,7 +3613,7 @@ mod tests {
 
     #[test]
     fn policy_snapshot_version_changes_on_material_policy_delta() {
-        let policy_base = ExtensionPolicy::from_profile(PolicyProfile::Standard);
+        let policy_base = ExtensionPolicy::from_profile(PolicyProfile::Balanced);
         let mut policy_delta = policy_base.clone();
         policy_delta.deny_caps.push("http".to_string());
 
