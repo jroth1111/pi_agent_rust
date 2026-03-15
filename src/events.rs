@@ -56,12 +56,6 @@
 //! - **Self-documenting**: Action variants clearly show available operations
 //! - **Serializable**: All types support serde for persistence/transmission
 //!
-//! # Backward Compatibility
-//!
-//! The module provides [`ActionResult::to_content_blocks()`] to convert typed
-//! observations back into the legacy [`ContentBlock`](crate::model::ContentBlock) format
-//! used by the TUI and provider systems.
-//!
 //! This module provides an OpenHands-style strongly-typed action/observation pattern
 //! for tool execution, replacing generic JSON-based tool calls with type-safe enums.
 //!
@@ -79,10 +73,11 @@
 //! - **Refactoring safety**: Changes to actions are caught at compile time
 //! - **Self-documentation**: Action variants clearly show available operations
 //!
-//! ## Backward Compatibility
+//! ## Interoperability
 //!
-//! The legacy [`Tool`](crate::tools::Tool) trait is maintained via `From` implementations
-//! that convert between typed actions and the JSON-based tool interface.
+//! The legacy [`Tool`](crate::tools::Tool) trait is maintained via `From`
+//! implementations and structured serialization rather than content-block
+//! adapters.
 
 use crate::model::ContentBlock;
 use crate::tools::TruncationResult;
@@ -1021,65 +1016,6 @@ impl ActionResult {
             Observation::Error { .. } | Observation::Custom { is_error: true, .. }
         )
     }
-
-    /// Get the content blocks for TUI rendering (legacy compatibility).
-    pub fn to_content_blocks(&self) -> Vec<ContentBlock> {
-        match &self.observation {
-            Observation::Read(obs) => vec![ContentBlock::Text(crate::model::TextContent::new(
-                obs.content.clone(),
-            ))],
-            Observation::Write(obs) => vec![ContentBlock::Text(crate::model::TextContent::new(
-                format!("Wrote {} bytes to {}", obs.bytes_written, obs.file_path),
-            ))],
-            Observation::Edit(obs) => {
-                vec![ContentBlock::Text(crate::model::TextContent::new(format!(
-                    "Made {} replacement(s) in {}",
-                    obs.replacements, obs.file_path
-                )))]
-            }
-            Observation::Bash(obs) => vec![ContentBlock::Text(crate::model::TextContent::new(
-                obs.output.clone(),
-            ))],
-            Observation::Grep(obs) => {
-                let mut text = String::new();
-                for m in &obs.matches {
-                    text.push_str(&format!("{}:{}: {}\n", m.file, m.line_number, m.line));
-                }
-                vec![ContentBlock::Text(crate::model::TextContent::new(text))]
-            }
-            Observation::Glob(obs) => {
-                let text = obs.matches.join("\n");
-                vec![ContentBlock::Text(crate::model::TextContent::new(text))]
-            }
-            Observation::Ls(obs) => {
-                let mut text = String::new();
-                for entry in &obs.entries {
-                    text.push_str(&format!("{}\n", entry.path));
-                }
-                vec![ContentBlock::Text(crate::model::TextContent::new(text))]
-            }
-            Observation::WebSearch(obs) => {
-                let mut text = String::new();
-                for result in &obs.results {
-                    text.push_str(&format!(
-                        "{}: {}\n{}\n\n",
-                        result.title, result.url, result.snippet
-                    ));
-                }
-                vec![ContentBlock::Text(crate::model::TextContent::new(text))]
-            }
-            Observation::WebFetch(obs) => vec![ContentBlock::Text(crate::model::TextContent::new(
-                obs.content.clone(),
-            ))],
-            Observation::Lsp(obs) => vec![ContentBlock::Text(crate::model::TextContent::new(
-                format!("{:?}", obs.result),
-            ))],
-            Observation::Error { message, .. } => vec![ContentBlock::Text(
-                crate::model::TextContent::new(format!("Error: {message}")),
-            )],
-            Observation::Custom { content, .. } => content.clone(),
-        }
-    }
 }
 
 /// Get current Unix timestamp in milliseconds.
@@ -1290,30 +1226,6 @@ mod tests {
                 assert_eq!(message, "File not found");
             }
             _ => panic!("Expected Error observation"),
-        }
-    }
-
-    #[test]
-    fn test_observation_to_content_blocks() {
-        let obs = Observation::Read(ReadObservation {
-            file_path: "/test.rs".to_string(),
-            content: "test content".to_string(),
-            line_info: None,
-            truncated: false,
-            truncation: None,
-            metadata: None,
-        });
-
-        let action = Action::read("/test.rs");
-        let result = ActionResult::new(action, obs);
-        let blocks = result.to_content_blocks();
-
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            ContentBlock::Text(text) => {
-                assert_eq!(text.text, "test content");
-            }
-            _ => panic!("Expected Text block"),
         }
     }
 

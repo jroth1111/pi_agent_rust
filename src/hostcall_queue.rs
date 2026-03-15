@@ -585,10 +585,8 @@ impl HostcallQueueMode {
 
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "ebr" | "epoch" | "epoch-based" => Some(Self::Ebr),
-            "fallback" | "safe-fallback" | "off" | "disabled" | "legacy" => {
-                Some(Self::SafeFallback)
-            }
+            "ebr" => Some(Self::Ebr),
+            "safe-fallback" => Some(Self::SafeFallback),
             _ => None,
         }
     }
@@ -1058,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn hostcall_queue_mode_parsing_supports_ebr_and_fallback() {
+    fn hostcall_queue_mode_parsing_requires_canonical_names() {
         assert_eq!(
             HostcallQueueMode::parse("ebr"),
             Some(HostcallQueueMode::Ebr)
@@ -1067,6 +1065,8 @@ mod tests {
             HostcallQueueMode::parse("safe-fallback"),
             Some(HostcallQueueMode::SafeFallback)
         );
+        assert_eq!(HostcallQueueMode::parse("epoch"), None);
+        assert_eq!(HostcallQueueMode::parse("disabled"), None);
         assert_eq!(HostcallQueueMode::parse("nope"), None);
     }
 
