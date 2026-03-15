@@ -1,7 +1,7 @@
 use super::loader::{LoadSkillsOptions, load_skills};
-#[cfg(test)]
-use super::schema::SkillSections;
-use super::schema::{ExplicitSkillInvocation, Skill};
+use super::schema::{
+    ExplicitSkillInvocation, Skill, SkillSections, parse_skill_sections, strip_frontmatter,
+};
 use crate::agent::AgentEvent;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -25,6 +25,8 @@ const SKILL_AMENDMENT_LEDGER: &str = "skill-amendments.jsonl";
 const SKILL_FEEDBACK_LEDGER: &str = "skill-feedback.jsonl";
 const GUARDRAIL_BLOCK_BEGIN: &str = "<!-- PI-SKILL-GUARDRAILS:BEGIN -->";
 const GUARDRAIL_BLOCK_END: &str = "<!-- PI-SKILL-GUARDRAILS:END -->";
+const ROUTING_BLOCK_BEGIN: &str = "<!-- PI-SKILL-ROUTING:BEGIN -->";
+const ROUTING_BLOCK_END: &str = "<!-- PI-SKILL-ROUTING:END -->";
 const LOW_FEEDBACK_THRESHOLD: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,46 @@ pub struct SkillObservation {
     pub agent_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRoutingHints {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub use_when: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_for: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_examples: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anti_trigger_examples: Vec<String>,
+}
+
+impl SkillRoutingHints {
+    fn is_empty(&self) -> bool {
+        self.use_when.is_empty()
+            && self.not_for.is_empty()
+            && self.trigger_examples.is_empty()
+            && self.anti_trigger_examples.is_empty()
+    }
+
+    fn normalize(&mut self) {
+        normalize_items(&mut self.use_when);
+        normalize_items(&mut self.not_for);
+        normalize_items(&mut self.trigger_examples);
+        normalize_items(&mut self.anti_trigger_examples);
+    }
+
+    fn from_sections(sections: &SkillSections) -> Self {
+        let mut hints = Self {
+            use_when: sections.use_when.clone(),
+            not_for: sections.not_for.clone(),
+            trigger_examples: sections.trigger_examples.clone(),
+            anti_trigger_examples: sections.anti_trigger_examples.clone(),
+        };
+        hints.normalize();
+        hints
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillAmendment {
@@ -88,6 +130,10 @@ pub struct SkillAmendment {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_guardrails: Vec<String>,
     pub guardrails: Vec<String>,
+    #[serde(default, skip_serializing_if = "SkillRoutingHints::is_empty")]
+    pub previous_routing_hints: SkillRoutingHints,
+    #[serde(default, skip_serializing_if = "SkillRoutingHints::is_empty")]
+    pub routing_hints: SkillRoutingHints,
     pub evidence: Vec<String>,
 }
 
@@ -163,6 +209,8 @@ pub struct SkillHealthReport {
     pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposed_guardrails: Vec<String>,
+    #[serde(default, skip_serializing_if = "SkillRoutingHints::is_empty")]
+    pub proposed_routing_hints: SkillRoutingHints,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_success_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -503,7 +551,7 @@ pub fn handle_skill_doctor(
         for index in 0..skills.len() {
             match skills[index].status {
                 SkillHealthStatus::Regressed => {
-                    if let Some(amendment) = rollback_guardrail_patch(
+                    if let Some(amendment) = rollback_managed_skill_patch(
                         &skills[index].skill_name,
                         &skills[index].skill_path,
                         &skills[index].current_digest,
@@ -520,13 +568,16 @@ pub fn handle_skill_doctor(
                     }
                 }
                 SkillHealthStatus::NeedsAmendment => {
-                    if skills[index].proposed_guardrails.is_empty() {
+                    if skills[index].proposed_guardrails.is_empty()
+                        && skills[index].proposed_routing_hints.is_empty()
+                    {
                         continue;
                     }
-                    if let Some(amendment) = apply_guardrail_patch(
+                    if let Some(amendment) = apply_managed_skill_patch(
                         &skills[index].skill_name,
                         &skills[index].skill_path,
                         &skills[index].proposed_guardrails,
+                        &skills[index].proposed_routing_hints,
                         &skills[index].evidence,
                         cwd,
                     )? {
@@ -595,6 +646,8 @@ fn build_skill_health_report(
     let evidence = summarize_evidence(latest_observations, latest_feedback);
     let mut proposed_guardrails =
         recommend_guardrails(latest_observations, latest_feedback, criteria);
+    let mut proposed_routing_hints =
+        recommend_routing_hints(latest_observations, latest_feedback, criteria);
 
     let has_unobserved_revision = current_digest != "missing" && current_digest != latest_digest;
     if has_unobserved_revision {
@@ -612,6 +665,7 @@ fn build_skill_health_report(
             status: SkillHealthStatus::PendingData,
             evidence,
             proposed_guardrails,
+            proposed_routing_hints,
             previous_success_rate: Some(success_rate),
             latest_success_rate: None,
             previous_average_feedback_score: average_feedback_score,
@@ -642,6 +696,7 @@ fn build_skill_health_report(
         SkillHealthStatus::Healthy | SkillHealthStatus::Improved
     ) {
         proposed_guardrails.clear();
+        proposed_routing_hints = SkillRoutingHints::default();
     }
 
     SkillHealthReport {
@@ -658,6 +713,7 @@ fn build_skill_health_report(
         status: evaluation.status,
         evidence,
         proposed_guardrails,
+        proposed_routing_hints,
         previous_success_rate: evaluation.previous_success_rate,
         latest_success_rate: evaluation.latest_success_rate,
         previous_average_feedback_score: evaluation.previous_average_feedback_score,
@@ -673,6 +729,7 @@ fn mark_report_pending_for_unobserved_revision(
     report.current_digest = current_digest;
     report.status = SkillHealthStatus::PendingData;
     report.proposed_guardrails.clear();
+    report.proposed_routing_hints = SkillRoutingHints::default();
     report
         .previous_success_rate
         .get_or_insert(report.success_rate);
@@ -945,6 +1002,73 @@ fn recommend_guardrails(
     guardrails
 }
 
+fn recommend_routing_hints(
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
+    criteria: &SkillSuccessCriteria,
+) -> SkillRoutingHints {
+    let low_feedback_problem = feedback.len() >= criteria.min_feedback_sample_size
+        && average_feedback_score(feedback)
+            .is_some_and(|score| score < criteria.min_average_feedback_score);
+    let notes = feedback
+        .iter()
+        .filter(|entry| entry.rating <= LOW_FEEDBACK_THRESHOLD)
+        .map(|entry| entry.notes.trim())
+        .filter(|notes| !notes.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    let agent_failures = observations
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                SkillRunOutcome::AgentFailure | SkillRunOutcome::Aborted
+            )
+        })
+        .count();
+    let misrouted = contains_any(
+        &notes,
+        &[
+            "wrong skill",
+            "not applicable",
+            "irrelevant",
+            "bad trigger",
+            "misrouted",
+            "should not have used",
+        ],
+    ) || agent_failures >= criteria.max_consecutive_failures;
+
+    if !misrouted {
+        return SkillRoutingHints::default();
+    }
+
+    let mut routing = SkillRoutingHints {
+        use_when: vec![
+            "Use this skill only when the request directly matches its intended task and all required inputs are present."
+                .to_string(),
+        ],
+        not_for: vec![
+            "Do not use this skill for loosely related requests, missing-input situations, or tasks better handled by another skill."
+                .to_string(),
+        ],
+        trigger_examples: collect_task_previews(observations, SkillRunOutcome::Success, 2),
+        anti_trigger_examples: collect_non_success_previews(observations, 2),
+    };
+
+    if low_feedback_problem && routing.anti_trigger_examples.is_empty() {
+        routing.anti_trigger_examples.push(
+            "Requests that repeatedly lead to irrelevant or low-quality results for this skill."
+                .to_string(),
+        );
+    }
+    dedup_strings(&mut routing.use_when);
+    dedup_strings(&mut routing.not_for);
+    dedup_strings(&mut routing.trigger_examples);
+    dedup_strings(&mut routing.anti_trigger_examples);
+    routing
+}
+
 fn summarize_evidence(
     observations: &[SkillObservation],
     feedback: &[SkillFeedback],
@@ -1002,10 +1126,11 @@ fn summarize_evidence(
     evidence
 }
 
-fn apply_guardrail_patch(
+fn apply_managed_skill_patch(
     skill_name: &str,
     skill_path: &Path,
     guardrails: &[String],
+    routing_hints: &SkillRoutingHints,
     evidence: &[String],
     cwd: &Path,
 ) -> Result<Option<SkillAmendment>> {
@@ -1017,8 +1142,10 @@ fn apply_guardrail_patch(
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
     let previous_guardrails = extract_guardrails_from_raw(&raw);
+    let previous_routing_hints = extract_routing_hints_from_raw(&raw);
     let block = guardrail_block(guardrails);
-    let updated = replace_or_insert_guardrail_block(&raw, &block);
+    let with_guardrails = replace_or_insert_guardrail_block(&raw, &block);
+    let updated = replace_or_insert_routing_block(&with_guardrails, routing_hints);
     if updated == raw {
         return Ok(None);
     }
@@ -1039,13 +1166,15 @@ fn apply_guardrail_patch(
         new_digest,
         previous_guardrails,
         guardrails: guardrails.to_vec(),
+        previous_routing_hints,
+        routing_hints: extract_routing_hints_from_raw(&updated),
         evidence: evidence.to_vec(),
     };
     append_jsonl_records(&skill_amendment_ledger_path(cwd), &[amendment.clone()])?;
     Ok(Some(amendment))
 }
 
-fn rollback_guardrail_patch(
+fn rollback_managed_skill_patch(
     skill_name: &str,
     skill_path: &Path,
     current_digest: &str,
@@ -1069,7 +1198,12 @@ fn rollback_guardrail_patch(
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
     let current_guardrails = extract_guardrails_from_raw(&raw);
-    let updated = restore_guardrail_block(&raw, &source_amendment.previous_guardrails);
+    let current_routing_hints = extract_routing_hints_from_raw(&raw);
+    let restored_guardrails = restore_guardrail_block(&raw, &source_amendment.previous_guardrails);
+    let updated = restore_routing_block(
+        &restored_guardrails,
+        &source_amendment.previous_routing_hints,
+    );
     if updated == raw {
         return Ok(None);
     }
@@ -1082,7 +1216,7 @@ fn rollback_guardrail_patch(
     })?;
     let new_digest = sha256_hex_standalone(&updated);
     let mut rollback_evidence = vec![format!(
-        "Automatically rolled back regressed managed guardrails from revision {}.",
+        "Automatically rolled back regressed managed skill patch from revision {}.",
         shorten_digest(current_digest)
     )];
     rollback_evidence.extend(evidence.iter().cloned());
@@ -1095,6 +1229,8 @@ fn rollback_guardrail_patch(
         new_digest,
         previous_guardrails: current_guardrails,
         guardrails: source_amendment.previous_guardrails.clone(),
+        previous_routing_hints: current_routing_hints,
+        routing_hints: source_amendment.previous_routing_hints.clone(),
         evidence: rollback_evidence,
     };
     append_jsonl_records(&skill_amendment_ledger_path(cwd), &[amendment.clone()])?;
@@ -1139,28 +1275,7 @@ fn restore_guardrail_block(raw: &str, guardrails: &[String]) -> String {
 }
 
 fn remove_guardrail_block(raw: &str) -> String {
-    let (Some(start), Some(end_marker)) = (
-        raw.find(GUARDRAIL_BLOCK_BEGIN),
-        raw.find(GUARDRAIL_BLOCK_END),
-    ) else {
-        return raw.to_string();
-    };
-    let mut remove_start = start;
-    while remove_start > 0 && raw[..remove_start].ends_with('\n') {
-        remove_start -= 1;
-    }
-    let mut remove_end = end_marker + GUARDRAIL_BLOCK_END.len();
-    while remove_end < raw.len() && raw[remove_end..].starts_with('\n') {
-        remove_end += 1;
-    }
-
-    let mut updated = String::with_capacity(raw.len());
-    updated.push_str(&raw[..remove_start]);
-    if !updated.is_empty() && !raw[remove_end..].is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str(&raw[remove_end..]);
-    updated
+    remove_managed_block(raw, GUARDRAIL_BLOCK_BEGIN, GUARDRAIL_BLOCK_END)
 }
 
 fn guardrail_block(guardrails: &[String]) -> String {
@@ -1185,6 +1300,132 @@ fn extract_guardrails_from_raw(raw: &str) -> Vec<String> {
         .filter_map(|line| line.strip_prefix("- "))
         .map(ToString::to_string)
         .collect()
+}
+
+fn replace_or_insert_routing_block(raw: &str, routing_hints: &SkillRoutingHints) -> String {
+    let base = remove_routing_block(raw);
+    if routing_hints.is_empty() {
+        return base;
+    }
+
+    let block = routing_block(&base, routing_hints);
+    if block.is_empty() {
+        return base;
+    }
+
+    let trimmed = base.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{trimmed}\n\n{block}\n")
+    }
+}
+
+fn restore_routing_block(raw: &str, routing_hints: &SkillRoutingHints) -> String {
+    replace_or_insert_routing_block(raw, routing_hints)
+}
+
+fn remove_routing_block(raw: &str) -> String {
+    remove_managed_block(raw, ROUTING_BLOCK_BEGIN, ROUTING_BLOCK_END)
+}
+
+fn routing_block(raw: &str, routing_hints: &SkillRoutingHints) -> String {
+    let sections = parse_skill_sections(&strip_frontmatter(raw));
+    let effective = SkillRoutingHints {
+        use_when: merge_section_items(&sections.use_when, &routing_hints.use_when),
+        not_for: merge_section_items(&sections.not_for, &routing_hints.not_for),
+        trigger_examples: merge_section_items(
+            &sections.trigger_examples,
+            &routing_hints.trigger_examples,
+        ),
+        anti_trigger_examples: merge_section_items(
+            &sections.anti_trigger_examples,
+            &routing_hints.anti_trigger_examples,
+        ),
+    };
+    if effective.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![ROUTING_BLOCK_BEGIN.to_string()];
+    push_routing_section(&mut lines, "Use When", &effective.use_when);
+    push_routing_section(&mut lines, "Not For", &effective.not_for);
+    push_routing_section(&mut lines, "Trigger Examples", &effective.trigger_examples);
+    push_routing_section(
+        &mut lines,
+        "Anti-Trigger Examples",
+        &effective.anti_trigger_examples,
+    );
+    lines.push(ROUTING_BLOCK_END.to_string());
+    lines.join("\n")
+}
+
+fn push_routing_section(lines: &mut Vec<String>, heading: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+
+    if lines.len() > 1 {
+        lines.push(String::new());
+    }
+    lines.push(format!("## {heading}"));
+    lines.extend(items.iter().map(|item| format!("- {item}")));
+}
+
+fn extract_routing_hints_from_raw(raw: &str) -> SkillRoutingHints {
+    let (Some(start), Some(end_marker)) =
+        (raw.find(ROUTING_BLOCK_BEGIN), raw.find(ROUTING_BLOCK_END))
+    else {
+        return SkillRoutingHints::default();
+    };
+    let sections = parse_skill_sections(&raw[start + ROUTING_BLOCK_BEGIN.len()..end_marker].trim());
+    SkillRoutingHints::from_sections(&sections)
+}
+
+fn merge_section_items(base: &[String], managed: &[String]) -> Vec<String> {
+    let mut items = base
+        .iter()
+        .chain(managed.iter())
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    normalize_items(&mut items);
+    items
+}
+
+fn normalize_items(items: &mut Vec<String>) {
+    items.retain(|item| !item.trim().is_empty());
+    for item in items.iter_mut() {
+        *item = item.trim().to_string();
+    }
+    dedup_strings(items);
+}
+
+fn remove_managed_block(raw: &str, begin_marker: &str, end_marker: &str) -> String {
+    let (Some(start), Some(end_marker_start)) = (raw.find(begin_marker), raw.find(end_marker))
+    else {
+        return raw.to_string();
+    };
+    let mut remove_start = start;
+    while remove_start > 0 && raw[..remove_start].ends_with('\n') {
+        remove_start -= 1;
+    }
+    let mut remove_end = end_marker_start + end_marker.len();
+    while remove_end < raw.len() && raw[remove_end..].starts_with('\n') {
+        remove_end += 1;
+    }
+
+    let mut updated = String::with_capacity(raw.len());
+    updated.push_str(&raw[..remove_start]);
+    if !updated.is_empty() && !raw[remove_end..].is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&raw[remove_end..]);
+    if raw.ends_with('\n') && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated
 }
 
 fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
@@ -1248,6 +1489,14 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
                 )
                 .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             }
+            if !skill.proposed_routing_hints.is_empty() {
+                writeln!(
+                    out,
+                    "  proposed routing: {}",
+                    render_routing_hints_summary(&skill.proposed_routing_hints)
+                )
+                .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            }
             let mut evaluation_parts = Vec::new();
             if let (Some(previous), Some(latest)) =
                 (skill.previous_success_rate, skill.latest_success_rate)
@@ -1292,6 +1541,29 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
     }
 
     Ok(out)
+}
+
+fn render_routing_hints_summary(hints: &SkillRoutingHints) -> String {
+    let mut parts = Vec::new();
+    if !hints.use_when.is_empty() {
+        parts.push(format!("use_when={}", hints.use_when.join(" | ")));
+    }
+    if !hints.not_for.is_empty() {
+        parts.push(format!("not_for={}", hints.not_for.join(" | ")));
+    }
+    if !hints.trigger_examples.is_empty() {
+        parts.push(format!(
+            "trigger_examples={}",
+            hints.trigger_examples.join(" | ")
+        ));
+    }
+    if !hints.anti_trigger_examples.is_empty() {
+        parts.push(format!(
+            "anti_trigger_examples={}",
+            hints.anti_trigger_examples.join(" | ")
+        ));
+    }
+    parts.join(" ; ")
 }
 
 fn render_skill_feedback_receipt(feedback: &SkillFeedback) -> Result<String> {
@@ -1415,6 +1687,41 @@ fn low_feedback_count(entries: &[SkillFeedback]) -> usize {
         .iter()
         .filter(|entry| entry.rating <= LOW_FEEDBACK_THRESHOLD)
         .count()
+}
+
+fn collect_task_previews(
+    observations: &[SkillObservation],
+    outcome: SkillRunOutcome,
+    limit: usize,
+) -> Vec<String> {
+    let mut previews = observations
+        .iter()
+        .filter(|entry| entry.outcome == outcome)
+        .map(|entry| entry.task_preview.trim())
+        .filter(|preview| !preview.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    dedup_strings(&mut previews);
+    previews.truncate(limit);
+    previews
+}
+
+fn collect_non_success_previews(observations: &[SkillObservation], limit: usize) -> Vec<String> {
+    let mut previews = observations
+        .iter()
+        .filter(|entry| !entry.outcome.is_success())
+        .map(|entry| entry.task_preview.trim())
+        .filter(|preview| !preview.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    dedup_strings(&mut previews);
+    previews.truncate(limit);
+    previews
+}
+
+fn dedup_strings(items: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    items.retain(|item| seen.insert(item.clone()));
 }
 
 fn consecutive_failures(entries: &[SkillObservation]) -> usize {
@@ -1806,6 +2113,98 @@ mod tests {
     }
 
     #[test]
+    fn doctor_recommends_routing_hints_for_misrouted_skill() {
+        let observations = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: PathBuf::from("/tmp/SKILL.md"),
+                skill_digest: "abc".to_string(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review this rust diff for bugs".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: PathBuf::from("/tmp/SKILL.md"),
+                skill_digest: "abc".to_string(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "draft a launch email".to_string(),
+                outcome: SkillRunOutcome::AgentFailure,
+                tool_failures: Vec::new(),
+                agent_error: Some("Wrong task".to_string()),
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: PathBuf::from("/tmp/SKILL.md"),
+                skill_digest: "abc".to_string(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "write release marketing copy".to_string(),
+                outcome: SkillRunOutcome::AgentFailure,
+                tool_failures: Vec::new(),
+                agent_error: Some("Wrong task".to_string()),
+            },
+        ];
+        let feedback = vec![
+            sample_feedback(
+                "2026-03-15T10:12:00Z",
+                None,
+                "code-review",
+                Path::new("/tmp/SKILL.md"),
+                "abc",
+                1,
+                "wrong skill, misrouted request",
+            ),
+            sample_feedback(
+                "2026-03-15T10:15:00Z",
+                None,
+                "code-review",
+                Path::new("/tmp/SKILL.md"),
+                "abc",
+                2,
+                "bad trigger for writing tasks",
+            ),
+        ];
+
+        let report = build_skill_health_report(
+            "code-review",
+            &observations,
+            &feedback,
+            &SkillSuccessCriteria::default(),
+        );
+
+        assert_eq!(report.status, SkillHealthStatus::NeedsAmendment);
+        assert!(
+            report
+                .proposed_routing_hints
+                .use_when
+                .iter()
+                .any(|item| item.contains("directly matches"))
+        );
+        assert_eq!(
+            report.proposed_routing_hints.trigger_examples,
+            vec!["review this rust diff for bugs".to_string()]
+        );
+        assert_eq!(
+            report.proposed_routing_hints.anti_trigger_examples,
+            vec![
+                "draft a launch email".to_string(),
+                "write release marketing copy".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn guardrail_patch_replaces_managed_block() {
         let raw = "---\nname: bug-triage\ndescription: triage bugs\n---\nBody\n";
         let block = guardrail_block(&["Guardrail one".to_string(), "Guardrail two".to_string()]);
@@ -1826,6 +2225,48 @@ mod tests {
             &guardrail_block(&["Guardrail one".to_string()]),
         );
         let restored = restore_guardrail_block(&updated, &[]);
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn routing_patch_overlays_existing_sections() {
+        let raw = "---\nname: code-review\ndescription: review code\n---\n## Use When\n- inspect a code diff\n\n## Not For\n- writing product copy\n";
+        let updated = replace_or_insert_routing_block(
+            raw,
+            &SkillRoutingHints {
+                use_when: vec!["only when the request is about finding bugs".to_string()],
+                not_for: vec!["general writing tasks".to_string()],
+                trigger_examples: vec!["review this rust patch for bugs".to_string()],
+                anti_trigger_examples: vec!["draft a launch email".to_string()],
+            },
+        );
+
+        assert!(updated.contains(ROUTING_BLOCK_BEGIN));
+        let sections = parse_skill_sections(&strip_frontmatter(&updated));
+        assert_eq!(
+            sections.use_when,
+            vec![
+                "inspect a code diff".to_string(),
+                "only when the request is about finding bugs".to_string(),
+            ]
+        );
+        assert_eq!(
+            sections.not_for,
+            vec![
+                "writing product copy".to_string(),
+                "general writing tasks".to_string(),
+            ]
+        );
+        assert_eq!(
+            sections.trigger_examples,
+            vec!["review this rust patch for bugs".to_string()]
+        );
+        assert_eq!(
+            sections.anti_trigger_examples,
+            vec!["draft a launch email".to_string()]
+        );
+
+        let restored = restore_routing_block(&updated, &SkillRoutingHints::default());
         assert_eq!(restored, raw);
     }
 
@@ -2137,6 +2578,141 @@ mod tests {
     }
 
     #[test]
+    fn doctor_fix_applies_routing_overlay_to_skill_file() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("code-review")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: code-review\ndescription: review code\n---\n## Use When\n- inspect a code diff\n\n## Not For\n- writing product copy\n\n## Instructions\n1. Review the diff\n",
+        )
+        .expect("write skill");
+        let original_digest = file_digest(&skill_path);
+
+        let observations = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review this rust diff for bugs".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "draft a launch email".to_string(),
+                outcome: SkillRunOutcome::AgentFailure,
+                tool_failures: Vec::new(),
+                agent_error: Some("Wrong task".to_string()),
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "write release marketing copy".to_string(),
+                outcome: SkillRunOutcome::AgentFailure,
+                tool_failures: Vec::new(),
+                agent_error: Some("Wrong task".to_string()),
+            },
+        ];
+        append_jsonl_records(&skill_observation_ledger_path(dir.path()), &observations)
+            .expect("write observations");
+        let feedback = vec![
+            sample_feedback(
+                "2026-03-15T10:12:00Z",
+                None,
+                "code-review",
+                &skill_path,
+                &original_digest,
+                1,
+                "wrong skill, misrouted request",
+            ),
+            sample_feedback(
+                "2026-03-15T10:15:00Z",
+                None,
+                "code-review",
+                &skill_path,
+                &original_digest,
+                2,
+                "bad trigger for writing tasks",
+            ),
+        ];
+        append_jsonl_records(&skill_feedback_ledger_path(dir.path()), &feedback)
+            .expect("write feedback");
+
+        let initial_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let initial_skill = initial_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "code-review")
+            .expect("skill report");
+        assert_eq!(initial_skill.status, SkillHealthStatus::NeedsAmendment);
+        assert!(!initial_skill.proposed_routing_hints.is_empty());
+
+        let fixed_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
+        let fixed_skill = fixed_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "code-review")
+            .expect("fixed skill report");
+        assert_eq!(fixed_skill.status, SkillHealthStatus::PendingData);
+        assert_eq!(fixed_report.applied_amendments.len(), 1);
+
+        let amended_raw = fs::read_to_string(&skill_path).expect("read amended skill");
+        assert!(amended_raw.contains(ROUTING_BLOCK_BEGIN));
+        let sections = parse_skill_sections(&strip_frontmatter(&amended_raw));
+        assert_eq!(
+            sections.use_when,
+            vec![
+                "inspect a code diff".to_string(),
+                "Use this skill only when the request directly matches its intended task and all required inputs are present."
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            sections.not_for,
+            vec![
+                "writing product copy".to_string(),
+                "Do not use this skill for loosely related requests, missing-input situations, or tasks better handled by another skill."
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            sections.trigger_examples,
+            vec!["review this rust diff for bugs".to_string()]
+        );
+        assert_eq!(
+            sections.anti_trigger_examples,
+            vec![
+                "draft a launch email".to_string(),
+                "write release marketing copy".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn doctor_uses_feedback_to_improve_successful_skill() {
         let dir = tempdir().expect("tempdir");
         let skill_path = dir
@@ -2328,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_fix_rolls_back_regressed_managed_guardrails() {
+    fn doctor_fix_rolls_back_regressed_managed_patch() {
         let dir = tempdir().expect("tempdir");
         let skill_path = dir
             .path()
@@ -2387,10 +2963,16 @@ mod tests {
         append_jsonl_records(&skill_observation_ledger_path(dir.path()), &healthy_entries)
             .expect("write healthy observations");
 
-        let forward_amendment = apply_guardrail_patch(
+        let forward_amendment = apply_managed_skill_patch(
             "summarize",
             &skill_path,
             &["Always emit exactly three bullet points.".to_string()],
+            &SkillRoutingHints {
+                use_when: vec!["only when the user asks for concise summaries".to_string()],
+                not_for: vec!["drafting original prose".to_string()],
+                trigger_examples: vec!["summarize these meeting notes".to_string()],
+                anti_trigger_examples: vec!["write a product announcement".to_string()],
+            },
             &["manual test amendment".to_string()],
             dir.path(),
         )
@@ -2398,6 +2980,11 @@ mod tests {
         .expect("amendment");
         let amended_digest = forward_amendment.new_digest.clone();
         assert_eq!(forward_amendment.previous_guardrails, Vec::<String>::new());
+        assert!(
+            fs::read_to_string(&skill_path)
+                .expect("read amended skill")
+                .contains(ROUTING_BLOCK_BEGIN)
+        );
 
         let regressed_entries = vec![
             SkillObservation {
