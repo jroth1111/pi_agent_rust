@@ -336,6 +336,7 @@ impl AnthropicProvider {
             max_tokens,
             temperature: options.temperature,
             tools,
+            cache_control: AnthropicCacheControl::from_retention(options.cache_retention),
             stream: true,
             thinking,
         }
@@ -815,9 +816,33 @@ pub struct AnthropicRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct AnthropicCacheControl {
+    r#type: &'static str,
+    ttl: &'static str,
+}
+
+impl AnthropicCacheControl {
+    const fn from_retention(retention: CacheRetention) -> Option<Self> {
+        match retention {
+            CacheRetention::None => None,
+            CacheRetention::Short => Some(Self {
+                r#type: "ephemeral",
+                ttl: "5m",
+            }),
+            CacheRetention::Long => Some(Self {
+                r#type: "ephemeral",
+                ttl: "1h",
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1207,6 +1232,7 @@ mod tests {
         assert_eq!(request.temperature, Some(0.2));
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
+        assert!(request.cache_control.is_none());
 
         let thinking = request.thinking.expect("thinking config");
         assert_eq!(thinking.r#type, "enabled");
@@ -1246,9 +1272,61 @@ mod tests {
         assert_eq!(request.model, "claude-test");
         assert_eq!(request.system, None);
         assert!(request.tools.is_none());
+        assert!(request.cache_control.is_none());
         assert!(request.thinking.is_none());
         assert_eq!(request.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(request.stream);
+    }
+
+    #[test]
+    fn test_build_request_includes_prompt_cache_control() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let request = provider.build_request(
+            &context,
+            &StreamOptions {
+                cache_retention: CacheRetention::Short,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            request.cache_control,
+            Some(AnthropicCacheControl {
+                r#type: "ephemeral",
+                ttl: "5m",
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_request_uses_long_prompt_cache_ttl() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context::default();
+        let request = provider.build_request(
+            &context,
+            &StreamOptions {
+                cache_retention: CacheRetention::Long,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            request.cache_control,
+            Some(AnthropicCacheControl {
+                r#type: "ephemeral",
+                ttl: "1h",
+            })
+        );
     }
 
     #[test]
@@ -1602,6 +1680,14 @@ mod tests {
         assert_eq!(
             captured.headers.get("anthropic-beta").map(String::as_str),
             Some("prompt-caching-2024-07-31")
+        );
+        let body: Value = serde_json::from_str(&captured.body).expect("request body json");
+        assert_eq!(
+            body.get("cache_control"),
+            Some(&json!({
+                "type": "ephemeral",
+                "ttl": "5m"
+            }))
         );
     }
 

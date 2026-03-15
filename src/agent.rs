@@ -38,7 +38,7 @@ use crate::model::{
     UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry};
-use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
 #[allow(unused_imports)]
 use crate::reliability::{
     ArtifactStore, Attempt, AttemptStats, CloseOutcomeKind, ClosePayload, CloseResult,
@@ -70,6 +70,7 @@ use std::time::Instant;
 
 const MAX_CONCURRENT_TOOLS: usize = 8;
 const RELIABILITY_OBJECTIVE_MAX_CHARS: usize = 160;
+const PROMPT_CACHE_AUTO_MIN_BYTES: usize = 4 * 1024;
 
 // ============================================================================
 // Agent Configuration
@@ -106,6 +107,75 @@ impl Default for AgentConfig {
 pub type MessageFetcher = Arc<dyn Fn() -> BoxFuture<'static, Vec<Message>> + Send + Sync + 'static>;
 
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
+
+fn estimate_tool_def_bytes(tool: &ToolDef) -> usize {
+    tool.name.len()
+        + tool.description.len()
+        + serde_json::to_string(&tool.parameters).map_or(0, |json| json.len())
+}
+
+fn estimate_message_bytes(message: &Message) -> usize {
+    fn estimate_blocks(blocks: &[ContentBlock]) -> usize {
+        blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.len(),
+                ContentBlock::Thinking(thinking) => thinking.thinking.len(),
+                ContentBlock::Image(image) => image.data.len() + image.mime_type.len(),
+                ContentBlock::ToolCall(tool_call) => {
+                    tool_call.id.len()
+                        + tool_call.name.len()
+                        + serde_json::to_string(&tool_call.arguments).map_or(0, |json| json.len())
+                }
+            })
+            .sum()
+    }
+
+    match message {
+        Message::User(UserMessage { content, .. }) => match content {
+            UserContent::Text(text) => text.len(),
+            UserContent::Blocks(blocks) => estimate_blocks(blocks),
+        },
+        Message::Assistant(message) => estimate_blocks(&message.content),
+        Message::ToolResult(result) => {
+            result.tool_call_id.len()
+                + result.tool_name.len()
+                + estimate_blocks(&result.content)
+                + result
+                    .details
+                    .as_ref()
+                    .and_then(|details| serde_json::to_string(details).ok())
+                    .map_or(0, |json| json.len())
+        }
+        Message::Custom(custom) => {
+            custom.custom_type.len()
+                + custom.content.len()
+                + custom
+                    .details
+                    .as_ref()
+                    .and_then(|details| serde_json::to_string(details).ok())
+                    .map_or(0, |json| json.len())
+        }
+    }
+}
+
+fn estimate_context_bytes(context: &Context<'_>) -> usize {
+    let system_bytes = context
+        .system_prompt
+        .as_ref()
+        .map_or(0, |prompt| prompt.len());
+    let message_bytes = context
+        .messages
+        .iter()
+        .map(estimate_message_bytes)
+        .sum::<usize>();
+    let tool_bytes = context
+        .tools
+        .iter()
+        .map(estimate_tool_def_bytes)
+        .sum::<usize>();
+    system_bytes + message_bytes + tool_bytes
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMode {
@@ -620,6 +690,24 @@ impl Agent {
         }
     }
 
+    fn resolve_cache_retention(
+        provider: &dyn Provider,
+        explicit: CacheRetention,
+        context: &Context<'_>,
+    ) -> CacheRetention {
+        if explicit != CacheRetention::None {
+            return explicit;
+        }
+        if provider.api() != "anthropic-messages" {
+            return CacheRetention::None;
+        }
+        if estimate_context_bytes(context) < PROMPT_CACHE_AUTO_MIN_BYTES {
+            return CacheRetention::None;
+        }
+
+        CacheRetention::Short
+    }
+
     /// Run the agent with a user message.
     ///
     /// Returns a stream of events and the final assistant message.
@@ -1050,8 +1138,13 @@ impl Agent {
     ) -> Result<AssistantMessage> {
         // Build context and stream completion
         let provider = Arc::clone(&self.provider);
-        let stream_options = self.config.stream_options.clone();
+        let mut stream_options = self.config.stream_options.clone();
         let context = self.build_context();
+        stream_options.cache_retention = Self::resolve_cache_retention(
+            provider.as_ref(),
+            stream_options.cache_retention,
+            &context,
+        );
         let mut stream = provider.stream(&context, &stream_options).await?;
 
         let mut added_partial = false;
@@ -7143,6 +7236,83 @@ mod tests {
         > {
             Ok(Box::pin(futures::stream::empty()))
         }
+    }
+
+    #[test]
+    fn resolve_cache_retention_preserves_explicit_policy() {
+        let context = Context::owned(
+            None,
+            vec![user_message(&"x".repeat(PROMPT_CACHE_AUTO_MIN_BYTES))],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            Agent::resolve_cache_retention(&SilentProvider, CacheRetention::Long, &context),
+            CacheRetention::Long
+        );
+    }
+
+    #[test]
+    fn resolve_cache_retention_skips_small_or_unsupported_contexts() {
+        let context = Context::owned(None, vec![user_message("small prompt")], Vec::new());
+
+        assert_eq!(
+            Agent::resolve_cache_retention(&SilentProvider, CacheRetention::None, &context),
+            CacheRetention::None
+        );
+    }
+
+    #[test]
+    fn resolve_cache_retention_enables_short_cache_for_large_anthropic_contexts() {
+        #[derive(Debug)]
+        struct AnthropicLikeProvider;
+
+        #[async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl Provider for AnthropicLikeProvider {
+            fn name(&self) -> &str {
+                "anthropic-like"
+            }
+
+            fn api(&self) -> &str {
+                "anthropic-messages"
+            }
+
+            fn model_id(&self) -> &str {
+                "claude-test"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+            > {
+                unreachable!("stream is not used in this unit test")
+            }
+        }
+
+        let context = Context::owned(
+            Some("system".repeat(256)),
+            vec![user_message(&"x".repeat(PROMPT_CACHE_AUTO_MIN_BYTES))],
+            vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }),
+            }],
+        );
+
+        assert_eq!(
+            Agent::resolve_cache_retention(&AnthropicLikeProvider, CacheRetention::None, &context),
+            CacheRetention::Short
+        );
     }
 
     #[test]

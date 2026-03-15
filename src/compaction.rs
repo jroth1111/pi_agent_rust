@@ -17,7 +17,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ThinkingLevel, ToolCall,
     Usage, UserContent, UserMessage,
 };
-use crate::provider::{Context, Provider, StreamOptions};
+use crate::provider::{CacheRetention, Context, Provider, StreamOptions};
 use crate::session::{
     SessionEntry, SessionMessage, prompt_metadata_from_entries,
     prompt_transform_messages_with_metadata, session_message_to_model,
@@ -37,6 +37,7 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 3;
 
 /// Estimated tokens for an image content block (~1200 tokens).
 const IMAGE_TOKEN_ESTIMATE: usize = 1200;
+const PROMPT_CACHE_AUTO_MIN_BYTES: usize = 4 * 1024;
 
 /// Character-equivalent estimate for an image (IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE).
 const IMAGE_CHAR_ESTIMATE: usize = IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE;
@@ -1264,6 +1265,8 @@ async fn complete_simple(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let max_tokens = (f64::from(reserve_tokens) * max_tokens_factor).floor() as u32;
     let max_tokens = max_tokens.max(256);
+    let cache_retention =
+        compaction_cache_retention(provider.as_ref(), system_prompt, &prompt_text);
 
     let context = Context {
         system_prompt: Some(system_prompt.to_string().into()),
@@ -1277,6 +1280,7 @@ async fn complete_simple(
 
     let options = StreamOptions {
         api_key: Some(api_key.to_string()),
+        cache_retention,
         max_tokens: Some(max_tokens),
         thinking_level: Some(ThinkingLevel::High),
         ..Default::default()
@@ -1308,6 +1312,21 @@ async fn complete_simple(
         return Err(Error::api(msg));
     }
     Ok(message)
+}
+
+fn compaction_cache_retention(
+    provider: &dyn Provider,
+    system_prompt: &str,
+    prompt_text: &str,
+) -> CacheRetention {
+    if provider.api() != "anthropic-messages" {
+        return CacheRetention::None;
+    }
+    if system_prompt.len() + prompt_text.len() < PROMPT_CACHE_AUTO_MIN_BYTES {
+        return CacheRetention::None;
+    }
+
+    CacheRetention::Short
 }
 
 async fn generate_summary(
@@ -1730,7 +1749,11 @@ pub fn compaction_details_to_value(details: &CompactionDetails) -> Result<Value>
 mod tests {
     use super::*;
     use crate::model::{AssistantMessage, ContentBlock, TextContent, Usage};
+    use crate::provider::StreamEvent;
+    use async_trait::async_trait;
+    use futures::Stream;
     use serde_json::json;
+    use std::pin::Pin;
 
     fn make_user_text(text: &str) -> SessionMessage {
         SessionMessage::User {
@@ -1779,6 +1802,58 @@ mod tests {
                 usage: Usage::default(),
             },
         }
+    }
+
+    #[derive(Debug)]
+    struct TestProvider {
+        api: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for TestProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn api(&self) -> &str {
+            self.api
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            unreachable!("stream is not used in these unit tests")
+        }
+    }
+
+    #[test]
+    fn compaction_cache_retention_skips_small_or_unsupported_prompts() {
+        let provider = TestProvider { api: "openai" };
+        assert_eq!(
+            super::compaction_cache_retention(&provider, "system", "small prompt"),
+            CacheRetention::None
+        );
+    }
+
+    #[test]
+    fn compaction_cache_retention_enables_short_cache_for_large_anthropic_prompts() {
+        let provider = TestProvider {
+            api: "anthropic-messages",
+        };
+        assert_eq!(
+            super::compaction_cache_retention(
+                &provider,
+                &"system".repeat(256),
+                &"x".repeat(PROMPT_CACHE_AUTO_MIN_BYTES)
+            ),
+            CacheRetention::Short
+        );
     }
 
     fn make_tool_result(text: &str) -> SessionMessage {
