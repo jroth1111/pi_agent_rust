@@ -86,7 +86,7 @@ pub fn phase_and_wake_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<
     }
 
     if snapshot.plan_required && !snapshot.plan_accepted {
-        return phase_event(snapshot, RunPhase::Planning, "materialize and accept plan");
+        return phase_event(snapshot, RunPhase::Planning, "accept plan before dispatch");
     }
 
     let approvals_pending = snapshot
@@ -239,7 +239,6 @@ mod tests {
             phase: RunPhase::Dispatching,
             plan_required: true,
             plan_accepted: true,
-            auto_proceed_after_planning: true,
             plan: None,
             tasks: BTreeMap::new(),
             jobs: BTreeMap::new(),

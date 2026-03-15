@@ -16,7 +16,6 @@ pub enum RuntimeCommand {
         spec: RunSpec,
         plan: PlanArtifact,
         tasks: Vec<TaskNode>,
-        auto_proceed_after_planning: bool,
     },
     AcceptPlan,
     SetPhase {
@@ -142,12 +141,7 @@ where
         let mut events = Vec::new();
 
         match command {
-            RuntimeCommand::BootstrapRun {
-                spec,
-                plan,
-                tasks,
-                auto_proceed_after_planning,
-            } => {
+            RuntimeCommand::BootstrapRun { spec, plan, tasks } => {
                 let mut request = PolicyRequest::new(PolicyTarget::Run {
                     run_id: spec.run_id.clone(),
                     objective: spec.objective.clone(),
@@ -174,7 +168,6 @@ where
 
                 let mut snapshot = RunSnapshot::new(spec.clone());
                 snapshot.plan_required = true;
-                snapshot.auto_proceed_after_planning = auto_proceed_after_planning;
                 let mut machine = RuntimeStateMachine::new(snapshot);
                 let run_id = spec.run_id.clone();
                 routed_phases = routed_phase_for(&self.router, RunPhase::Planning);
@@ -395,7 +388,6 @@ mod tests {
                 spec: sample_spec(),
                 plan: sample_plan(),
                 tasks: vec![sample_task()],
-                auto_proceed_after_planning: true,
             })
             .expect("bootstrap");
         assert_eq!(output.snapshot.phase, RunPhase::Planning);
@@ -414,7 +406,6 @@ mod tests {
                 spec: sample_spec(),
                 plan: sample_plan(),
                 tasks: vec![sample_task()],
-                auto_proceed_after_planning: false,
             })
             .expect("bootstrap");
         controller
@@ -481,14 +472,12 @@ mod tests {
                 spec: sample_spec(),
                 plan: sample_plan(),
                 tasks: vec![sample_task()],
-                auto_proceed_after_planning: false,
             })
             .expect("bootstrap");
 
         assert_eq!(output.snapshot.phase, RunPhase::Planning);
         assert!(output.snapshot.plan_required);
         assert!(!output.snapshot.plan_accepted);
-        assert!(!output.snapshot.auto_proceed_after_planning);
     }
 
     #[test]
