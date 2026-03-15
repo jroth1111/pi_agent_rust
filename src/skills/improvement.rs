@@ -1,3 +1,4 @@
+use super::loader::{LoadSkillsOptions, load_skills};
 use super::schema::{ExplicitSkillInvocation, Skill};
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -6,9 +7,9 @@ use crate::extensions::sha256_hex_standalone;
 use crate::session::Session;
 use crate::tools::ToolOutput;
 use chrono::{SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -16,10 +17,13 @@ use std::path::{Path, PathBuf};
 
 pub const SKILL_OBSERVATION_ENTRY_TYPE: &str = "skill/observation.v1";
 pub const SKILL_AMENDMENT_ENTRY_TYPE: &str = "skill/amendment.v1";
+pub const SKILL_FEEDBACK_ENTRY_TYPE: &str = "skill/feedback.v1";
 const SKILL_OBSERVATION_LEDGER: &str = "skill-observations.jsonl";
 const SKILL_AMENDMENT_LEDGER: &str = "skill-amendments.jsonl";
+const SKILL_FEEDBACK_LEDGER: &str = "skill-feedback.jsonl";
 const GUARDRAIL_BLOCK_BEGIN: &str = "<!-- PI-SKILL-GUARDRAILS:BEGIN -->";
 const GUARDRAIL_BLOCK_END: &str = "<!-- PI-SKILL-GUARDRAILS:END -->";
+const LOW_FEEDBACK_THRESHOLD: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +87,21 @@ pub struct SkillAmendment {
     pub evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFeedback {
+    pub version: u8,
+    pub recorded_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub skill_name: String,
+    pub skill_path: PathBuf,
+    pub skill_digest: String,
+    pub rating: u8,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub notes: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillHealthStatus {
@@ -101,6 +120,9 @@ pub struct SkillSuccessCriteria {
     pub max_consecutive_failures: usize,
     pub min_post_amend_runs: usize,
     pub min_improvement_delta: f64,
+    pub min_feedback_sample_size: usize,
+    pub min_average_feedback_score: f64,
+    pub min_feedback_improvement_delta: f64,
 }
 
 impl Default for SkillSuccessCriteria {
@@ -111,6 +133,9 @@ impl Default for SkillSuccessCriteria {
             max_consecutive_failures: 2,
             min_post_amend_runs: 3,
             min_improvement_delta: 0.15,
+            min_feedback_sample_size: 2,
+            min_average_feedback_score: 3.5,
+            min_feedback_improvement_delta: 0.5,
         }
     }
 }
@@ -125,6 +150,10 @@ pub struct SkillHealthReport {
     pub run_count: usize,
     pub success_rate: f64,
     pub consecutive_failures: usize,
+    pub feedback_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_feedback_score: Option<f64>,
+    pub low_feedback_count: usize,
     pub status: SkillHealthStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
@@ -134,6 +163,10 @@ pub struct SkillHealthReport {
     pub previous_success_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_success_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_average_feedback_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_average_feedback_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,6 +174,7 @@ pub struct SkillHealthReport {
 pub struct SkillDoctorReport {
     pub criteria: SkillSuccessCriteria,
     pub observation_count: usize,
+    pub feedback_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillHealthReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -176,6 +210,22 @@ struct TrackedSkill {
 struct ActivatedSkill {
     skill: TrackedSkill,
     source: SkillActivationSource,
+}
+
+#[derive(Debug, Clone)]
+struct SkillFeedbackTarget {
+    name: String,
+    path: PathBuf,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RevisionEvaluation {
+    status: SkillHealthStatus,
+    previous_success_rate: Option<f64>,
+    latest_success_rate: Option<f64>,
+    previous_average_feedback_score: Option<f64>,
+    latest_average_feedback_score: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +407,51 @@ pub fn persist_skill_tracker(
     Ok(observations)
 }
 
+pub fn handle_skill_feedback(
+    cwd: &Path,
+    skill_name: &str,
+    rating: u8,
+    notes: Option<&str>,
+    session_id: Option<&str>,
+    format: SkillDoctorFormat,
+) -> Result<SkillFeedback> {
+    if !(1..=5).contains(&rating) {
+        return Err(Error::validation(format!(
+            "Skill feedback rating must be between 1 and 5 inclusive: {rating}"
+        )));
+    }
+
+    let observations = load_observations(cwd)?;
+    let target = resolve_skill_feedback_target(cwd, skill_name, session_id, &observations)?;
+    let feedback = SkillFeedback {
+        version: 1,
+        recorded_at_utc: timestamp_now(),
+        session_id: normalize_optional_text(session_id),
+        skill_name: target.name,
+        skill_path: target.path,
+        skill_digest: target.digest,
+        rating,
+        notes: normalize_optional_text(notes).unwrap_or_default(),
+    };
+
+    append_jsonl_records(&skill_feedback_ledger_path(cwd), &[feedback.clone()])?;
+
+    match format {
+        SkillDoctorFormat::Text => {
+            println!("{}", render_skill_feedback_receipt(&feedback)?);
+        }
+        SkillDoctorFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&feedback)
+                    .map_err(|err| Error::session(format!("serialize skill feedback: {err}")))?
+            );
+        }
+    }
+
+    Ok(feedback)
+}
+
 pub fn handle_skill_doctor(
     cwd: &Path,
     format: SkillDoctorFormat,
@@ -364,18 +459,37 @@ pub fn handle_skill_doctor(
 ) -> Result<SkillDoctorReport> {
     let criteria = SkillSuccessCriteria::default();
     let observations = load_observations(cwd)?;
-    let mut grouped: BTreeMap<String, Vec<SkillObservation>> = BTreeMap::new();
+    let feedback = load_feedback(cwd)?;
+    let mut grouped_observations: BTreeMap<String, Vec<SkillObservation>> = BTreeMap::new();
     for observation in observations.iter().cloned() {
-        grouped
+        grouped_observations
             .entry(observation.skill_name.clone())
             .or_default()
             .push(observation);
     }
+    let mut grouped_feedback: BTreeMap<String, Vec<SkillFeedback>> = BTreeMap::new();
+    for entry in feedback.iter().cloned() {
+        grouped_feedback
+            .entry(entry.skill_name.clone())
+            .or_default()
+            .push(entry);
+    }
 
+    let mut skill_names = BTreeSet::new();
+    skill_names.extend(grouped_observations.keys().cloned());
+    skill_names.extend(grouped_feedback.keys().cloned());
     let mut skills = Vec::new();
-    for mut entries in grouped.into_values() {
+    for skill_name in skill_names {
+        let mut entries = grouped_observations.remove(&skill_name).unwrap_or_default();
         entries.sort_by(|a, b| a.recorded_at_utc.cmp(&b.recorded_at_utc));
-        skills.push(build_skill_health_report(&entries, &criteria));
+        let mut feedback_entries = grouped_feedback.remove(&skill_name).unwrap_or_default();
+        feedback_entries.sort_by(|a, b| a.recorded_at_utc.cmp(&b.recorded_at_utc));
+        skills.push(build_skill_health_report(
+            &skill_name,
+            &entries,
+            &feedback_entries,
+            &criteria,
+        ));
     }
     skills.sort_by(|a, b| a.skill_name.cmp(&b.skill_name));
 
@@ -408,6 +522,7 @@ pub fn handle_skill_doctor(
     let report = SkillDoctorReport {
         criteria,
         observation_count: observations.len(),
+        feedback_count: feedback.len(),
         skills,
         applied_amendments,
     };
@@ -430,37 +545,53 @@ pub fn handle_skill_doctor(
 }
 
 fn build_skill_health_report(
-    entries: &[SkillObservation],
+    skill_name: &str,
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
     criteria: &SkillSuccessCriteria,
 ) -> SkillHealthReport {
-    let latest = entries.last().expect("skill entries should not be empty");
-    let current_digest = file_digest(&latest.skill_path);
-    let run_count = entries.len();
-    let success_rate = success_rate(entries);
-    let consecutive_failures = entries
-        .iter()
-        .rev()
-        .take_while(|entry| !entry.outcome.is_success())
-        .count();
-    let evidence = summarize_evidence(entries);
-    let mut proposed_guardrails = recommend_guardrails(entries);
+    let (latest_path, latest_digest) = if let Some(latest) = observations.last() {
+        (latest.skill_path.clone(), latest.skill_digest.clone())
+    } else if let Some(latest) = feedback.last() {
+        (latest.skill_path.clone(), latest.skill_digest.clone())
+    } else {
+        panic!("skill evidence should not be empty");
+    };
 
-    let has_unobserved_revision =
-        current_digest != "missing" && current_digest != latest.skill_digest;
+    let (previous_observations, latest_observations) =
+        split_observations_by_digest(observations, &latest_digest);
+    let (previous_feedback, latest_feedback) = split_feedback_by_digest(feedback, &latest_digest);
+    let current_digest = file_digest(&latest_path);
+    let run_count = latest_observations.len();
+    let success_rate = success_rate(latest_observations);
+    let consecutive_failures = consecutive_failures(latest_observations);
+    let feedback_count = latest_feedback.len();
+    let average_feedback_score = average_feedback_score(latest_feedback);
+    let low_feedback_count = low_feedback_count(latest_feedback);
+    let evidence = summarize_evidence(latest_observations, latest_feedback);
+    let mut proposed_guardrails =
+        recommend_guardrails(latest_observations, latest_feedback, criteria);
+
+    let has_unobserved_revision = current_digest != "missing" && current_digest != latest_digest;
     if has_unobserved_revision {
         let mut report = SkillHealthReport {
-            skill_name: latest.skill_name.clone(),
-            skill_path: latest.skill_path.clone(),
-            latest_digest: latest.skill_digest.clone(),
+            skill_name: skill_name.to_string(),
+            skill_path: latest_path,
+            latest_digest,
             current_digest,
             run_count,
             success_rate,
             consecutive_failures,
+            feedback_count,
+            average_feedback_score,
+            low_feedback_count,
             status: SkillHealthStatus::PendingData,
             evidence,
             proposed_guardrails,
             previous_success_rate: Some(success_rate),
             latest_success_rate: None,
+            previous_average_feedback_score: average_feedback_score,
+            latest_average_feedback_score: None,
         };
         let pending_digest = report.current_digest.clone();
         mark_report_pending_for_unobserved_revision(&mut report, criteria, pending_digest);
@@ -469,30 +600,44 @@ fn build_skill_health_report(
 
     let unhealthy = run_count >= criteria.min_sample_size
         && (success_rate < criteria.min_success_rate
-            || consecutive_failures >= criteria.max_consecutive_failures);
+            || consecutive_failures >= criteria.max_consecutive_failures)
+        || feedback_count >= criteria.min_feedback_sample_size
+            && average_feedback_score
+                .is_some_and(|score| score < criteria.min_average_feedback_score);
 
-    let (status, previous_success_rate, latest_success_rate) =
-        evaluate_latest_revision(entries, criteria, unhealthy);
+    let evaluation = evaluate_latest_revision(
+        previous_observations,
+        latest_observations,
+        previous_feedback,
+        latest_feedback,
+        criteria,
+        unhealthy,
+    );
     if matches!(
-        status,
+        evaluation.status,
         SkillHealthStatus::Healthy | SkillHealthStatus::Improved
     ) {
         proposed_guardrails.clear();
     }
 
     SkillHealthReport {
-        skill_name: latest.skill_name.clone(),
-        skill_path: latest.skill_path.clone(),
-        latest_digest: latest.skill_digest.clone(),
+        skill_name: skill_name.to_string(),
+        skill_path: latest_path,
+        latest_digest,
         current_digest,
         run_count,
         success_rate,
         consecutive_failures,
-        status,
+        feedback_count,
+        average_feedback_score,
+        low_feedback_count,
+        status: evaluation.status,
         evidence,
         proposed_guardrails,
-        previous_success_rate,
-        latest_success_rate,
+        previous_success_rate: evaluation.previous_success_rate,
+        latest_success_rate: evaluation.latest_success_rate,
+        previous_average_feedback_score: evaluation.previous_average_feedback_score,
+        latest_average_feedback_score: evaluation.latest_average_feedback_score,
     }
 }
 
@@ -508,6 +653,10 @@ fn mark_report_pending_for_unobserved_revision(
         .previous_success_rate
         .get_or_insert(report.success_rate);
     report.latest_success_rate = None;
+    if let Some(score) = report.average_feedback_score {
+        report.previous_average_feedback_score.get_or_insert(score);
+    }
+    report.latest_average_feedback_score = None;
 
     let evidence = pending_revision_evidence(criteria);
     if !report.evidence.iter().any(|entry| entry == &evidence) {
@@ -523,78 +672,105 @@ fn pending_revision_evidence(criteria: &SkillSuccessCriteria) -> String {
 }
 
 fn evaluate_latest_revision(
-    entries: &[SkillObservation],
+    previous_observations: &[SkillObservation],
+    latest_observations: &[SkillObservation],
+    previous_feedback: &[SkillFeedback],
+    latest_feedback: &[SkillFeedback],
     criteria: &SkillSuccessCriteria,
     unhealthy: bool,
-) -> (SkillHealthStatus, Option<f64>, Option<f64>) {
-    let latest_digest = &entries
-        .last()
-        .expect("skill entries should not be empty")
-        .skill_digest;
-    let split_at = entries
-        .iter()
-        .rposition(|entry| entry.skill_digest != *latest_digest)
-        .map_or(0, |idx| idx + 1);
+) -> RevisionEvaluation {
+    let previous_success_rate =
+        (!previous_observations.is_empty()).then(|| success_rate(previous_observations));
+    let latest_success_rate =
+        (!latest_observations.is_empty()).then(|| success_rate(latest_observations));
+    let previous_average_feedback_score = average_feedback_score(previous_feedback);
+    let latest_average_feedback_score = average_feedback_score(latest_feedback);
+    let has_previous_revision = !previous_observations.is_empty() || !previous_feedback.is_empty();
 
-    if split_at == 0 {
+    if !has_previous_revision {
         let status = if unhealthy {
             SkillHealthStatus::NeedsAmendment
-        } else if entries.len() < criteria.min_sample_size {
+        } else if latest_observations.len() < criteria.min_sample_size
+            && latest_feedback.len() < criteria.min_feedback_sample_size
+        {
             SkillHealthStatus::PendingData
         } else {
             SkillHealthStatus::Healthy
         };
-        return (status, None, None);
+        return RevisionEvaluation {
+            status,
+            previous_success_rate: None,
+            latest_success_rate,
+            previous_average_feedback_score: None,
+            latest_average_feedback_score,
+        };
     }
 
-    let previous_entries = &entries[..split_at];
-    let latest_entries = &entries[split_at..];
-    let previous_rate = success_rate(previous_entries);
-    let latest_rate = success_rate(latest_entries);
-
-    if latest_entries.len() < criteria.min_post_amend_runs {
+    let has_observation_window = latest_observations.len() >= criteria.min_post_amend_runs;
+    let has_feedback_window = latest_feedback.len() >= criteria.min_feedback_sample_size;
+    if !has_observation_window && !has_feedback_window {
         let status = if unhealthy {
             SkillHealthStatus::NeedsAmendment
         } else {
             SkillHealthStatus::PendingData
         };
-        return (status, Some(previous_rate), Some(latest_rate));
+        return RevisionEvaluation {
+            status,
+            previous_success_rate,
+            latest_success_rate,
+            previous_average_feedback_score,
+            latest_average_feedback_score,
+        };
     }
 
-    let delta = latest_rate - previous_rate;
-    if delta >= criteria.min_improvement_delta {
-        (
-            SkillHealthStatus::Improved,
-            Some(previous_rate),
-            Some(latest_rate),
-        )
-    } else if delta <= -criteria.min_improvement_delta {
-        (
-            SkillHealthStatus::Regressed,
-            Some(previous_rate),
-            Some(latest_rate),
-        )
-    } else if unhealthy {
-        (
-            SkillHealthStatus::NeedsAmendment,
-            Some(previous_rate),
-            Some(latest_rate),
-        )
+    let success_delta = if has_observation_window {
+        previous_success_rate
+            .zip(latest_success_rate)
+            .map(|(previous, latest)| latest - previous)
     } else {
-        (
-            SkillHealthStatus::Healthy,
-            Some(previous_rate),
-            Some(latest_rate),
-        )
+        None
+    };
+    let feedback_delta = if has_feedback_window {
+        previous_average_feedback_score
+            .zip(latest_average_feedback_score)
+            .map(|(previous, latest)| latest - previous)
+    } else {
+        None
+    };
+    let regressed = success_delta.is_some_and(|delta| delta <= -criteria.min_improvement_delta)
+        || feedback_delta.is_some_and(|delta| delta <= -criteria.min_feedback_improvement_delta);
+    let improved = success_delta.is_some_and(|delta| delta >= criteria.min_improvement_delta)
+        || feedback_delta.is_some_and(|delta| delta >= criteria.min_feedback_improvement_delta);
+
+    let status = if regressed {
+        SkillHealthStatus::Regressed
+    } else if improved {
+        SkillHealthStatus::Improved
+    } else if unhealthy {
+        SkillHealthStatus::NeedsAmendment
+    } else {
+        SkillHealthStatus::Healthy
+    };
+
+    RevisionEvaluation {
+        status,
+        previous_success_rate,
+        latest_success_rate,
+        previous_average_feedback_score,
+        latest_average_feedback_score,
     }
 }
 
-fn recommend_guardrails(entries: &[SkillObservation]) -> Vec<String> {
+fn recommend_guardrails(
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
+    criteria: &SkillSuccessCriteria,
+) -> Vec<String> {
     let mut guardrails = Vec::new();
     let mut failure_counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut agent_failure_count = 0usize;
 
-    for entry in entries {
+    for entry in observations {
         if matches!(
             entry.outcome,
             SkillRunOutcome::AgentFailure | SkillRunOutcome::Aborted
@@ -636,19 +812,136 @@ fn recommend_guardrails(entries: &[SkillObservation]) -> Vec<String> {
                 .to_string(),
         );
     }
-    if !entries.is_empty() && guardrails.is_empty() {
+    let low_feedback = feedback
+        .iter()
+        .filter(|entry| entry.rating <= LOW_FEEDBACK_THRESHOLD)
+        .collect::<Vec<_>>();
+    let low_feedback_problem = feedback.len() >= criteria.min_feedback_sample_size
+        && average_feedback_score(feedback)
+            .is_some_and(|score| score < criteria.min_average_feedback_score);
+    if low_feedback_problem {
+        let notes = low_feedback
+            .iter()
+            .map(|entry| entry.notes.trim())
+            .filter(|notes| !notes.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+
+        if contains_any(
+            &notes,
+            &[
+                "format", "json", "yaml", "table", "bullet", "schema", "field",
+            ],
+        ) {
+            guardrails.push(
+                "State the expected output contract before responding, then verify the final answer matches the required format and fields exactly."
+                    .to_string(),
+            );
+        }
+        if contains_any(
+            &notes,
+            &[
+                "wrong",
+                "incorrect",
+                "inaccurate",
+                "halluc",
+                "made up",
+                "false",
+            ],
+        ) {
+            guardrails.push(
+                "Add a verification step for every factual or codebase-specific claim; when evidence is missing, say so instead of guessing."
+                    .to_string(),
+            );
+        }
+        if contains_any(
+            &notes,
+            &[
+                "missing",
+                "incomplete",
+                "forgot",
+                "skipped",
+                "left out",
+                "partial",
+            ],
+        ) {
+            guardrails.push(
+                "Use a completion checklist before finishing so all requested steps, files, and deliverables are explicitly covered."
+                    .to_string(),
+            );
+        }
+        if contains_any(
+            &notes,
+            &[
+                "verbose",
+                "too long",
+                "wordy",
+                "rambling",
+                "too much detail",
+            ],
+        ) {
+            guardrails.push(
+                "Keep the final response concise by default; include only the requested outcome, verification, and the minimum supporting context."
+                    .to_string(),
+            );
+        }
+        if contains_any(
+            &notes,
+            &[
+                "wrong skill",
+                "not applicable",
+                "irrelevant",
+                "bad trigger",
+                "misrouted",
+                "should not have used",
+            ],
+        ) {
+            guardrails.push(
+                "Tighten activation criteria: only use this skill when the task matches its trigger conditions and required inputs are available."
+                    .to_string(),
+            );
+        }
+        if low_feedback_problem && guardrails.is_empty() {
+            guardrails.push(
+                "Add explicit prerequisites, output expectations, and verification steps before acting so future runs can fail early instead of producing low-quality output."
+                    .to_string(),
+            );
+        }
+    }
+    if (!observations.is_empty() || !feedback.is_empty()) && guardrails.is_empty() {
         guardrails.push(
             "Before each tool call, verify prerequisites and stop with a concrete explanation instead of cascading into secondary failures."
                 .to_string(),
         );
     }
 
+    guardrails.sort();
+    guardrails.dedup();
     guardrails
 }
 
-fn summarize_evidence(entries: &[SkillObservation]) -> Vec<String> {
+fn summarize_evidence(
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if let Some(average) = average_feedback_score(feedback) {
+        evidence.push(format!(
+            "average feedback {:.1}/5 across {} rating(s)",
+            average,
+            feedback.len()
+        ));
+    }
+    let low_feedback_count = low_feedback_count(feedback);
+    if low_feedback_count > 0 {
+        evidence.push(format!(
+            "{low_feedback_count} low-feedback rating(s) (<= {LOW_FEEDBACK_THRESHOLD}/5)"
+        ));
+    }
+
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for entry in entries {
+    for entry in observations {
         if let Some(error) = &entry.agent_error {
             *counts
                 .entry(format!("agent: {}", normalize_signature(error)))
@@ -658,6 +951,16 @@ fn summarize_evidence(entries: &[SkillObservation]) -> Vec<String> {
             *counts
                 .entry(format!("{}: {}", failure.tool_name, failure.signature))
                 .or_default() += 1;
+        }
+    }
+    for entry in feedback {
+        if entry.rating <= LOW_FEEDBACK_THRESHOLD {
+            let label = if entry.notes.trim().is_empty() {
+                format!("feedback: rating {}/5", entry.rating)
+            } else {
+                format!("feedback: {}", normalize_signature(&entry.notes))
+            };
+            *counts.entry(label).or_default() += 1;
         }
     }
 
@@ -671,7 +974,8 @@ fn summarize_evidence(entries: &[SkillObservation]) -> Vec<String> {
         .into_iter()
         .take(3)
         .map(|(message, count)| format!("{message} ({count}x)"))
-        .collect()
+        .for_each(|entry| evidence.push(entry));
+    evidence
 }
 
 fn apply_guardrail_patch(
@@ -757,30 +1061,40 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
     let mut out = String::new();
     writeln!(
         out,
-        "Success criteria: min sample {}, target success rate {:.0}%, max consecutive failures {}, min post-amend runs {}, required improvement {:.0}%",
+        "Success criteria: min sample {}, target success rate {:.0}%, max consecutive failures {}, min feedback sample {}, target average feedback {:.1}/5, min post-amend runs {}, required success-rate improvement {:.0}%, required feedback improvement {:.1}",
         report.criteria.min_sample_size,
         report.criteria.min_success_rate * 100.0,
         report.criteria.max_consecutive_failures,
+        report.criteria.min_feedback_sample_size,
+        report.criteria.min_average_feedback_score,
         report.criteria.min_post_amend_runs,
         report.criteria.min_improvement_delta * 100.0,
+        report.criteria.min_feedback_improvement_delta,
     )
     .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
     writeln!(out, "Observed runs: {}", report.observation_count)
+        .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+    writeln!(out, "Recorded feedback: {}", report.feedback_count)
         .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
 
     if report.skills.is_empty() {
         writeln!(out, "No skill observations recorded yet.")
             .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
     } else {
+        let average_feedback_display = |score: Option<f64>| {
+            score.map_or_else(|| "n/a".to_string(), |score| format!("{score:.1}/5"))
+        };
         for skill in &report.skills {
             writeln!(
                 out,
-                "{}: {:?} | runs={} success={:.0}% consecutive_failures={}",
+                "{}: {:?} | runs={} success={:.0}% consecutive_failures={} feedback={} avg_feedback={}",
                 skill.skill_name,
                 skill.status,
                 skill.run_count,
                 skill.success_rate * 100.0,
-                skill.consecutive_failures
+                skill.consecutive_failures,
+                skill.feedback_count,
+                average_feedback_display(skill.average_feedback_score),
             )
             .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             writeln!(out, "  path: {}", skill.skill_path.display())
@@ -804,16 +1118,27 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
                 )
                 .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             }
+            let mut evaluation_parts = Vec::new();
             if let (Some(previous), Some(latest)) =
                 (skill.previous_success_rate, skill.latest_success_rate)
             {
-                writeln!(
-                    out,
-                    "  evaluation: previous={:.0}% latest={:.0}%",
+                evaluation_parts.push(format!(
+                    "success previous={:.0}% latest={:.0}%",
                     previous * 100.0,
                     latest * 100.0
-                )
-                .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+                ));
+            }
+            if let (Some(previous), Some(latest)) = (
+                skill.previous_average_feedback_score,
+                skill.latest_average_feedback_score,
+            ) {
+                evaluation_parts.push(format!(
+                    "feedback previous={previous:.1}/5 latest={latest:.1}/5"
+                ));
+            }
+            if !evaluation_parts.is_empty() {
+                writeln!(out, "  evaluation: {}", evaluation_parts.join(" | "))
+                    .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             }
         }
     }
@@ -836,6 +1161,29 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
         }
     }
 
+    Ok(out)
+}
+
+fn render_skill_feedback_receipt(feedback: &SkillFeedback) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "Recorded feedback for {}: rating {}/5",
+        feedback.skill_name, feedback.rating
+    )
+    .map_err(|err| Error::session(format!("render skill feedback receipt: {err}")))?;
+    writeln!(out, "  path: {}", feedback.skill_path.display())
+        .map_err(|err| Error::session(format!("render skill feedback receipt: {err}")))?;
+    writeln!(out, "  digest: {}", shorten_digest(&feedback.skill_digest))
+        .map_err(|err| Error::session(format!("render skill feedback receipt: {err}")))?;
+    if let Some(session_id) = &feedback.session_id {
+        writeln!(out, "  session: {session_id}")
+            .map_err(|err| Error::session(format!("render skill feedback receipt: {err}")))?;
+    }
+    if !feedback.notes.is_empty() {
+        writeln!(out, "  notes: {}", feedback.notes)
+            .map_err(|err| Error::session(format!("render skill feedback receipt: {err}")))?;
+    }
     Ok(out)
 }
 
@@ -864,27 +1212,11 @@ fn append_jsonl_records<T: Serialize>(path: &Path, records: &[T]) -> Result<()> 
 }
 
 fn load_observations(cwd: &Path) -> Result<Vec<SkillObservation>> {
-    let path = skill_observation_ledger_path(cwd);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+    load_jsonl_records(&skill_observation_ledger_path(cwd))
+}
 
-    let file = fs::File::open(&path)
-        .map_err(|err| Error::config(format!("failed to open {}: {err}", path.display())))?;
-    let reader = BufReader::new(file);
-    let mut observations = Vec::new();
-    for line in reader.lines() {
-        let line =
-            line.map_err(|err| Error::config(format!("failed to read {}: {err}", path.display())))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(record) = serde_json::from_str::<SkillObservation>(trimmed) {
-            observations.push(record);
-        }
-    }
-    Ok(observations)
+fn load_feedback(cwd: &Path) -> Result<Vec<SkillFeedback>> {
+    load_jsonl_records(&skill_feedback_ledger_path(cwd))
 }
 
 fn skill_observation_ledger_path(cwd: &Path) -> PathBuf {
@@ -896,6 +1228,33 @@ fn skill_amendment_ledger_path(cwd: &Path) -> PathBuf {
     cwd.join(Config::project_dir()).join(SKILL_AMENDMENT_LEDGER)
 }
 
+fn skill_feedback_ledger_path(cwd: &Path) -> PathBuf {
+    cwd.join(Config::project_dir()).join(SKILL_FEEDBACK_LEDGER)
+}
+
+fn load_jsonl_records<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|err| Error::config(format!("failed to open {}: {err}", path.display())))?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line =
+            line.map_err(|err| Error::config(format!("failed to read {}: {err}", path.display())))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<T>(trimmed) {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 fn success_rate(entries: &[SkillObservation]) -> f64 {
     if entries.is_empty() {
         return 0.0;
@@ -905,6 +1264,31 @@ fn success_rate(entries: &[SkillObservation]) -> f64 {
         .filter(|entry| entry.outcome.is_success())
         .count();
     successes as f64 / entries.len() as f64
+}
+
+fn average_feedback_score(entries: &[SkillFeedback]) -> Option<f64> {
+    (!entries.is_empty()).then(|| {
+        entries
+            .iter()
+            .map(|entry| f64::from(entry.rating))
+            .sum::<f64>()
+            / entries.len() as f64
+    })
+}
+
+fn low_feedback_count(entries: &[SkillFeedback]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.rating <= LOW_FEEDBACK_THRESHOLD)
+        .count()
+}
+
+fn consecutive_failures(entries: &[SkillObservation]) -> usize {
+    entries
+        .iter()
+        .rev()
+        .take_while(|entry| !entry.outcome.is_success())
+        .count()
 }
 
 fn classify_outcome(
@@ -986,6 +1370,101 @@ fn normalize_signature(message: &str) -> String {
     truncate_preview(&compact)
 }
 
+fn resolve_skill_feedback_target(
+    cwd: &Path,
+    skill_name: &str,
+    session_id: Option<&str>,
+    observations: &[SkillObservation],
+) -> Result<SkillFeedbackTarget> {
+    if let Some(session_id) = normalize_optional_text(session_id) {
+        if let Some(observation) = observations.iter().rev().find(|entry| {
+            entry.skill_name == skill_name
+                && entry.session_id.as_deref() == Some(session_id.as_str())
+        }) {
+            return Ok(SkillFeedbackTarget {
+                name: observation.skill_name.clone(),
+                path: observation.skill_path.clone(),
+                digest: observation.skill_digest.clone(),
+            });
+        }
+    }
+
+    let loaded = load_skills(LoadSkillsOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir: Config::global_dir(),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+    if let Some(skill) = loaded
+        .skills
+        .into_iter()
+        .find(|skill| skill.name == skill_name)
+    {
+        return Ok(SkillFeedbackTarget {
+            name: skill.name,
+            digest: file_digest(&skill.file_path),
+            path: skill.file_path,
+        });
+    }
+
+    if let Some(observation) = observations
+        .iter()
+        .rev()
+        .find(|entry| entry.skill_name == skill_name)
+    {
+        return Ok(SkillFeedbackTarget {
+            name: observation.skill_name.clone(),
+            path: observation.skill_path.clone(),
+            digest: observation.skill_digest.clone(),
+        });
+    }
+
+    Err(Error::validation(format!(
+        "Unknown skill `{skill_name}`; no loaded skill or recorded observation matched."
+    )))
+}
+
+fn split_observations_by_digest<'a>(
+    entries: &'a [SkillObservation],
+    latest_digest: &str,
+) -> (&'a [SkillObservation], &'a [SkillObservation]) {
+    let split_at = entries
+        .iter()
+        .rposition(|entry| entry.skill_digest != latest_digest)
+        .map_or(0, |idx| idx + 1);
+    (&entries[..split_at], &entries[split_at..])
+}
+
+fn split_feedback_by_digest<'a>(
+    entries: &'a [SkillFeedback],
+    latest_digest: &str,
+) -> (&'a [SkillFeedback], &'a [SkillFeedback]) {
+    let split_at = entries
+        .iter()
+        .rposition(|entry| entry.skill_digest != latest_digest)
+        .map_or(0, |idx| idx + 1);
+    (&entries[..split_at], &entries[split_at..])
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn normalize_optional_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn shorten_digest(digest: &str) -> String {
+    const LIMIT: usize = 12;
+    if digest.len() <= LIMIT {
+        digest.to_string()
+    } else {
+        digest[..LIMIT].to_string()
+    }
+}
+
 fn truncate_preview(text: &str) -> String {
     const LIMIT: usize = 180;
     let trimmed = text.trim();
@@ -1012,6 +1491,27 @@ mod tests {
             content: vec![ContentBlock::Text(TextContent::new(message.to_string()))],
             details: None,
             is_error: true,
+        }
+    }
+
+    fn sample_feedback(
+        recorded_at_utc: &str,
+        session_id: Option<&str>,
+        skill_name: &str,
+        skill_path: &Path,
+        skill_digest: &str,
+        rating: u8,
+        notes: &str,
+    ) -> SkillFeedback {
+        SkillFeedback {
+            version: 1,
+            recorded_at_utc: recorded_at_utc.to_string(),
+            session_id: session_id.map(ToString::to_string),
+            skill_name: skill_name.to_string(),
+            skill_path: skill_path.to_path_buf(),
+            skill_digest: skill_digest.to_string(),
+            rating,
+            notes: notes.to_string(),
         }
     }
 
@@ -1110,13 +1610,63 @@ mod tests {
                 agent_error: None,
             },
         ];
-        let report = build_skill_health_report(&entries, &SkillSuccessCriteria::default());
+        let report = build_skill_health_report(
+            "bug-triage",
+            &entries,
+            &[],
+            &SkillSuccessCriteria::default(),
+        );
         assert_eq!(report.status, SkillHealthStatus::NeedsAmendment);
         assert!(
             report
                 .proposed_guardrails
                 .iter()
                 .any(|guardrail| guardrail.contains("Validate commands"))
+        );
+    }
+
+    #[test]
+    fn doctor_marks_low_feedback_skill_unhealthy() {
+        let feedback = vec![
+            sample_feedback(
+                "2026-03-15T10:00:00Z",
+                None,
+                "summarize",
+                Path::new("/tmp/SKILL.md"),
+                "abc",
+                1,
+                "wrong json format and missing fields",
+            ),
+            sample_feedback(
+                "2026-03-15T10:05:00Z",
+                None,
+                "summarize",
+                Path::new("/tmp/SKILL.md"),
+                "abc",
+                2,
+                "incomplete output and too verbose",
+            ),
+        ];
+        let report = build_skill_health_report(
+            "summarize",
+            &[],
+            &feedback,
+            &SkillSuccessCriteria::default(),
+        );
+        assert_eq!(report.status, SkillHealthStatus::NeedsAmendment);
+        assert_eq!(report.feedback_count, 2);
+        assert_eq!(report.average_feedback_score, Some(1.5));
+        assert!(
+            report
+                .proposed_guardrails
+                .iter()
+                .any(|guardrail| guardrail.contains("output contract"))
+        );
+        assert!(
+            report
+                .proposed_guardrails
+                .iter()
+                .any(|guardrail| guardrail.contains("completion checklist"))
         );
     }
 
@@ -1220,6 +1770,64 @@ mod tests {
                 .iter()
                 .any(|failure| failure.tool_name == "read")
         );
+    }
+
+    #[test]
+    fn handle_skill_feedback_prefers_session_observation_revision() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("summarize")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: summarize\ndescription: summarize text\n---\nVersion one\n",
+        )
+        .expect("write skill");
+        let observed_digest = file_digest(&skill_path);
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                session_id: Some("sess-1".to_string()),
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: observed_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize this".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            }],
+        )
+        .expect("write observation");
+
+        fs::write(
+            &skill_path,
+            "---\nname: summarize\ndescription: summarize text\n---\nVersion two\n",
+        )
+        .expect("rewrite skill");
+        let current_digest = file_digest(&skill_path);
+        assert_ne!(current_digest, observed_digest);
+
+        let feedback = handle_skill_feedback(
+            dir.path(),
+            "summarize",
+            1,
+            Some("wrong output"),
+            Some("sess-1"),
+            SkillDoctorFormat::Json,
+        )
+        .expect("record feedback");
+        assert_eq!(feedback.skill_digest, observed_digest);
+
+        let stored_feedback = load_feedback(dir.path()).expect("load feedback");
+        assert_eq!(stored_feedback.len(), 1);
+        assert_eq!(stored_feedback[0].skill_digest, observed_digest);
     }
 
     #[test]
@@ -1377,6 +1985,197 @@ mod tests {
         assert_eq!(improved_skill.status, SkillHealthStatus::Improved);
         assert_eq!(improved_skill.previous_success_rate, Some(0.0));
         assert_eq!(improved_skill.latest_success_rate, Some(1.0));
+        assert!(improved_skill.proposed_guardrails.is_empty());
+    }
+
+    #[test]
+    fn doctor_uses_feedback_to_improve_successful_skill() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("code-review")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: code-review\ndescription: review code\n---\nReturn findings\n",
+        )
+        .expect("write skill");
+        let original_digest = file_digest(&skill_path);
+
+        let successful_entries = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review this diff".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review this diff again".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review this diff one more time".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+        ];
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &successful_entries,
+        )
+        .expect("write successful observations");
+        let negative_feedback = vec![
+            sample_feedback(
+                "2026-03-15T10:12:00Z",
+                None,
+                "code-review",
+                &skill_path,
+                &original_digest,
+                1,
+                "wrong format and missing the key bug",
+            ),
+            sample_feedback(
+                "2026-03-15T10:15:00Z",
+                None,
+                "code-review",
+                &skill_path,
+                &original_digest,
+                2,
+                "too verbose and incomplete",
+            ),
+        ];
+        append_jsonl_records(&skill_feedback_ledger_path(dir.path()), &negative_feedback)
+            .expect("write negative feedback");
+
+        let initial_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let initial_skill = initial_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "code-review")
+            .expect("initial skill report");
+        assert_eq!(initial_skill.status, SkillHealthStatus::NeedsAmendment);
+        assert_eq!(initial_skill.success_rate, 1.0);
+        assert_eq!(initial_skill.average_feedback_score, Some(1.5));
+
+        let fixed_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
+        let fixed_skill = fixed_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "code-review")
+            .expect("fixed skill report");
+        assert_eq!(fixed_skill.status, SkillHealthStatus::PendingData);
+
+        let amended_digest = file_digest(&skill_path);
+        let amended_observations = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review after amendment".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review after amendment again".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
+                session_id: None,
+                skill_name: "code-review".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "review after amendment one more time".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+        ];
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &amended_observations,
+        )
+        .expect("write amended observations");
+        let positive_feedback = vec![
+            sample_feedback(
+                "2026-03-15T10:32:00Z",
+                None,
+                "code-review",
+                &skill_path,
+                &amended_digest,
+                5,
+                "found the key bug and kept the format tight",
+            ),
+            sample_feedback(
+                "2026-03-15T10:35:00Z",
+                None,
+                "code-review",
+                &skill_path,
+                &amended_digest,
+                4,
+                "clear and complete",
+            ),
+        ];
+        append_jsonl_records(&skill_feedback_ledger_path(dir.path()), &positive_feedback)
+            .expect("write positive feedback");
+
+        let improved_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let improved_skill = improved_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "code-review")
+            .expect("improved skill report");
+        assert_eq!(improved_skill.status, SkillHealthStatus::Improved);
+        assert_eq!(improved_skill.previous_success_rate, Some(1.0));
+        assert_eq!(improved_skill.latest_success_rate, Some(1.0));
+        assert_eq!(improved_skill.previous_average_feedback_score, Some(1.5));
+        assert_eq!(improved_skill.latest_average_feedback_score, Some(4.5));
         assert!(improved_skill.proposed_guardrails.is_empty());
     }
 }

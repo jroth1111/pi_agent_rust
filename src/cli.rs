@@ -840,6 +840,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_skills_feedback_subcommand() {
+        let cli = Cli::parse_from([
+            "pi",
+            "skills",
+            "feedback",
+            "bug-triage",
+            "--rating",
+            "2",
+            "--notes",
+            "wrong format",
+            "--session-id",
+            "sess-1",
+            "--format",
+            "json",
+        ]);
+        match cli.command {
+            Some(Commands::Skills {
+                command:
+                    SkillCommands::Feedback {
+                        skill,
+                        rating,
+                        notes,
+                        session_id,
+                        format,
+                    },
+            }) => {
+                assert_eq!(skill, "bug-triage");
+                assert_eq!(rating, 2);
+                assert_eq!(notes.as_deref(), Some("wrong format"));
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(format, "json");
+            }
+            other => panic!("expected Skills::Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_subcommand_when_only_message() {
         let cli = Cli::parse_from(["pi", "hello"]);
         assert!(cli.command.is_none());
@@ -1737,6 +1774,23 @@ pub enum SkillCommands {
         /// Apply managed guardrail patches to unhealthy skills
         #[arg(long)]
         fix: bool,
+    },
+    /// Record explicit user feedback for a skill revision
+    Feedback {
+        /// Skill name
+        skill: String,
+        /// Feedback rating from 1 (bad) to 5 (good)
+        #[arg(long)]
+        rating: u8,
+        /// Optional free-form notes describing what went wrong or right
+        #[arg(long)]
+        notes: Option<String>,
+        /// Optional session id; when present, binds feedback to the latest observed revision in that session
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 }
 

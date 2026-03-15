@@ -68,7 +68,10 @@ use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
-use pi::skills::{SkillDoctorFormat, SkillRunTracker, handle_skill_doctor, persist_skill_tracker};
+use pi::skills::{
+    SkillDoctorFormat, SkillRunTracker, handle_skill_doctor, handle_skill_feedback,
+    persist_skill_tracker,
+};
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
 use serde::Serialize;
@@ -174,6 +177,22 @@ fn main_impl() -> Result<()> {
                 match command {
                     cli::SkillCommands::Doctor { format, fix } => {
                         handle_skill_doctor(&cwd, SkillDoctorFormat::parse(format)?, *fix)?;
+                    }
+                    cli::SkillCommands::Feedback {
+                        skill,
+                        rating,
+                        notes,
+                        session_id,
+                        format,
+                    } => {
+                        handle_skill_feedback(
+                            &cwd,
+                            skill,
+                            *rating,
+                            notes.as_deref(),
+                            session_id.as_deref(),
+                            SkillDoctorFormat::parse(format)?,
+                        )?;
                     }
                 }
                 return Ok(());
@@ -1359,6 +1378,22 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::Skills { command } => match command {
             cli::SkillCommands::Doctor { format, fix } => {
                 handle_skill_doctor(cwd, SkillDoctorFormat::parse(&format)?, fix)?;
+            }
+            cli::SkillCommands::Feedback {
+                skill,
+                rating,
+                notes,
+                session_id,
+                format,
+            } => {
+                handle_skill_feedback(
+                    cwd,
+                    &skill,
+                    rating,
+                    notes.as_deref(),
+                    session_id.as_deref(),
+                    SkillDoctorFormat::parse(&format)?,
+                )?;
             }
         },
         cli::Commands::Migrate { path, dry_run } => {

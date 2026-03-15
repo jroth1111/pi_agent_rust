@@ -12,8 +12,9 @@ pub mod resolver;
 pub mod schema;
 
 pub use improvement::{
-    SKILL_AMENDMENT_ENTRY_TYPE, SKILL_OBSERVATION_ENTRY_TYPE, SkillDoctorFormat, SkillDoctorReport,
-    SkillRunTracker, handle_skill_doctor, persist_skill_tracker,
+    SKILL_AMENDMENT_ENTRY_TYPE, SKILL_FEEDBACK_ENTRY_TYPE, SKILL_OBSERVATION_ENTRY_TYPE,
+    SkillDoctorFormat, SkillDoctorReport, SkillFeedback, SkillRunTracker, handle_skill_doctor,
+    handle_skill_feedback, persist_skill_tracker,
 };
 pub use loader::{LoadSkillFileResult, LoadSkillsOptions, LoadSkillsResult, load_skills};
 pub use resolver::is_under_path;

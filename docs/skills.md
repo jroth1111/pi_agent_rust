@@ -66,6 +66,18 @@ Pi now treats skills as observable components instead of static prompt files.
 - Implicit skill selection is recorded when the agent successfully reads a `SKILL.md` file with the `read` tool.
 - Each observation captures the skill version, task preview, activation source, tool failures, and terminal outcome.
 - Observations are appended to `.pi/skill-observations.jsonl` and also persisted as `skill/observation.v1` session custom entries when a session is available.
+- Explicit user ratings are recorded with `pi skills feedback` and persisted to `.pi/skill-feedback.jsonl`.
+
+### Explicit Feedback
+
+Use explicit feedback when a skill technically completed but the outcome quality was poor:
+
+```bash
+pi skills feedback bug-triage --rating 2 --notes "wrong format and missed the failing test"
+pi skills feedback bug-triage --rating 1 --session-id sess-123 --notes "used the right tools but made up evidence"
+```
+
+When `--session-id` is provided, Pi binds the feedback to the latest observed revision of that skill in the matching session. Otherwise it binds to the current on-disk skill revision.
 
 ### Automated Inspection And Fixing
 
@@ -90,12 +102,17 @@ Applied amendments are written to `.pi/skill-amendments.jsonl`.
 
 If a skill has been amended but the new revision has not been observed yet, `pi skills doctor` reports that skill as `PendingData` instead of continuing to judge the old revision as current.
 
+The doctor now evaluates both execution evidence and user feedback. A skill can therefore be marked unhealthy even when tool calls succeeded, if the resulting output repeatedly earned low ratings.
+
 ### Success Criteria
 
 - Minimum sample size: 3 observed runs per skill version
 - Target success rate: 80% or better
 - Consecutive failure threshold: 2 failures in a row triggers intervention
+- Minimum feedback sample size: 2 ratings per skill version
+- Target average feedback score: 3.5/5 or better
 - Amendment evaluation window: 3 post-amend runs minimum
 - Promotion threshold: 15 percentage-point success-rate improvement over the prior version
+- Feedback promotion threshold: 0.5 points average-rating improvement over the prior version
 
-The current automated fixer is intentionally conservative: it patches operational guardrails around repeated tool and environment failures. Higher-risk semantic rewrites of a skill's core instructions remain a future step.
+The automated fixer remains conservative, but it is no longer limited to tool errors. Low-feedback notes now drive guardrails for output contracts, completeness, verification, verbosity, and trigger tightening. Higher-risk semantic rewrites of a skill's core instructions remain a future step.
