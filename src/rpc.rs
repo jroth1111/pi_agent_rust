@@ -1,7 +1,6 @@
 //! RPC mode: headless JSON protocol over stdin/stdout.
 //!
-//! This implements a compatibility subset of pi-mono's RPC protocol
-//! (see legacy `docs/rpc.md` in `legacy_pi_mono_code`).
+//! This exposes the project's headless JSON orchestration protocol.
 
 #![allow(clippy::significant_drop_tightening)]
 #![allow(clippy::too_many_arguments)]

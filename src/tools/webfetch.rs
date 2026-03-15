@@ -24,8 +24,6 @@ enum ExtractMode {
     Readability,
     /// Convert HTML to Markdown format.
     Markdown,
-    /// Legacy regex-based extraction.
-    Legacy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,7 +32,7 @@ struct WebFetchInput {
     url: String,
     timeout: Option<u64>,
     raw: Option<bool>,
-    /// Extraction mode: "smart" (default), "readability", "markdown", or "legacy".
+    /// Extraction mode: "smart" (default), "readability", or "markdown".
     extract: Option<ExtractMode>,
 }
 
@@ -171,8 +169,8 @@ impl Tool for WebFetchTool {
                 },
                 "extract": {
                     "type": "string",
-                    "enum": ["smart", "readability", "markdown", "legacy"],
-                    "description": "HTML extraction mode: 'smart' (default) uses DOM selectors, 'readability' uses content density scoring, 'markdown' converts to Markdown, 'legacy' uses regex"
+                    "enum": ["smart", "readability", "markdown"],
+                    "description": "HTML extraction mode: 'smart' (default) uses DOM selectors, 'readability' uses content density scoring, and 'markdown' converts to Markdown"
                 }
             },
             "required": ["url"]
@@ -245,10 +243,6 @@ impl Tool for WebFetchTool {
                 ExtractMode::Markdown => {
                     let markdown = html_extract::html_to_markdown(&response.body);
                     (markdown, Some("markdown".to_string()), None)
-                }
-                ExtractMode::Legacy => {
-                    let text = html_extract::html_to_text_legacy(&response.body);
-                    (text, Some("legacy".to_string()), None)
                 }
             }
         } else {

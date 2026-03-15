@@ -144,7 +144,6 @@ pub struct Config {
 #[serde(default)]
 pub struct ExtensionPolicyConfig {
     /// Policy profile: "safe" (default), "balanced", or "permissive".
-    /// Legacy alias "standard" is also accepted.
     pub profile: Option<String>,
     /// Allow dangerous capabilities (exec, env). Overrides profile's deny list.
     #[serde(alias = "allowDangerous")]
@@ -846,8 +845,7 @@ impl Config {
             PolicyProfile::Safe
         } else if normalized_profile == "permissive" {
             PolicyProfile::Permissive
-        } else if normalized_profile == "balanced" || normalized_profile == "standard" {
-            // "balanced" (and legacy "standard") map to the standard policy.
+        } else if normalized_profile == "balanced" {
             PolicyProfile::Standard
         } else {
             // Unknown values fail closed to the safe profile.
@@ -2313,14 +2311,14 @@ mod tests {
     }
 
     #[test]
-    fn extension_policy_metadata_legacy_standard_alias_maps_to_balanced() {
+    fn extension_policy_metadata_standard_fails_closed() {
         let config = Config::default();
         let resolved = config.resolve_extension_policy_with_metadata(Some("standard"));
         assert_eq!(resolved.requested_profile, "standard");
-        assert_eq!(resolved.effective_profile, "balanced");
+        assert_eq!(resolved.effective_profile, "safe");
         assert_eq!(
             resolved.policy.mode,
-            crate::extensions::ExtensionPolicyMode::Prompt
+            crate::extensions::ExtensionPolicyMode::Strict
         );
     }
 
@@ -2983,7 +2981,6 @@ mod tests {
             prop_assume!(
                 lowered != "safe"
                     && lowered != "balanced"
-                    && lowered != "standard"
                     && lowered != "permissive"
             );
 

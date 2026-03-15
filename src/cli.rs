@@ -371,7 +371,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_extensions: bool,
 
-    /// Extension capability policy: safe, balanced, or permissive (legacy alias: standard)
+    /// Extension capability policy: safe, balanced, or permissive
     #[arg(long, value_name = "PROFILE")]
     pub extension_policy: Option<String>,
 

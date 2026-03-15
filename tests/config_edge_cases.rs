@@ -462,11 +462,11 @@ fn extension_policy_unknown_profile_falls_back_to_safe() {
 }
 
 #[test]
-fn extension_policy_legacy_standard_maps_to_balanced() {
+fn extension_policy_standard_fails_closed() {
     let _lock = config_lock();
     let config = Config::default();
     let resolved = config.resolve_extension_policy_with_metadata(Some("standard"));
-    assert_eq!(resolved.effective_profile, "balanced");
+    assert_eq!(resolved.effective_profile, "safe");
 }
 
 #[test]

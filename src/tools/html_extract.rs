@@ -688,27 +688,6 @@ fn process_list_to_markdown(
     }
 }
 
-/// Legacy HTML-to-text conversion using regex (no DOM parsing).
-///
-/// This is the original implementation kept for backwards compatibility
-/// when users specify `extract: "legacy"`.
-pub fn html_to_text_legacy(html: &str) -> String {
-    static SCRIPT_STYLE_RE: OnceLock<Regex> = OnceLock::new();
-    static TAG_RE: OnceLock<Regex> = OnceLock::new();
-
-    let script_style = SCRIPT_STYLE_RE.get_or_init(|| {
-        Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>")
-            .expect("valid script/style stripping regex")
-    });
-    let tags = TAG_RE.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid tag regex"));
-
-    let without_code = script_style.replace_all(html, " ");
-    let no_tags = tags.replace_all(&without_code, "\n");
-    let decoded = decode_html_entities(&no_tags);
-
-    normalize_text(&decoded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -591,7 +591,6 @@ fn e2e_cli_explain_extension_policy_outputs_remediation() {
     assert_eq!(payload["requested_profile"], "balanced");
     assert_eq!(payload["effective_profile"], "balanced");
     assert_eq!(payload["profile_source"], "cli");
-    assert_eq!(payload["profile_aliases"]["standard"], "balanced");
     assert_eq!(
         payload["dangerous_capability_opt_in"]["config_example"]["extensionPolicy"]["allowDangerous"],
         true
@@ -637,9 +636,8 @@ fn e2e_cli_explain_extension_policy_outputs_remediation() {
 }
 
 #[test]
-fn e2e_cli_explain_extension_policy_supports_legacy_standard_alias() {
-    let harness =
-        CliTestHarness::new("e2e_cli_explain_extension_policy_supports_legacy_standard_alias");
+fn e2e_cli_explain_extension_policy_rejects_standard_alias() {
+    let harness = CliTestHarness::new("e2e_cli_explain_extension_policy_rejects_standard_alias");
     let result = harness.run(&[
         "--explain-extension-policy",
         "--extension-policy",
@@ -651,7 +649,7 @@ fn e2e_cli_explain_extension_policy_supports_legacy_standard_alias() {
     let payload: serde_json::Value =
         serde_json::from_str(&result.stdout).expect("explain output should be valid JSON");
     assert_eq!(payload["requested_profile"], "standard");
-    assert_eq!(payload["effective_profile"], "balanced");
+    assert_eq!(payload["effective_profile"], "safe");
     assert_eq!(payload["profile_source"], "cli");
 }
 

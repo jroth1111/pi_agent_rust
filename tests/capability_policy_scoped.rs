@@ -137,13 +137,13 @@ mod config_resolution {
     }
 
     #[test]
-    fn cli_override_legacy_standard_alias_matches_balanced() {
+    fn cli_override_standard_fails_closed() {
         let config = Config::default();
-        let balanced = config.resolve_extension_policy(Some("balanced"));
         let standard = config.resolve_extension_policy(Some("standard"));
-        assert_eq!(standard.mode, balanced.mode);
-        assert_eq!(standard.default_caps, balanced.default_caps);
-        assert_eq!(standard.deny_caps, balanced.deny_caps);
+        let safe = config.resolve_extension_policy(Some("safe"));
+        assert_eq!(standard.mode, safe.mode);
+        assert_eq!(standard.default_caps, safe.default_caps);
+        assert_eq!(standard.deny_caps, safe.deny_caps);
     }
 
     #[test]

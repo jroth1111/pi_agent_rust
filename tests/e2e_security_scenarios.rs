@@ -679,7 +679,7 @@ fn scenario_policy_profile_escalation() {
         "Standard profile exec check",
         ext_id,
         &[
-            ("policy_profile", "standard".to_string()),
+            ("policy_profile", "balanced".to_string()),
             ("capability", "exec".to_string()),
             ("decision", format!("{:?}", standard_check.decision)),
         ],

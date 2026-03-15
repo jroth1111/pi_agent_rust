@@ -116,7 +116,7 @@ fn make_telemetry(ts_ms: i64, ext_id: &str) -> RuntimeHostcallTelemetryEvent {
         args_shape_hash: "shape-secret".to_string(),
         resource_target_class: "process".to_string(),
         policy_reason: "allowed".to_string(),
-        policy_profile: "standard".to_string(),
+        policy_profile: "balanced".to_string(),
         risk_score: 0.3,
         timeout_ms: Some(5000),
         latency_ms: 42,

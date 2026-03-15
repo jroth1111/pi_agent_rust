@@ -370,11 +370,11 @@ fn dangerous_opt_in_audit_entry_serializes() {
 fn dangerous_opt_in_audit_entry_fields() {
     let entry = DangerousOptInAuditEntry {
         source: "env".to_string(),
-        profile: "standard".to_string(),
+        profile: "balanced".to_string(),
         capabilities_unblocked: vec!["exec".to_string()],
     };
     assert_eq!(entry.source, "env");
-    assert_eq!(entry.profile, "standard");
+    assert_eq!(entry.profile, "balanced");
     assert!(entry.capabilities_unblocked.contains(&"exec".to_string()));
 }
 

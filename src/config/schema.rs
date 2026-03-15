@@ -124,7 +124,7 @@ fn validate_extension_policy(
 ) {
     if let Some(policy) = obj.get("extensionPolicy").and_then(|v| v.as_object()) {
         if let Some(profile) = policy.get("profile").and_then(|v| v.as_str()) {
-            let valid_profiles = ["safe", "balanced", "permissive", "standard"];
+            let valid_profiles = ["safe", "balanced", "permissive"];
             if !valid_profiles.contains(&profile) {
                 errors.push(ValidationError {
                     path: "/extensionPolicy/profile".to_string(),

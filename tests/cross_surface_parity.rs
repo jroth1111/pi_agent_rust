@@ -695,7 +695,7 @@ mod config_types {
 
     #[test]
     fn config_extension_policy_profiles() {
-        for profile in &["safe", "balanced", "permissive", "standard"] {
+        for profile in &["safe", "balanced", "permissive"] {
             let json = serde_json::json!({
                 "extensionPolicy": { "profile": profile }
             });

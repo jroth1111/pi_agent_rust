@@ -614,7 +614,7 @@ fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolic
         },
         {
             "profile": "balanced",
-            "summary": "Prompt-based profile (legacy alias: standard).",
+            "summary": "Prompt-based profile for guarded extension access.",
             "cli": "pi --extension-policy balanced <your command>",
             "config_example": policy_config_example("balanced", false),
         },
@@ -629,9 +629,6 @@ fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolic
     let payload = serde_json::json!({
         "requested_profile": resolved.requested_profile,
         "effective_profile": resolved.effective_profile,
-        "profile_aliases": {
-            "standard": "balanced",
-        },
         "profile_source": resolved.profile_source,
         "allow_dangerous": resolved.allow_dangerous,
         "profile_presets": profile_presets,
