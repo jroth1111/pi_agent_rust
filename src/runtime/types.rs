@@ -302,92 +302,6 @@ impl Default for RunDispatchState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct RunStatus {
-    pub run_id: String,
-    pub objective: String,
-    pub selected_tier: ExecutionTier,
-    pub lifecycle: RunLifecycle,
-    #[serde(default)]
-    pub run_verify_command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_verify_timeout_sec: Option<u32>,
-    #[serde(default = "RunStatus::default_max_parallelism")]
-    pub max_parallelism: usize,
-    #[serde(default)]
-    pub task_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_subrun_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_wave: Option<WaveStatus>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub planned_subruns: Vec<SubrunPlan>,
-    #[serde(default)]
-    pub task_counts: BTreeMap<String, usize>,
-    #[serde(default)]
-    pub task_reports: BTreeMap<String, TaskReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_run_verify: Option<RunVerifyStatus>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl RunStatus {
-    pub const DEFAULT_MAX_PARALLELISM: usize = 4;
-
-    const fn default_max_parallelism() -> usize {
-        Self::DEFAULT_MAX_PARALLELISM
-    }
-
-    pub fn new(
-        run_id: impl Into<String>,
-        objective: impl Into<String>,
-        selected_tier: ExecutionTier,
-    ) -> Self {
-        let now = Utc::now();
-        Self {
-            run_id: run_id.into(),
-            objective: objective.into(),
-            selected_tier,
-            lifecycle: RunLifecycle::Pending,
-            run_verify_command: String::new(),
-            run_verify_timeout_sec: None,
-            max_parallelism: Self::DEFAULT_MAX_PARALLELISM,
-            task_ids: Vec::new(),
-            active_subrun_id: None,
-            active_wave: None,
-            planned_subruns: Vec::new(),
-            task_counts: BTreeMap::new(),
-            task_reports: BTreeMap::new(),
-            latest_run_verify: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    pub fn touch(&mut self) {
-        self.updated_at = Utc::now();
-    }
-
-    pub fn set_task_count(&mut self, state_label: impl Into<String>, count: usize) {
-        self.task_counts.insert(state_label.into(), count);
-        self.touch();
-    }
-
-    pub fn upsert_task_report(&mut self, report: TaskReport) {
-        self.task_reports.insert(report.task_id.clone(), report);
-        self.touch();
-    }
-
-    pub fn effective_max_parallelism(&self) -> usize {
-        match self.selected_tier {
-            ExecutionTier::Inline => 1,
-            ExecutionTier::Wave | ExecutionTier::Hierarchical => self.max_parallelism.max(1),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct PlanArtifact {
     pub plan_id: PlanId,
     pub digest: String,
@@ -616,6 +530,35 @@ impl RunSnapshot {
     pub fn task_ids(&self) -> Vec<String> {
         self.tasks.keys().cloned().collect()
     }
+
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_task_count(&mut self, state_label: impl Into<String>, count: usize) {
+        self.summary.task_counts.insert(state_label.into(), count);
+        self.touch();
+    }
+
+    pub fn upsert_task_report(&mut self, report: TaskReport) {
+        self.dispatch
+            .task_reports
+            .insert(report.task_id.clone(), report);
+        self.touch();
+    }
+
+    pub fn effective_max_parallelism(&self) -> usize {
+        match self.dispatch.selected_tier {
+            ExecutionTier::Inline => 1,
+            ExecutionTier::Wave | ExecutionTier::Hierarchical => {
+                self.spec.budgets.max_parallelism.max(1)
+            }
+        }
+    }
+
+    pub fn run_verify_command(&self) -> &str {
+        self.spec.run_verify_command.as_deref().unwrap_or("")
+    }
 }
 
 #[cfg(test)]
@@ -653,8 +596,20 @@ mod tests {
     }
 
     #[test]
-    fn run_status_upserts_reports_and_counts() {
-        let mut run = RunStatus::new("run-1", "Ship orchestration", ExecutionTier::Wave);
+    fn run_snapshot_upserts_reports_and_counts() {
+        let mut run = RunSnapshot::new(RunSpec {
+            run_id: "run-1".to_string(),
+            objective: "Ship orchestration".to_string(),
+            root_workspace: PathBuf::from("/tmp/pi"),
+            policy_profile: "default".to_string(),
+            model_profile: "default".to_string(),
+            run_verify_command: None,
+            run_verify_timeout_sec: None,
+            budgets: RunBudgets::default(),
+            constraints: RunConstraints::default(),
+            created_at: Utc::now(),
+        });
+        run.dispatch.selected_tier = ExecutionTier::Wave;
         run.set_task_count("ready", 2);
         run.upsert_task_report(TaskReport {
             task_id: "task-a".to_string(),
@@ -672,9 +627,10 @@ mod tests {
             generated_at: Utc::now(),
         });
 
-        assert_eq!(run.task_counts.get("ready"), Some(&2));
+        assert_eq!(run.summary.task_counts.get("ready"), Some(&2));
         assert_eq!(
-            run.task_reports
+            run.dispatch
+                .task_reports
                 .get("task-a")
                 .map(|report| report.summary.as_str()),
             Some("done")

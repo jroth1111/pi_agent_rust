@@ -26,8 +26,8 @@ use crate::model::{
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunVerifyScopeKind, RunVerifyStatus,
-    SubrunPlan, TaskReport, WaveStatus,
+    ExecutionTier, FlockWorkspace, RunLifecycle, RunVerifyScopeKind, RunVerifyStatus, SubrunPlan,
+    TaskReport, WaveStatus,
 };
 use crate::provider::Provider;
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
@@ -43,9 +43,8 @@ use crate::runtime::model_routing::{ModelRoute, PhaseModelRouter};
 use crate::runtime::policy::PolicySet;
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
-    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints,
-    RunDispatchState, RunPhase, RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec,
-    TaskState, VerifySpec,
+    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints, RunPhase,
+    RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState, VerifySpec,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -1325,17 +1324,6 @@ fn next_run_id(candidate: Option<&str>) -> String {
         .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4().simple()))
 }
 
-async fn persist_run_status(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    runtime_store: &RuntimeStore,
-    status: &RunStatus,
-) -> Result<()> {
-    let mut snapshot = runtime_store.load_snapshot(&status.run_id)?;
-    apply_run_status_to_snapshot(&mut snapshot, status);
-    persist_runtime_snapshot(cx, session, runtime_store, &snapshot).await
-}
-
 async fn persist_runtime_snapshot(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -1382,6 +1370,10 @@ const fn runtime_phase_to_run_lifecycle(phase: RunPhase) -> RunLifecycle {
         RunPhase::Failed => RunLifecycle::Failed,
         RunPhase::Canceled => RunLifecycle::Canceled,
     }
+}
+
+const fn run_lifecycle(snapshot: &RunSnapshot) -> RunLifecycle {
+    runtime_phase_to_run_lifecycle(snapshot.phase)
 }
 
 const fn runtime_task_state_label(state: TaskState) -> &'static str {
@@ -1469,57 +1461,23 @@ const fn run_lifecycle_to_runtime_phase(
     }
 }
 
-fn apply_run_status_to_snapshot(snapshot: &mut RunSnapshot, status: &RunStatus) {
-    snapshot.phase = run_lifecycle_to_runtime_phase(status.lifecycle, snapshot.phase);
-    snapshot.spec.run_verify_command = Some(status.run_verify_command.clone());
-    snapshot.spec.run_verify_timeout_sec = status.run_verify_timeout_sec;
-    snapshot.spec.budgets.max_parallelism = status.max_parallelism.max(1);
-    snapshot.dispatch = RunDispatchState {
-        selected_tier: status.selected_tier,
-        active_subrun_id: status.active_subrun_id.clone(),
-        active_wave: status.active_wave.clone(),
-        planned_subruns: status.planned_subruns.clone(),
-        task_reports: status.task_reports.clone(),
-        latest_run_verify: status.latest_run_verify.clone(),
-    };
-    snapshot.summary.task_counts = status.task_counts.clone();
-    snapshot.created_at = status.created_at;
-    snapshot.updated_at = status.updated_at;
+fn set_run_lifecycle(snapshot: &mut RunSnapshot, lifecycle: RunLifecycle) {
+    snapshot.phase = run_lifecycle_to_runtime_phase(lifecycle, snapshot.phase);
+    snapshot.touch();
 }
 
-fn project_runtime_run_status(snapshot: &RunSnapshot) -> RunStatus {
+fn recompute_runtime_task_counts(snapshot: &mut RunSnapshot) {
     let mut task_counts = BTreeMap::new();
     for task in snapshot.tasks.values() {
         *task_counts
             .entry(runtime_task_state_label(task.runtime.state).to_string())
             .or_insert(0) += 1;
     }
-
-    RunStatus {
-        run_id: snapshot.spec.run_id.clone(),
-        objective: snapshot.spec.objective.clone(),
-        selected_tier: runtime_snapshot_execution_tier(snapshot),
-        lifecycle: runtime_phase_to_run_lifecycle(snapshot.phase),
-        run_verify_command: snapshot.spec.run_verify_command.clone().unwrap_or_default(),
-        run_verify_timeout_sec: snapshot.spec.run_verify_timeout_sec,
-        max_parallelism: snapshot.spec.budgets.max_parallelism.max(1),
-        task_ids: snapshot.tasks.keys().cloned().collect(),
-        active_subrun_id: snapshot.dispatch.active_subrun_id.clone(),
-        active_wave: snapshot.dispatch.active_wave.clone(),
-        planned_subruns: snapshot.dispatch.planned_subruns.clone(),
-        task_counts,
-        task_reports: snapshot.dispatch.task_reports.clone(),
-        latest_run_verify: snapshot.dispatch.latest_run_verify.clone(),
-        created_at: snapshot.created_at,
-        updated_at: snapshot.updated_at,
-    }
+    snapshot.summary.task_counts = task_counts;
 }
 
-fn load_runtime_run_projection(runtime_store: &RuntimeStore, run_id: &str) -> Option<RunStatus> {
-    runtime_store
-        .load_snapshot(run_id)
-        .ok()
-        .map(|snapshot| project_runtime_run_status(&snapshot))
+fn load_runtime_snapshot(runtime_store: &RuntimeStore, run_id: &str) -> Option<RunSnapshot> {
+    runtime_store.load_snapshot(run_id).ok()
 }
 
 fn runtime_model_selector(
@@ -2043,34 +2001,37 @@ fn task_terminal_success(reliability: &RpcReliabilityState, task_id: &str) -> bo
     })
 }
 
-fn run_terminal_success(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
-    !run.task_ids.is_empty()
-        && run
-            .task_ids
+fn run_terminal_success(reliability: &RpcReliabilityState, run: &RunSnapshot) -> bool {
+    let task_ids = run.task_ids();
+    !task_ids.is_empty()
+        && task_ids
             .iter()
             .all(|task_id| task_terminal_success(reliability, task_id))
 }
 
 fn completed_run_verify_scope(
     reliability: &RpcReliabilityState,
-    run: &RunStatus,
+    run: &RunSnapshot,
 ) -> Option<CompletedRunVerifyScope> {
-    if run.run_verify_command.trim().is_empty() || !run_terminal_success(reliability, run) {
+    if run.run_verify_command().trim().is_empty() || !run_terminal_success(reliability, run) {
         return None;
     }
     Some(CompletedRunVerifyScope {
-        scope_id: run.run_id.clone(),
+        scope_id: run.spec.run_id.clone(),
         scope_kind: RunVerifyScopeKind::Run,
         subrun_id: None,
     })
 }
 
-fn should_skip_run_verify(run: &RunStatus, scope: &CompletedRunVerifyScope) -> bool {
-    run.latest_run_verify.as_ref().is_some_and(|status| {
-        status.scope_id == scope.scope_id
-            && status.scope_kind == scope.scope_kind
-            && status.subrun_id == scope.subrun_id
-    })
+fn should_skip_run_verify(run: &RunSnapshot, scope: &CompletedRunVerifyScope) -> bool {
+    run.dispatch
+        .latest_run_verify
+        .as_ref()
+        .is_some_and(|status| {
+            status.scope_id == scope.scope_id
+                && status.scope_kind == scope.scope_kind
+                && status.subrun_id == scope.subrun_id
+        })
 }
 
 fn completed_scope_from_run_verify(status: &RunVerifyStatus) -> CompletedRunVerifyScope {
@@ -2081,14 +2042,16 @@ fn completed_scope_from_run_verify(status: &RunVerifyStatus) -> CompletedRunVeri
     }
 }
 
-fn apply_run_verify_lifecycle(run: &mut RunStatus) {
-    if !matches!(run.lifecycle, RunLifecycle::Canceled)
+fn apply_run_verify_lifecycle(run: &mut RunSnapshot) {
+    if !matches!(run.phase, RunPhase::Canceled)
         && run
+            .dispatch
             .latest_run_verify
             .as_ref()
             .is_some_and(|status| !status.ok)
     {
-        run.lifecycle = RunLifecycle::Failed;
+        run.phase = RunPhase::Failed;
+        run.touch();
     }
 }
 
@@ -2122,19 +2085,18 @@ fn next_active_wave(
 
 const MAX_HIERARCHICAL_SUBRUN_TASKS: usize = 12;
 
-fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<String> {
-    let run_task_ids = run.task_ids.iter().cloned().collect::<HashSet<_>>();
+fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunSnapshot) -> Vec<String> {
+    let task_ids = run.task_ids();
+    let run_task_ids = task_ids.iter().cloned().collect::<HashSet<_>>();
     let mut in_degree = run
-        .task_ids
-        .iter()
-        .cloned()
-        .map(|task_id| (task_id, 0usize))
+        .tasks
+        .keys()
+        .map(|task_id| (task_id.clone(), 0usize))
         .collect::<HashMap<_, _>>();
     let mut adjacency = run
-        .task_ids
-        .iter()
-        .cloned()
-        .map(|task_id| (task_id, Vec::new()))
+        .tasks
+        .keys()
+        .map(|task_id| (task_id.clone(), Vec::new()))
         .collect::<HashMap<_, Vec<String>>>();
 
     for edge in &reliability.edges {
@@ -2158,7 +2120,7 @@ fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) 
         .collect::<Vec<_>>();
     ready.sort();
 
-    let mut ordered = Vec::with_capacity(run.task_ids.len());
+    let mut ordered = Vec::with_capacity(task_ids.len());
     while let Some(task_id) = ready.first().cloned() {
         ready.remove(0);
         ordered.push(task_id.clone());
@@ -2178,8 +2140,8 @@ fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) 
     }
 
     let mut missing = run
-        .task_ids
-        .iter()
+        .tasks
+        .keys()
         .filter(|task_id| !ordered.contains(task_id))
         .cloned()
         .collect::<Vec<_>>();
@@ -2188,18 +2150,18 @@ fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) 
     ordered
 }
 
-fn planned_subruns(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<SubrunPlan> {
-    if run.selected_tier != ExecutionTier::Hierarchical {
+fn planned_subruns(reliability: &RpcReliabilityState, run: &RunSnapshot) -> Vec<SubrunPlan> {
+    if runtime_snapshot_execution_tier(run) != ExecutionTier::Hierarchical {
         return Vec::new();
     }
 
+    let task_ids = run.task_ids();
     let mut adjacency = run
-        .task_ids
-        .iter()
-        .cloned()
-        .map(|task_id| (task_id, HashSet::new()))
+        .tasks
+        .keys()
+        .map(|task_id| (task_id.clone(), HashSet::new()))
         .collect::<HashMap<_, HashSet<String>>>();
-    let run_task_ids = run.task_ids.iter().cloned().collect::<HashSet<_>>();
+    let run_task_ids = task_ids.iter().cloned().collect::<HashSet<_>>();
 
     for edge in &reliability.edges {
         match &edge.kind {
@@ -2219,11 +2181,11 @@ fn planned_subruns(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<Su
         }
     }
 
-    for (index, left_id) in run.task_ids.iter().enumerate() {
+    for (index, left_id) in task_ids.iter().enumerate() {
         let Some(left_task) = reliability.tasks.get(left_id) else {
             continue;
         };
-        for right_id in run.task_ids.iter().skip(index + 1) {
+        for right_id in task_ids.iter().skip(index + 1) {
             let Some(right_task) = reliability.tasks.get(right_id) else {
                 continue;
             };
@@ -2254,7 +2216,7 @@ fn planned_subruns(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<Su
 
     let mut visited = HashSet::new();
     let mut components = Vec::new();
-    let mut seeds = run.task_ids.clone();
+    let mut seeds = task_ids;
     seeds.sort_by_key(|task_id| order_index.get(task_id).copied().unwrap_or(usize::MAX));
     for seed in seeds {
         if !visited.insert(seed.clone()) {
@@ -2395,7 +2357,7 @@ fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) 
 
 fn planned_wave_task_ids(
     reliability: &RpcReliabilityState,
-    run: &RunStatus,
+    run: &RunSnapshot,
     candidate_task_ids: &[String],
 ) -> Vec<String> {
     let ready_task_ids = candidate_task_ids
@@ -2446,17 +2408,17 @@ fn planned_wave_task_ids(
     scheduled
 }
 
-fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
-    !run.task_ids.is_empty()
-        && run
-            .task_ids
+fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunSnapshot) -> bool {
+    let task_ids = run.task_ids();
+    !task_ids.is_empty()
+        && task_ids
             .iter()
             .all(|task_id| reliability.tasks.contains_key(task_id))
 }
 
 fn refresh_live_run_from_reliability(
     reliability: &mut RpcReliabilityState,
-    run: &mut RunStatus,
+    run: &mut RunSnapshot,
 ) -> bool {
     let has_live_tasks = run_has_live_tasks(reliability, run);
     if has_live_tasks {
@@ -2466,30 +2428,33 @@ fn refresh_live_run_from_reliability(
     has_live_tasks
 }
 
-fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
-    let preserve_canceled = matches!(run.lifecycle, RunLifecycle::Canceled);
-    run.task_counts = reliability.task_counts_for(&run.task_ids);
-    run.planned_subruns = planned_subruns(reliability, run);
+fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunSnapshot) {
+    let preserve_canceled = matches!(run.phase, RunPhase::Canceled);
+    let task_ids = run.task_ids();
+    run.summary.task_counts = reliability.task_counts_for(&task_ids);
+    run.dispatch.planned_subruns = planned_subruns(reliability, run);
 
     if preserve_canceled {
-        run.active_subrun_id = None;
-        run.active_wave = None;
+        run.dispatch.active_subrun_id = None;
+        run.dispatch.active_wave = None;
     } else {
-        let active_scope_task_ids = if run.selected_tier == ExecutionTier::Hierarchical {
-            let active_subrun = run.planned_subruns.iter().find(|subrun| {
+        let active_scope_task_ids = if runtime_snapshot_execution_tier(run)
+            == ExecutionTier::Hierarchical
+        {
+            let active_subrun = run.dispatch.planned_subruns.iter().find(|subrun| {
                 subrun.task_ids.iter().any(|task_id| {
                     reliability.tasks.get(task_id).is_some_and(|task| {
                         !matches!(task.runtime.state, reliability::RuntimeState::Terminal(_))
                     })
                 })
             });
-            run.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
+            run.dispatch.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
             active_subrun
                 .map(|subrun| subrun.task_ids.clone())
                 .unwrap_or_default()
         } else {
-            run.active_subrun_id = None;
-            run.task_ids.clone()
+            run.dispatch.active_subrun_id = None;
+            task_ids.clone()
         };
 
         let mut active_task_ids = active_scope_task_ids
@@ -2506,11 +2471,12 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
         if active_task_ids.is_empty() {
             active_task_ids = planned_wave_task_ids(reliability, run, &active_scope_task_ids);
         }
-        run.active_wave = next_active_wave(run.active_wave.take(), active_task_ids);
+        run.dispatch.active_wave =
+            next_active_wave(run.dispatch.active_wave.take(), active_task_ids);
     }
 
     if !preserve_canceled {
-        run.lifecycle = derive_run_lifecycle(reliability, &run.task_ids);
+        set_run_lifecycle(run, derive_run_lifecycle(reliability, &task_ids));
     }
     apply_run_verify_lifecycle(run);
     run.touch();
@@ -2518,22 +2484,23 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
 
 fn dispatch_run_wave(
     reliability: &mut RpcReliabilityState,
-    run: &mut RunStatus,
+    run: &mut RunSnapshot,
     agent_id_prefix: &str,
     lease_ttl_sec: i64,
 ) -> Result<Vec<DispatchGrant>> {
     refresh_live_run_from_reliability(reliability, run);
     if matches!(
-        run.lifecycle,
-        RunLifecycle::Canceled | RunLifecycle::Failed | RunLifecycle::Succeeded
+        run.phase,
+        RunPhase::Canceled | RunPhase::Failed | RunPhase::Completed
     ) {
         return Err(Error::validation(format!(
-            "run {} is not dispatchable in lifecycle {:?}",
-            run.run_id, run.lifecycle
+            "run {} is not dispatchable in phase {:?}",
+            run.spec.run_id, run.phase
         )));
     }
 
     let dispatchable_task_ids = run
+        .dispatch
         .active_wave
         .as_ref()
         .map(|wave| {
@@ -2577,10 +2544,10 @@ fn dispatch_run_wave(
 
 fn cancel_live_run_tasks(
     reliability: &mut RpcReliabilityState,
-    run: &mut RunStatus,
+    run: &mut RunSnapshot,
 ) -> Vec<DispatchGrant> {
-    let leased_grants = run
-        .task_ids
+    let task_ids = run.task_ids();
+    let leased_grants = task_ids
         .iter()
         .filter_map(|task_id| {
             let task = reliability.tasks.get(task_id)?;
@@ -2609,9 +2576,9 @@ fn cancel_live_run_tasks(
 
     reliability.refresh_dependency_states();
     refresh_run_from_reliability(reliability, run);
-    run.lifecycle = RunLifecycle::Canceled;
-    run.active_wave = None;
-    run.active_subrun_id = None;
+    run.phase = RunPhase::Canceled;
+    run.dispatch.active_wave = None;
+    run.dispatch.active_subrun_id = None;
     run.touch();
     leased_grants
 }
@@ -2655,7 +2622,7 @@ async fn cancel_live_run_tasks_and_sync(
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
-    run: &mut RunStatus,
+    run: &mut RunSnapshot,
 ) -> Result<()> {
     let canceled_grants = {
         let mut rel = reliability_state
@@ -2670,7 +2637,7 @@ async fn cancel_live_run_tasks_and_sync(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(&run.run_id, &run.task_ids);
+        orchestration.update_run(&run.spec.run_id, &run.task_ids());
     }
 
     append_canceled_dispatch_grants_session_entries(
@@ -2687,7 +2654,7 @@ async fn cancel_live_run_tasks_and_sync(
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-            build_cancel_run_task_report(&rel, &run.run_id, &grant.task_id)
+            build_cancel_run_task_report(&rel, &run.spec.run_id, &grant.task_id)
         };
         let updated_runs = sync_task_runs(
             cx,
@@ -2701,24 +2668,24 @@ async fn cancel_live_run_tasks_and_sync(
         .await?;
         if let Some(updated_run) = updated_runs
             .into_iter()
-            .find(|updated_run| updated_run.run_id == run.run_id)
+            .find(|updated_run| updated_run.spec.run_id == run.spec.run_id)
         {
             *run = updated_run;
         }
     }
 
-    run.lifecycle = RunLifecycle::Canceled;
-    run.active_wave = None;
-    run.active_subrun_id = None;
+    run.phase = RunPhase::Canceled;
+    run.dispatch.active_wave = None;
+    run.dispatch.active_subrun_id = None;
     run.touch();
     {
         let mut orchestration = orchestration_state
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(&run.run_id, &run.task_ids);
+        orchestration.update_run(&run.spec.run_id, &run.task_ids());
     }
-    persist_run_status(cx, session, runtime_store, run).await?;
+    persist_runtime_snapshot(cx, session, runtime_store, run).await?;
 
     Ok(())
 }
@@ -2729,11 +2696,11 @@ const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn next_recoverable_retry_delay(
     reliability: &RpcReliabilityState,
-    run: &RunStatus,
+    run: &RunSnapshot,
 ) -> Option<Duration> {
     let now = chrono::Utc::now();
 
-    run.task_ids
+    run.task_ids()
         .iter()
         .filter_map(|task_id| reliability.tasks.get(task_id))
         .filter_map(|task| match &task.runtime.state {
@@ -3210,17 +3177,14 @@ async fn rollback_dispatch_grant(
                 "orchestration_execution_error",
             )
         });
-        let mut run = runtime_store
-            .load_snapshot(run_id)
-            .ok()
-            .map(|snapshot| project_runtime_run_status(&snapshot));
+        let mut run = runtime_store.load_snapshot(run_id).ok();
         if let Some(mut run) = run.take() {
             if let Some(report) = rollback_report.as_ref() {
                 run.upsert_task_report(report.clone());
             }
             refresh_run_from_reliability(&rel, &mut run);
             if let Ok(mut orchestration) = orchestration_state.lock(cx).await {
-                orchestration.update_run(&run.run_id, &run.task_ids);
+                orchestration.update_run(&run.spec.run_id, &run.task_ids());
             }
             (Some(run), rolled_back_state)
         } else {
@@ -3235,7 +3199,7 @@ async fn rollback_dispatch_grant(
     }
 
     if let Some(run) = updated_run {
-        let _ = persist_run_status(cx, session, runtime_store, &run).await;
+        let _ = persist_runtime_snapshot(cx, session, runtime_store, &run).await;
     }
 }
 
@@ -3360,15 +3324,13 @@ fn captured_dispatches_overlap(captures: &[CapturedDispatchExecution]) -> bool {
     false
 }
 
-async fn current_run_status(
+async fn current_run_snapshot(
     _cx: &AgentCx,
     _orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
     run_id: &str,
-) -> Result<RunStatus> {
-    runtime_store
-        .load_snapshot(run_id)
-        .map(|snapshot| project_runtime_run_status(&snapshot))
+) -> Result<RunSnapshot> {
+    runtime_store.load_snapshot(run_id)
 }
 
 async fn finalize_captured_dispatch_execution(
@@ -3380,7 +3342,7 @@ async fn finalize_captured_dispatch_execution(
     repo_root: &Path,
     run_id: &str,
     capture: CapturedDispatchExecution,
-) -> Result<RunStatus> {
+) -> Result<RunSnapshot> {
     let evidence = match append_evidence_record(
         cx,
         session,
@@ -3484,7 +3446,7 @@ async fn finalize_captured_dispatch_execution(
         return Err(err);
     }
 
-    current_run_status(cx, orchestration_state, runtime_store, run_id).await
+    current_run_snapshot(cx, orchestration_state, runtime_store, run_id).await
 }
 
 #[allow(dead_code)]
@@ -3498,7 +3460,7 @@ async fn execute_inline_dispatch_grant_with_worker(
     run_id: &str,
     grant: &DispatchGrant,
     worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
+) -> Result<RunSnapshot> {
     let capture =
         match capture_dispatch_grant_execution(cx, reliability_state, repo_root, grant, worker)
             .await
@@ -3541,10 +3503,10 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
-    run: RunStatus,
+    run: RunSnapshot,
     grants: &[DispatchGrant],
     worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
+) -> Result<RunSnapshot> {
     let mut updated_run = run;
     let mut replay_base_patches = Vec::new();
 
@@ -3571,7 +3533,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
                     reliability_state,
                     orchestration_state,
                     runtime_store,
-                    &updated_run.run_id,
+                    &updated_run.spec.run_id,
                     grant,
                     Some(summary),
                 )
@@ -3588,7 +3550,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
             orchestration_state,
             runtime_store,
             repo_root,
-            &updated_run.run_id,
+            &updated_run.spec.run_id,
             capture,
         )
         .await?;
@@ -3608,9 +3570,9 @@ async fn finalize_captured_dispatches(
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
-    run: RunStatus,
+    run: RunSnapshot,
     captures: Vec<CapturedDispatchExecution>,
-) -> Result<RunStatus> {
+) -> Result<RunSnapshot> {
     let mut updated_run = run;
     for capture in captures {
         updated_run = finalize_captured_dispatch_execution(
@@ -3620,7 +3582,7 @@ async fn finalize_captured_dispatches(
             orchestration_state,
             runtime_store,
             repo_root,
-            &updated_run.run_id,
+            &updated_run.spec.run_id,
             capture,
         )
         .await?;
@@ -3635,10 +3597,10 @@ async fn execute_dispatch_grants_with_worker(
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
-    run: RunStatus,
+    run: RunSnapshot,
     grants: &[DispatchGrant],
     worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
+) -> Result<RunSnapshot> {
     if grants.is_empty() {
         return Ok(run);
     }
@@ -3671,7 +3633,7 @@ async fn execute_dispatch_grants_with_worker(
                     reliability_state,
                     orchestration_state,
                     runtime_store,
-                    &run.run_id,
+                    &run.spec.run_id,
                     &grant,
                     Some(summary),
                 )
@@ -3711,7 +3673,8 @@ async fn execute_dispatch_grants_with_worker(
                     .await?
                 }
             } else {
-                current_run_status(cx, orchestration_state, runtime_store, &run.run_id).await?
+                current_run_snapshot(cx, orchestration_state, runtime_store, &run.spec.run_id)
+                    .await?
             };
             return Ok(updated_run);
         }
@@ -3753,7 +3716,7 @@ async fn execute_dispatch_grants_with_worker(
             orchestration_state,
             runtime_store,
             repo_root,
-            &updated_run.run_id,
+            &updated_run.spec.run_id,
             grant,
             worker,
         )
@@ -3769,9 +3732,9 @@ async fn execute_inline_run_dispatch(
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
     config: &Config,
-    run: RunStatus,
+    run: RunSnapshot,
     grants: &[DispatchGrant],
-) -> Result<RunStatus> {
+) -> Result<RunSnapshot> {
     let repo_root = session_workspace_root(cx, session).await?;
     let provider = {
         let guard = session
@@ -3823,19 +3786,19 @@ async fn dispatch_run_until_quiescent(
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
     config: &Config,
-    mut run: RunStatus,
+    mut run: RunSnapshot,
     agent_id_prefix: &str,
     lease_ttl_sec: i64,
-) -> Result<(RunStatus, Vec<DispatchGrant>)> {
+) -> Result<(RunSnapshot, Vec<DispatchGrant>)> {
     loop {
         let mut grants = {
             let mut rel = reliability_state
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-            let has_live_tasks = !run.task_ids.is_empty()
-                && run
-                    .task_ids
+            let task_ids = run.task_ids();
+            let has_live_tasks = !task_ids.is_empty()
+                && task_ids
                     .iter()
                     .all(|task_id| rel.tasks.contains_key(task_id));
             if has_live_tasks {
@@ -3843,7 +3806,7 @@ async fn dispatch_run_until_quiescent(
             } else {
                 Err(Error::session(format!(
                     "orchestration run {} is not live in this process",
-                    run.run_id
+                    run.spec.run_id
                 )))
             }
         }?;
@@ -3853,7 +3816,7 @@ async fn dispatch_run_until_quiescent(
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-            orchestration.update_run(&run.run_id, &run.task_ids);
+            orchestration.update_run(&run.spec.run_id, &run.task_ids());
         }
 
         if grants.is_empty() {
@@ -3863,7 +3826,7 @@ async fn dispatch_run_until_quiescent(
                     .await
                     .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
                 if run_has_live_tasks(&rel, &run)
-                    && matches!(run.lifecycle, RunLifecycle::Pending | RunLifecycle::Running)
+                    && matches!(run.phase, RunPhase::Dispatching | RunPhase::Running)
                 {
                     next_recoverable_retry_delay(&rel, &run)
                 } else {
@@ -3880,7 +3843,7 @@ async fn dispatch_run_until_quiescent(
         }
 
         append_dispatch_grants_session_entries(cx, session, reliability_state, &grants).await?;
-        let run_id = run.run_id.clone();
+        let run_id = run.spec.run_id.clone();
         run = match execute_inline_run_dispatch(
             cx,
             session,
@@ -3896,10 +3859,10 @@ async fn dispatch_run_until_quiescent(
             Ok(updated_run) => updated_run,
             Err(err) if grants.len() == 1 => {
                 let recovered_run =
-                    current_run_status(cx, orchestration_state, runtime_store, &run_id).await?;
+                    current_run_snapshot(cx, orchestration_state, runtime_store, &run_id).await?;
                 if matches!(
-                    recovered_run.lifecycle,
-                    RunLifecycle::Pending | RunLifecycle::Running
+                    recovered_run.phase,
+                    RunPhase::Dispatching | RunPhase::Running
                 ) {
                     grants.clear();
                     run = recovered_run;
@@ -3913,12 +3876,8 @@ async fn dispatch_run_until_quiescent(
         grants.clear();
 
         if matches!(
-            run.lifecycle,
-            RunLifecycle::Canceled
-                | RunLifecycle::Failed
-                | RunLifecycle::Succeeded
-                | RunLifecycle::Blocked
-                | RunLifecycle::AwaitingHuman
+            run.phase,
+            RunPhase::Canceled | RunPhase::Failed | RunPhase::Completed | RunPhase::AwaitingHuman
         ) {
             return Ok((run, grants));
         }
@@ -4032,22 +3991,21 @@ fn refresh_task_runs_with_verify_scopes(
     runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<&TaskReport>,
-) -> Vec<(RunStatus, Option<CompletedRunVerifyScope>)> {
+) -> Vec<(RunSnapshot, Option<CompletedRunVerifyScope>)> {
     let run_ids = orchestration.run_ids_for_task(task_id);
     let mut updated_runs = Vec::new();
 
     for run_id in run_ids {
-        let Ok(snapshot) = runtime_store.load_snapshot(&run_id) else {
+        let Ok(mut run) = runtime_store.load_snapshot(&run_id) else {
             continue;
         };
-        let mut run = project_runtime_run_status(&snapshot);
-        if let Some(report) = report.filter(|report| run.task_ids.contains(&report.task_id)) {
+        if let Some(report) = report.filter(|report| run.tasks.contains_key(&report.task_id)) {
             run.upsert_task_report(report.clone());
         }
         let verify_scope = completed_run_verify_scope(reliability, &run)
             .filter(|scope| !should_skip_run_verify(&run, scope));
         refresh_run_from_reliability(reliability, &mut run);
-        orchestration.update_run(&run.run_id, &run.task_ids);
+        orchestration.update_run(&run.spec.run_id, &run.task_ids());
         updated_runs.push((run, verify_scope));
     }
 
@@ -4060,7 +4018,7 @@ fn refresh_task_runs(
     runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<TaskReport>,
-) -> Vec<RunStatus> {
+) -> Vec<RunSnapshot> {
     refresh_task_runs_with_verify_scopes(
         reliability,
         orchestration,
@@ -4097,12 +4055,12 @@ fn run_verify_scope_summary(
 
 async fn execute_run_verification(
     cwd: &Path,
-    run: &mut RunStatus,
+    run: &mut RunSnapshot,
     scope: &CompletedRunVerifyScope,
 ) {
-    let timeout_sec = run.run_verify_timeout_sec.unwrap_or(60);
+    let timeout_sec = run.spec.run_verify_timeout_sec.unwrap_or(60);
     let verify_status =
-        match Verifier::execute_verify_command(cwd, &run.run_verify_command, timeout_sec).await {
+        match Verifier::execute_verify_command(cwd, run.run_verify_command(), timeout_sec).await {
             Ok(execution) => {
                 let outcome = Verifier::classify_execution(&execution);
                 let details = if outcome.ok {
@@ -4130,7 +4088,7 @@ async fn execute_run_verification(
                 scope_id: scope.scope_id.clone(),
                 scope_kind: scope.scope_kind,
                 subrun_id: scope.subrun_id.clone(),
-                command: run.run_verify_command.clone(),
+                command: run.run_verify_command().to_string(),
                 timeout_sec,
                 exit_code: -1,
                 ok: false,
@@ -4140,7 +4098,7 @@ async fn execute_run_verification(
             },
         };
 
-    run.latest_run_verify = Some(verify_status);
+    run.dispatch.latest_run_verify = Some(verify_status);
     apply_run_verify_lifecycle(run);
     run.touch();
 }
@@ -4153,7 +4111,7 @@ async fn sync_task_runs(
     runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<TaskReport>,
-) -> Result<Vec<RunStatus>> {
+) -> Result<Vec<RunSnapshot>> {
     let refreshed_runs = {
         let reliability = reliability_state
             .lock(cx)
@@ -4181,9 +4139,9 @@ async fn sync_task_runs(
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-            orchestration.update_run(&run.run_id, &run.task_ids);
+            orchestration.update_run(&run.spec.run_id, &run.task_ids());
         }
-        persist_run_status(cx, session, runtime_store, &run).await?;
+        persist_runtime_snapshot(cx, session, runtime_store, &run).await?;
         updated_runs.push(run);
     }
     Ok(updated_runs)
@@ -4195,8 +4153,8 @@ async fn refresh_run_if_live(
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     runtime_store: &RuntimeStore,
-    mut run: RunStatus,
-) -> Result<RunStatus> {
+    mut run: RunSnapshot,
+) -> Result<RunSnapshot> {
     let original = run.clone();
     let has_live_tasks = {
         let mut reliability = reliability_state
@@ -4211,11 +4169,11 @@ async fn refresh_run_if_live(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(&run.run_id, &run.task_ids);
+        orchestration.update_run(&run.spec.run_id, &run.task_ids());
     }
 
     if has_live_tasks && run != original {
-        persist_run_status(cx, session, runtime_store, &run).await?;
+        persist_runtime_snapshot(cx, session, runtime_store, &run).await?;
     }
 
     Ok(run)
@@ -4965,20 +4923,20 @@ pub async fn run(
                 }
 
                 {
-                    let mut status = project_runtime_run_status(&runtime_bootstrap.snapshot);
+                    let mut run = runtime_bootstrap.snapshot;
                     {
                         let rel = reliability_state.lock(&cx).await.map_err(|err| {
                             Error::session(format!("reliability lock failed: {err}"))
                         })?;
-                        refresh_run_from_reliability(&rel, &mut status);
+                        refresh_run_from_reliability(&rel, &mut run);
                     }
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
-                    orchestration.register_run(&status.run_id, &status.task_ids);
+                    orchestration.register_run(&run.spec.run_id, &run.task_ids());
                     drop(orchestration);
                     if let Err(err) =
-                        persist_run_status(&cx, &session, &runtime_store, &status).await
+                        persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
                     {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -4990,7 +4948,7 @@ pub async fn run(
                     let _ = out_tx.send(response_ok(
                         id,
                         "orchestration.start_run",
-                        Some(json!({ "run": status })),
+                        Some(json!({ "run": run })),
                     ));
                 }
             }
@@ -5009,7 +4967,7 @@ pub async fn run(
                         }
                     };
 
-                if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
+                if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
                     let run = match refresh_run_if_live(
                         &cx,
                         &session,
@@ -5063,21 +5021,20 @@ pub async fn run(
                     .unwrap_or("run");
                 let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
 
-                let run =
-                    if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.dispatch_run",
-                            &err,
-                        ));
-                        continue;
-                    };
+                let run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.dispatch_run",
+                        &err,
+                    ));
+                    continue;
+                };
 
-                let (run, grants) = match dispatch_run_until_quiescent(
+                let (run, grants) = match Box::pin(dispatch_run_until_quiescent(
                     &cx,
                     &session,
                     &reliability_state,
@@ -5087,7 +5044,7 @@ pub async fn run(
                     run,
                     agent_id_prefix,
                     lease_ttl_sec,
-                )
+                ))
                 .await
                 {
                     Ok(result) => result,
@@ -5100,7 +5057,9 @@ pub async fn run(
                         continue;
                     }
                 };
-                if let Err(err) = persist_run_status(&cx, &session, &runtime_store, &run).await {
+                if let Err(err) =
+                    persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
+                {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.dispatch_run",
@@ -5130,19 +5089,19 @@ pub async fn run(
                         }
                     };
 
-                let mut run =
-                    if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.cancel_run",
-                            &err,
-                        ));
-                        continue;
-                    };
+                let mut run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id)
+                {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.cancel_run",
+                        &err,
+                    ));
+                    continue;
+                };
                 let has_live_tasks = {
                     let rel = reliability_state
                         .lock(&cx)
@@ -5169,18 +5128,20 @@ pub async fn run(
                         continue;
                     }
                 } else {
-                    run.lifecycle = RunLifecycle::Canceled;
-                    run.active_wave = None;
-                    run.active_subrun_id = None;
+                    run.phase = RunPhase::Canceled;
+                    run.dispatch.active_wave = None;
+                    run.dispatch.active_subrun_id = None;
                     run.touch();
                 }
                 {
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
-                    orchestration.update_run(&run.run_id, &run.task_ids);
+                    orchestration.update_run(&run.spec.run_id, &run.task_ids());
                 }
-                if let Err(err) = persist_run_status(&cx, &session, &runtime_store, &run).await {
+                if let Err(err) =
+                    persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
+                {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.cancel_run",
@@ -5210,26 +5171,29 @@ pub async fn run(
                         }
                     };
 
-                let mut run =
-                    if let Some(run) = load_runtime_run_projection(&runtime_store, &req.run_id) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.resume_run",
-                            &err,
-                        ));
-                        continue;
-                    };
-                if matches!(
-                    run.lifecycle,
-                    RunLifecycle::Canceled | RunLifecycle::Blocked | RunLifecycle::Failed
-                ) {
-                    run.lifecycle = RunLifecycle::Pending;
+                let mut run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id)
+                {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.resume_run",
+                        &err,
+                    ));
+                    continue;
+                };
+                if matches!(run.phase, RunPhase::Canceled | RunPhase::Failed) {
+                    run.phase = RunPhase::Dispatching;
+                    run.touch();
                 }
-                if let Some(status) = run.latest_run_verify.as_ref().filter(|status| !status.ok) {
+                if let Some(status) = run
+                    .dispatch
+                    .latest_run_verify
+                    .as_ref()
+                    .filter(|status| !status.ok)
+                {
                     let scope = completed_scope_from_run_verify(status);
                     let cwd = session_workspace_root(&cx, &session).await?;
                     execute_run_verification(&cwd, &mut run, &scope).await;
@@ -5243,15 +5207,14 @@ pub async fn run(
                 };
                 if has_live_tasks
                     && !matches!(
-                        run.lifecycle,
-                        RunLifecycle::Canceled
-                            | RunLifecycle::Failed
-                            | RunLifecycle::Succeeded
-                            | RunLifecycle::Blocked
-                            | RunLifecycle::AwaitingHuman
+                        run.phase,
+                        RunPhase::Canceled
+                            | RunPhase::Failed
+                            | RunPhase::Completed
+                            | RunPhase::AwaitingHuman
                     )
                 {
-                    let (updated_run, _) = match dispatch_run_until_quiescent(
+                    let (updated_run, _) = match Box::pin(dispatch_run_until_quiescent(
                         &cx,
                         &session,
                         &reliability_state,
@@ -5261,7 +5224,7 @@ pub async fn run(
                         run,
                         "resume",
                         3600,
-                    )
+                    ))
                     .await
                     {
                         Ok(result) => result,
@@ -5282,10 +5245,12 @@ pub async fn run(
                             orchestration_state.lock(&cx).await.map_err(|err| {
                                 Error::session(format!("orchestration lock failed: {err}"))
                             })?;
-                        orchestration.update_run(&run.run_id, &run.task_ids);
+                        orchestration.update_run(&run.spec.run_id, &run.task_ids());
                     }
                 }
-                if let Err(err) = persist_run_status(&cx, &session, &runtime_store, &run).await {
+                if let Err(err) =
+                    persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
+                {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
                         "orchestration.resume_run",
@@ -9047,6 +9012,52 @@ mod tests {
         }
     }
 
+    fn test_task_node(task_id: &str) -> TaskNode {
+        TaskNode::new(TaskSpec {
+            task_id: task_id.to_string(),
+            title: format!("Task {task_id}"),
+            objective: format!("Objective {task_id}"),
+            planned_touches: Vec::new(),
+            verify: VerifySpec {
+                command: "true".to_string(),
+                timeout_sec: 30,
+                acceptance_ids: Vec::new(),
+            },
+            autonomy: AutonomyLevel::Guarded,
+            constraints: TaskConstraints::default(),
+        })
+    }
+
+    fn test_run_snapshot(
+        run_id: &str,
+        objective: &str,
+        selected_tier: ExecutionTier,
+    ) -> RunSnapshot {
+        let mut run = RunSnapshot::new(RunSpec {
+            run_id: run_id.to_string(),
+            objective: objective.to_string(),
+            root_workspace: PathBuf::from("/tmp/pi-agent-rust-tests"),
+            policy_profile: "default".to_string(),
+            model_profile: "default".to_string(),
+            run_verify_command: None,
+            run_verify_timeout_sec: None,
+            budgets: RunBudgets::default(),
+            constraints: RunConstraints::default(),
+            created_at: Utc::now(),
+        });
+        run.dispatch.selected_tier = selected_tier;
+        set_run_lifecycle(&mut run, RunLifecycle::Pending);
+        run
+    }
+
+    fn set_run_task_ids(run: &mut RunSnapshot, task_ids: Vec<String>) {
+        run.tasks = task_ids
+            .into_iter()
+            .map(|task_id| (task_id.clone(), test_task_node(&task_id)))
+            .collect();
+        run.touch();
+    }
+
     fn run_async<F>(future: F) -> F::Output
     where
         F: std::future::Future,
@@ -9384,9 +9395,9 @@ mod tests {
     #[test]
     fn orchestration_state_tracks_task_membership_updates() {
         let mut orchestration = RpcOrchestrationState::default();
-        let mut run = RunStatus::new("run-1", "Ship it", ExecutionTier::Wave);
-        run.task_ids = vec!["task-a".to_string(), "task-b".to_string()];
-        orchestration.register_run(&run.run_id, &run.task_ids);
+        let mut run = test_run_snapshot("run-1", "Ship it", ExecutionTier::Wave);
+        set_run_task_ids(&mut run, vec!["task-a".to_string(), "task-b".to_string()]);
+        orchestration.register_run(&run.spec.run_id, &run.task_ids());
 
         assert_eq!(
             orchestration.run_ids_for_task("task-a"),
@@ -9397,8 +9408,8 @@ mod tests {
             vec!["run-1".to_string()]
         );
 
-        run.task_ids = vec!["task-b".to_string()];
-        orchestration.update_run(&run.run_id, &run.task_ids);
+        set_run_task_ids(&mut run, vec!["task-b".to_string()]);
+        orchestration.update_run(&run.spec.run_id, &run.task_ids());
 
         assert!(orchestration.run_ids_for_task("task-a").is_empty());
         assert_eq!(
@@ -9471,15 +9482,19 @@ mod tests {
             .request_dispatch(&contract_a, "agent-1", 60)
             .expect("dispatch task a");
 
-        let mut run = RunStatus::new("run-wave", "Wave", ExecutionTier::Wave);
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        let mut run = test_run_snapshot("run-wave", "Wave", ExecutionTier::Wave);
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Running);
-        assert_eq!(run.task_counts.get("leased"), Some(&1));
-        assert_eq!(run.task_counts.get("ready"), Some(&1));
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Running);
+        assert_eq!(run.summary.task_counts.get("leased"), Some(&1));
+        assert_eq!(run.summary.task_counts.get("ready"), Some(&1));
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -9501,13 +9516,17 @@ mod tests {
             .get_or_create_task(&contract_b)
             .expect("register task b");
 
-        let mut run = RunStatus::new("run-ready", "Ready wave", ExecutionTier::Wave);
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        let mut run = test_run_snapshot("run-ready", "Ready wave", ExecutionTier::Wave);
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Pending);
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -9535,13 +9554,13 @@ mod tests {
             retry_after: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
         };
 
-        let mut run = RunStatus::new("run-recoverable", "Recoverable wait", ExecutionTier::Wave);
-        run.task_ids = vec![contract.task_id.clone()];
+        let mut run = test_run_snapshot("run-recoverable", "Recoverable wait", ExecutionTier::Wave);
+        set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Pending);
-        assert_eq!(run.task_counts.get("recoverable"), Some(&1));
-        assert!(run.active_wave.is_none());
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
+        assert_eq!(run.summary.task_counts.get("recoverable"), Some(&1));
+        assert!(run.dispatch.active_wave.is_none());
     }
 
     #[test]
@@ -9582,16 +9601,20 @@ mod tests {
             retry_after: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
         };
 
-        let mut run = RunStatus::new("run-mixed", "Mixed run", ExecutionTier::Wave);
-        run.task_ids = vec![
-            contract_running.task_id.clone(),
-            contract_recoverable.task_id.clone(),
-        ];
+        let mut run = test_run_snapshot("run-mixed", "Mixed run", ExecutionTier::Wave);
+        set_run_task_ids(
+            &mut run,
+            vec![
+                contract_running.task_id.clone(),
+                contract_recoverable.task_id.clone(),
+            ],
+        );
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Running);
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Running);
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -9617,13 +9640,16 @@ mod tests {
             .get_or_create_task(&contract_c)
             .expect("register task c");
 
-        let mut run = RunStatus::new("run-dispatch", "Dispatch wave", ExecutionTier::Wave);
-        run.max_parallelism = 2;
-        run.task_ids = vec![
-            contract_a.task_id.clone(),
-            contract_b.task_id.clone(),
-            contract_c.task_id.clone(),
-        ];
+        let mut run = test_run_snapshot("run-dispatch", "Dispatch wave", ExecutionTier::Wave);
+        run.spec.budgets.max_parallelism = 2;
+        set_run_task_ids(
+            &mut run,
+            vec![
+                contract_a.task_id.clone(),
+                contract_b.task_id.clone(),
+                contract_c.task_id.clone(),
+            ],
+        );
 
         let grants =
             dispatch_run_wave(&mut reliability, &mut run, "worker", 120).expect("dispatch run");
@@ -9643,11 +9669,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["worker:task-a".to_string(), "worker:task-b".to_string()]
         );
-        assert_eq!(run.lifecycle, RunLifecycle::Running);
-        assert_eq!(run.task_counts.get("leased"), Some(&2));
-        assert_eq!(run.task_counts.get("ready"), Some(&1));
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Running);
+        assert_eq!(run.summary.task_counts.get("leased"), Some(&2));
+        assert_eq!(run.summary.task_counts.get("ready"), Some(&1));
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -9669,9 +9696,12 @@ mod tests {
             .get_or_create_task(&contract_b)
             .expect("register task b");
 
-        let mut run = RunStatus::new("run-dispatch", "Dispatch wave", ExecutionTier::Wave);
-        run.max_parallelism = 2;
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        let mut run = test_run_snapshot("run-dispatch", "Dispatch wave", ExecutionTier::Wave);
+        run.spec.budgets.max_parallelism = 2;
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
 
         let first_grants =
             dispatch_run_wave(&mut reliability, &mut run, "worker", 120).expect("first dispatch");
@@ -9680,8 +9710,8 @@ mod tests {
 
         assert_eq!(first_grants.len(), 2);
         assert!(second_grants.is_empty());
-        assert_eq!(run.lifecycle, RunLifecycle::Running);
-        assert_eq!(run.task_counts.get("leased"), Some(&2));
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Running);
+        assert_eq!(run.summary.task_counts.get("leased"), Some(&2));
     }
 
     #[test]
@@ -9698,23 +9728,26 @@ mod tests {
             .get_or_create_task(&contract_b)
             .expect("register task b");
 
-        let mut run = RunStatus::new("run-cancel", "Cancel run", ExecutionTier::Wave);
-        run.max_parallelism = 2;
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        let mut run = test_run_snapshot("run-cancel", "Cancel run", ExecutionTier::Wave);
+        run.spec.budgets.max_parallelism = 2;
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
 
         let grants =
             dispatch_run_wave(&mut reliability, &mut run, "worker", 120).expect("dispatch run");
 
         assert_eq!(grants.len(), 2);
-        assert_eq!(run.lifecycle, RunLifecycle::Running);
-        assert!(run.active_wave.is_some());
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Running);
+        assert!(run.dispatch.active_wave.is_some());
 
         let canceled_grants = cancel_live_run_tasks(&mut reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Canceled);
-        assert!(run.active_wave.is_none());
-        assert!(run.active_subrun_id.is_none());
-        assert_eq!(run.task_counts.get("ready"), Some(&2));
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Canceled);
+        assert!(run.dispatch.active_wave.is_none());
+        assert!(run.dispatch.active_subrun_id.is_none());
+        assert_eq!(run.summary.task_counts.get("ready"), Some(&2));
         assert_eq!(canceled_grants.len(), 2);
         assert!(matches!(
             reliability
@@ -9746,13 +9779,13 @@ mod tests {
         let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
 
         run_async(async {
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-cancel-sync",
                 "Cancel run sync fixture",
                 ExecutionTier::Wave,
             );
-            run.max_parallelism = 2;
-            run.task_ids = vec!["task-a".to_string(), "task-b".to_string()];
+            run.spec.budgets.max_parallelism = 2;
+            set_run_task_ids(&mut run, vec!["task-a".to_string(), "task-b".to_string()]);
 
             let grants = {
                 let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
@@ -9768,9 +9801,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist run");
             append_dispatch_grants_session_entries(&cx, &session, &reliability_state, &grants)
@@ -9788,21 +9821,21 @@ mod tests {
             .await
             .expect("cancel live run");
 
-            assert_eq!(run.lifecycle, RunLifecycle::Canceled);
-            assert_eq!(run.task_reports.len(), 2);
-            assert!(run.active_wave.is_none());
+            assert_eq!(run_lifecycle(&run), RunLifecycle::Canceled);
+            assert_eq!(run.dispatch.task_reports.len(), 2);
+            assert!(run.dispatch.active_wave.is_none());
             assert!(
-                run.task_reports
+                run.dispatch
+                    .task_reports
                     .values()
                     .all(|report| report.summary.contains("canceled dispatch"))
             );
 
             let persisted = runtime_store
-                .load_snapshot(&run.run_id)
-                .map(|snapshot| project_runtime_run_status(&snapshot))
+                .load_snapshot(&run.spec.run_id)
                 .expect("load persisted run");
-            assert_eq!(persisted.lifecycle, RunLifecycle::Canceled);
-            assert_eq!(persisted.task_reports.len(), 2);
+            assert_eq!(persisted.phase, RunPhase::Canceled);
+            assert_eq!(persisted.dispatch.task_reports.len(), 2);
 
             let snapshot = {
                 let guard = session.lock(&cx).await.expect("lock session");
@@ -9854,26 +9887,26 @@ mod tests {
             .get_or_create_task(&reliability_contract("task-b", Vec::new()))
             .expect("register task b");
 
-        let mut run = RunStatus::new(
+        let mut run = test_run_snapshot(
             "run-canceled-refresh",
             "Canceled refresh fixture",
             ExecutionTier::Wave,
         );
-        run.task_ids = vec!["task-a".to_string(), "task-b".to_string()];
-        run.lifecycle = RunLifecycle::Canceled;
-        run.active_wave = Some(WaveStatus {
+        set_run_task_ids(&mut run, vec!["task-a".to_string(), "task-b".to_string()]);
+        set_run_lifecycle(&mut run, RunLifecycle::Canceled);
+        run.dispatch.active_wave = Some(WaveStatus {
             wave_id: "wave-stale".to_string(),
             task_ids: vec!["task-a".to_string()],
             started_at: chrono::Utc::now(),
             completed_at: None,
         });
-        run.active_subrun_id = Some("subrun-stale".to_string());
+        run.dispatch.active_subrun_id = Some("subrun-stale".to_string());
 
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Canceled);
-        assert!(run.active_wave.is_none());
-        assert!(run.active_subrun_id.is_none());
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Canceled);
+        assert!(run.dispatch.active_wave.is_none());
+        assert!(run.dispatch.active_subrun_id.is_none());
     }
 
     #[test]
@@ -9897,13 +9930,17 @@ mod tests {
             .planned_touches
             .clear();
 
-        let mut run = RunStatus::new("run-serialized", "Serialized wave", ExecutionTier::Wave);
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+        let mut run = test_run_snapshot("run-serialized", "Serialized wave", ExecutionTier::Wave);
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Pending);
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -9925,15 +9962,16 @@ mod tests {
             task_ids.push(task_id);
         }
 
-        let mut run = RunStatus::new("run-cap", "Capped wave", ExecutionTier::Wave);
-        run.max_parallelism = 2;
-        run.task_ids = task_ids;
+        let mut run = test_run_snapshot("run-cap", "Capped wave", ExecutionTier::Wave);
+        run.spec.budgets.max_parallelism = 2;
+        set_run_task_ids(&mut run, task_ids);
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.lifecycle, RunLifecycle::Pending);
-        assert_eq!(run.max_parallelism, 2);
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
+        assert_eq!(run.effective_max_parallelism(), 2);
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -9955,18 +9993,19 @@ mod tests {
             task_ids.push(task_id);
         }
 
-        let mut run = RunStatus::new("run-hier", "Hierarchical", ExecutionTier::Hierarchical);
-        run.max_parallelism = 12;
-        run.task_ids = task_ids.clone();
+        let mut run = test_run_snapshot("run-hier", "Hierarchical", ExecutionTier::Hierarchical);
+        run.spec.budgets.max_parallelism = 12;
+        set_run_task_ids(&mut run, task_ids.clone());
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.active_subrun_id.as_deref(), Some("subrun-01"));
-        assert_eq!(run.max_parallelism, 12);
-        assert_eq!(run.planned_subruns.len(), 2);
-        assert_eq!(run.planned_subruns[0].task_ids.len(), 12);
-        assert_eq!(run.planned_subruns[1].task_ids.len(), 1);
+        assert_eq!(run.dispatch.active_subrun_id.as_deref(), Some("subrun-01"));
+        assert_eq!(run.effective_max_parallelism(), 12);
+        assert_eq!(run.dispatch.planned_subruns.len(), 2);
+        assert_eq!(run.dispatch.planned_subruns[0].task_ids.len(), 12);
+        assert_eq!(run.dispatch.planned_subruns[1].task_ids.len(), 1);
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -10003,18 +10042,19 @@ mod tests {
         }
         reliability.refresh_dependency_states();
 
-        let mut run = RunStatus::new(
+        let mut run = test_run_snapshot(
             "run-hier-chain",
             "Hierarchical chain",
             ExecutionTier::Hierarchical,
         );
-        run.task_ids = task_ids.clone();
+        set_run_task_ids(&mut run, task_ids.clone());
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run.planned_subruns.len(), 2);
-        assert_eq!(run.active_subrun_id.as_deref(), Some("subrun-01"));
+        assert_eq!(run.dispatch.planned_subruns.len(), 2);
+        assert_eq!(run.dispatch.active_subrun_id.as_deref(), Some("subrun-01"));
         assert_eq!(
-            run.active_wave
+            run.dispatch
+                .active_wave
                 .as_ref()
                 .map(|wave| wave.task_ids.clone())
                 .unwrap_or_default(),
@@ -10067,24 +10107,11 @@ mod tests {
         let mut orchestration = RpcOrchestrationState::default();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
-        let mut run = RunStatus::new("run-success", "Run success", ExecutionTier::Inline);
-        run.task_ids = vec![contract.task_id.clone()];
-        orchestration.register_run(&run.run_id, &run.task_ids);
-        let mut snapshot = RunSnapshot::new(RunSpec {
-            run_id: run.run_id.clone(),
-            objective: run.objective.clone(),
-            root_workspace: PathBuf::from("/tmp/run-success"),
-            policy_profile: "default".to_string(),
-            model_profile: "default".to_string(),
-            run_verify_command: Some(run.run_verify_command.clone()),
-            run_verify_timeout_sec: run.run_verify_timeout_sec,
-            budgets: RunBudgets::default(),
-            constraints: RunConstraints::default(),
-            created_at: run.created_at,
-        });
-        apply_run_status_to_snapshot(&mut snapshot, &run);
+        let mut run = test_run_snapshot("run-success", "Run success", ExecutionTier::Inline);
+        set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+        orchestration.register_run(&run.spec.run_id, &run.task_ids());
         runtime_store
-            .save_snapshot(&snapshot)
+            .save_snapshot(&run)
             .expect("save run snapshot");
 
         let updated = refresh_task_runs(
@@ -10096,11 +10123,12 @@ mod tests {
         );
         let run = updated.first().expect("updated run");
         let task_report = run
+            .dispatch
             .task_reports
             .get(&contract.task_id)
             .expect("persisted task report");
 
-        assert_eq!(run.lifecycle, RunLifecycle::Succeeded);
+        assert_eq!(run_lifecycle(run), RunLifecycle::Succeeded);
         assert_eq!(task_report.summary, "Implemented orchestration report");
         assert_eq!(task_report.verify_exit_code, 0);
         assert_eq!(task_report.changed_files, vec!["src/rpc.rs".to_string()]);
@@ -10131,14 +10159,14 @@ mod tests {
                     .expect("dispatch inline task")
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-inline-exec",
                 "Inline execution fixture",
                 ExecutionTier::Inline,
             );
-            run.task_ids = vec![contract.task_id.clone()];
-            run.run_verify_command = "true".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+            run.spec.run_verify_command = Some("true".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10148,9 +10176,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10173,15 +10201,17 @@ mod tests {
             .await
             .expect("execute inline task");
 
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Succeeded);
             assert!(
                 updated_run
+                    .dispatch
                     .latest_run_verify
                     .as_ref()
                     .is_some_and(|verify| verify.ok)
             );
             assert_eq!(
                 updated_run
+                    .dispatch
                     .task_reports
                     .get(&contract.task_id)
                     .expect("task report")
@@ -10230,14 +10260,14 @@ mod tests {
                     .expect("dispatch inline task")
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-inline-fail",
                 "Inline execution verify failure",
                 ExecutionTier::Inline,
             );
-            run.task_ids = vec![contract.task_id.clone()];
-            run.run_verify_command = "true".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+            run.spec.run_verify_command = Some("true".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10247,9 +10277,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10317,14 +10347,14 @@ mod tests {
                     .expect("dispatch inline task")
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-inline-worker-fail",
                 "Inline execution worker failure",
                 ExecutionTier::Inline,
             );
-            run.task_ids = vec![contract.task_id.clone()];
-            run.run_verify_command = "true".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+            run.spec.run_verify_command = Some("true".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10334,9 +10364,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10358,7 +10388,7 @@ mod tests {
             .expect_err("worker failure should surface");
             assert!(err.to_string().contains("fixture worker exploded"));
 
-            let run = current_run_status(
+            let run = current_run_snapshot(
                 &cx,
                 &orchestration_state,
                 &runtime_store,
@@ -10367,11 +10397,12 @@ mod tests {
             .await
             .expect("load updated run");
             let report = run
+                .dispatch
                 .task_reports
                 .get(&contract.task_id)
                 .expect("rollback task report");
 
-            assert_eq!(run.lifecycle, RunLifecycle::Pending);
+            assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
             assert_eq!(
                 report.failure_class.as_deref(),
                 Some("orchestration_execution_error")
@@ -10443,14 +10474,14 @@ mod tests {
                     .expect("dispatch inline create task")
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-inline-create",
                 "Inline execution create-file fixture",
                 ExecutionTier::Inline,
             );
-            run.task_ids = vec![contract.task_id.clone()];
-            run.run_verify_command = "test -f src/new_file.rs".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+            run.spec.run_verify_command = Some("test -f src/new_file.rs".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10460,9 +10491,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10485,15 +10516,17 @@ mod tests {
             .await
             .expect("execute inline create task");
 
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Succeeded);
             assert!(
                 updated_run
+                    .dispatch
                     .latest_run_verify
                     .as_ref()
                     .is_some_and(|verify| verify.ok)
             );
             assert_eq!(
                 updated_run
+                    .dispatch
                     .task_reports
                     .get(&contract.task_id)
                     .expect("task report")
@@ -10559,16 +10592,20 @@ mod tests {
                 ]
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-parallel-wave",
                 "Parallel wave execution fixture",
                 ExecutionTier::Wave,
             );
-            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
-            run.run_verify_command =
+            set_run_task_ids(
+                &mut run,
+                vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+            );
+            run.spec.run_verify_command = Some(
                 "grep -q task_parallel_a src/lib.rs && grep -q task_parallel_b src/extra.rs"
-                    .to_string();
-            run.run_verify_timeout_sec = Some(30);
+                    .to_string(),
+            );
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10578,9 +10615,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10606,9 +10643,10 @@ mod tests {
             .await
             .expect("execute parallel wave");
 
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Succeeded);
             assert!(
                 updated_run
+                    .dispatch
                     .latest_run_verify
                     .as_ref()
                     .is_some_and(|verify| verify.ok)
@@ -10665,14 +10703,17 @@ mod tests {
                 ]
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-partial-wave",
                 "Parallel partial failure fixture",
                 ExecutionTier::Wave,
             );
-            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
-            run.run_verify_command = "true".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            set_run_task_ids(
+                &mut run,
+                vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+            );
+            run.spec.run_verify_command = Some("true".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10682,9 +10723,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10704,7 +10745,7 @@ mod tests {
             )
             .await
             .expect("partial wave failure should stay automatable");
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Pending);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Pending);
 
             let lib_contents =
                 fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
@@ -10713,7 +10754,7 @@ mod tests {
             assert!(lib_contents.contains("task_partial_a"));
             assert!(!extra_contents.contains("task_partial_b"));
 
-            let updated_run = current_run_status(
+            let updated_run = current_run_snapshot(
                 &cx,
                 &orchestration_state,
                 &runtime_store,
@@ -10721,9 +10762,10 @@ mod tests {
             )
             .await
             .expect("load updated run");
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Pending);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Pending);
             assert_eq!(
                 updated_run
+                    .dispatch
                     .task_reports
                     .get("task-partial-a")
                     .and_then(|report| report.failure_class.clone()),
@@ -10731,6 +10773,7 @@ mod tests {
             );
             assert_eq!(
                 updated_run
+                    .dispatch
                     .task_reports
                     .get("task-partial-b")
                     .and_then(|report| report.failure_class.as_deref()),
@@ -10738,6 +10781,7 @@ mod tests {
             );
             assert!(
                 updated_run
+                    .dispatch
                     .task_reports
                     .get("task-partial-b")
                     .is_some_and(|report| report.summary.contains("fixture partial wave failure"))
@@ -10799,16 +10843,20 @@ mod tests {
                 ]
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-overlap-replay",
                 "Overlap replay fixture",
                 ExecutionTier::Wave,
             );
-            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
-            run.run_verify_command =
+            set_run_task_ids(
+                &mut run,
+                vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+            );
+            run.spec.run_verify_command = Some(
                 "grep -q \"beta-after-alpha\" src/lib.rs && ! grep -q \"beta-alone\" src/lib.rs"
-                    .to_string();
-            run.run_verify_timeout_sec = Some(30);
+                    .to_string(),
+            );
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10818,9 +10866,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10841,9 +10889,10 @@ mod tests {
             .await
             .expect("execute overlap replay");
 
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Succeeded);
             assert!(
                 updated_run
+                    .dispatch
                     .latest_run_verify
                     .as_ref()
                     .is_some_and(|verify| verify.ok)
@@ -10893,14 +10942,17 @@ mod tests {
                     .expect("dispatch first sequential task")
             };
 
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-sequential-rebase",
                 "Sequential rebase fixture",
                 ExecutionTier::Wave,
             );
-            run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
-            run.run_verify_command = "true".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            set_run_task_ids(
+                &mut run,
+                vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+            );
+            run.spec.run_verify_command = Some("true".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             {
                 let rel = reliability_state.lock(&cx).await.expect("lock reliability");
                 refresh_run_from_reliability(&rel, &mut run);
@@ -10910,9 +10962,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -10933,7 +10985,7 @@ mod tests {
             .await
             .expect("execute first sequential task");
             assert!(matches!(
-                after_first.lifecycle,
+                run_lifecycle(&after_first),
                 RunLifecycle::Pending | RunLifecycle::Running
             ));
 
@@ -10962,7 +11014,7 @@ mod tests {
             .await
             .expect("execute second sequential task");
 
-            assert_eq!(updated_run.lifecycle, RunLifecycle::Succeeded);
+            assert_eq!(run_lifecycle(&updated_run), RunLifecycle::Succeeded);
             let lib_contents =
                 fs::read_to_string(repo_path.join("src/lib.rs")).expect("read updated lib file");
             assert!(lib_contents.contains("// alpha"));
@@ -11011,12 +11063,15 @@ mod tests {
                 rel.reconcile_prerequisites(&contract_b)
                     .expect("reconcile prerequisite");
 
-                let mut run = RunStatus::new(
+                let mut run = test_run_snapshot(
                     "run-chain-wave",
                     "Same-touch prerequisite chain",
                     ExecutionTier::Wave,
                 );
-                run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
+                set_run_task_ids(
+                    &mut run,
+                    vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+                );
                 refresh_run_from_reliability(&rel, &mut run);
                 run
             };
@@ -11025,9 +11080,9 @@ mod tests {
                     .lock(&cx)
                     .await
                     .expect("lock orchestration");
-                orchestration.register_run(&run.run_id, &run.task_ids);
+                orchestration.register_run(&run.spec.run_id, &run.task_ids());
             }
-            persist_run_status(&cx, &session, &runtime_store, &run)
+            persist_runtime_snapshot(&cx, &session, &runtime_store, &run)
                 .await
                 .expect("persist initial run");
 
@@ -11058,7 +11113,7 @@ mod tests {
             .expect("execute first wave");
 
             let mut run =
-                current_run_status(&cx, &orchestration_state, &runtime_store, "run-chain-wave")
+                current_run_snapshot(&cx, &orchestration_state, &runtime_store, "run-chain-wave")
                     .await
                     .expect("load updated run");
             let second_grants = {
@@ -11125,24 +11180,11 @@ mod tests {
         let mut orchestration = RpcOrchestrationState::default();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
-        let mut run = RunStatus::new("run-blocked", "Run blocked", ExecutionTier::Inline);
-        run.task_ids = vec![contract.task_id.clone()];
-        orchestration.register_run(&run.run_id, &run.task_ids);
-        let mut snapshot = RunSnapshot::new(RunSpec {
-            run_id: run.run_id.clone(),
-            objective: run.objective.clone(),
-            root_workspace: PathBuf::from("/tmp/run-blocked"),
-            policy_profile: "default".to_string(),
-            model_profile: "default".to_string(),
-            run_verify_command: Some(run.run_verify_command.clone()),
-            run_verify_timeout_sec: run.run_verify_timeout_sec,
-            budgets: RunBudgets::default(),
-            constraints: RunConstraints::default(),
-            created_at: run.created_at,
-        });
-        apply_run_status_to_snapshot(&mut snapshot, &run);
+        let mut run = test_run_snapshot("run-blocked", "Run blocked", ExecutionTier::Inline);
+        set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+        orchestration.register_run(&run.spec.run_id, &run.task_ids());
         runtime_store
-            .save_snapshot(&snapshot)
+            .save_snapshot(&run)
             .expect("save run snapshot");
 
         let updated = refresh_task_runs(
@@ -11154,11 +11196,12 @@ mod tests {
         );
         let run = updated.first().expect("updated run");
         let task_report = run
+            .dispatch
             .task_reports
             .get(&contract.task_id)
             .expect("persisted task report");
 
-        assert_eq!(run.lifecycle, RunLifecycle::AwaitingHuman);
+        assert_eq!(run_lifecycle(run), RunLifecycle::AwaitingHuman);
         assert_eq!(task_report.failure_class.as_deref(), Some("human_blocker"));
         assert!(
             task_report
@@ -11221,19 +11264,22 @@ mod tests {
                 .expect("submit success");
         }
 
-        let mut run = RunStatus::new("run-wave-verify", "Run verify", ExecutionTier::Wave);
-        run.run_verify_command = "true".to_string();
-        run.run_verify_timeout_sec = Some(30);
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
-        run.active_wave = Some(WaveStatus {
+        let mut run = test_run_snapshot("run-wave-verify", "Run verify", ExecutionTier::Wave);
+        run.spec.run_verify_command = Some("true".to_string());
+        run.spec.run_verify_timeout_sec = Some(30);
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
+        run.dispatch.active_wave = Some(WaveStatus {
             wave_id: "wave-1".to_string(),
-            task_ids: run.task_ids.clone(),
+            task_ids: run.task_ids(),
             started_at: chrono::Utc::now(),
             completed_at: None,
         });
 
         let scope = completed_run_verify_scope(&reliability, &run).expect("completed run scope");
-        assert_eq!(scope.scope_id, run.run_id);
+        assert_eq!(scope.scope_id, run.spec.run_id);
         assert_eq!(scope.scope_kind, RunVerifyScopeKind::Run);
         assert_eq!(scope.subrun_id, None);
     }
@@ -11299,15 +11345,18 @@ mod tests {
             .expect("submit success");
         reliability.refresh_dependency_states();
 
-        let mut run = RunStatus::new(
+        let mut run = test_run_snapshot(
             "run-wave-intermediate",
             "Run verify waits for terminal run",
             ExecutionTier::Wave,
         );
-        run.run_verify_command = "true".to_string();
-        run.run_verify_timeout_sec = Some(30);
-        run.task_ids = vec![contract_a.task_id.clone(), contract_b.task_id.clone()];
-        run.active_wave = Some(WaveStatus {
+        run.spec.run_verify_command = Some("true".to_string());
+        run.spec.run_verify_timeout_sec = Some(30);
+        set_run_task_ids(
+            &mut run,
+            vec![contract_a.task_id.clone(), contract_b.task_id.clone()],
+        );
+        run.dispatch.active_wave = Some(WaveStatus {
             wave_id: "wave-1".to_string(),
             task_ids: vec![contract_a.task_id.clone()],
             started_at: chrono::Utc::now(),
@@ -11387,21 +11436,26 @@ mod tests {
         }
         reliability.refresh_dependency_states();
 
-        let mut run = RunStatus::new(
+        let mut run = test_run_snapshot(
             "run-hier-intermediate",
             "Run verify waits for terminal hierarchical run",
             ExecutionTier::Hierarchical,
         );
-        run.run_verify_command = "true".to_string();
-        run.run_verify_timeout_sec = Some(30);
-        run.task_ids = task_ids.clone();
+        run.spec.run_verify_command = Some("true".to_string());
+        run.spec.run_verify_timeout_sec = Some(30);
+        set_run_task_ids(&mut run, task_ids.clone());
         refresh_run_from_reliability(&reliability, &mut run);
-        assert_eq!(run.planned_subruns.len(), 2);
+        assert_eq!(run.dispatch.planned_subruns.len(), 2);
 
-        let first_subrun = run.planned_subruns.first().cloned().expect("first subrun");
+        let first_subrun = run
+            .dispatch
+            .planned_subruns
+            .first()
+            .cloned()
+            .expect("first subrun");
         assert_eq!(first_subrun.task_ids.len(), 12);
-        run.active_subrun_id = Some(first_subrun.subrun_id.clone());
-        run.active_wave = Some(WaveStatus {
+        run.dispatch.active_subrun_id = Some(first_subrun.subrun_id.clone());
+        run.dispatch.active_wave = Some(WaveStatus {
             wave_id: "wave-hier-1".to_string(),
             task_ids: first_subrun.task_ids.clone(),
             started_at: chrono::Utc::now(),
@@ -11456,13 +11510,13 @@ mod tests {
             })
             .expect("submit success");
 
-        let mut run = RunStatus::new(
+        let mut run = test_run_snapshot(
             "run-verify-fail-state",
             "Run verify failed",
             ExecutionTier::Inline,
         );
-        run.task_ids = vec![contract.task_id.clone()];
-        run.latest_run_verify = Some(RunVerifyStatus {
+        set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
+        run.dispatch.latest_run_verify = Some(RunVerifyStatus {
             scope_id: "run-verify-fail-state".to_string(),
             scope_kind: RunVerifyScopeKind::Run,
             subrun_id: None,
@@ -11476,7 +11530,7 @@ mod tests {
         });
 
         refresh_run_from_reliability(&reliability, &mut run);
-        assert_eq!(run.lifecycle, RunLifecycle::Failed);
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Failed);
     }
 
     #[test]
@@ -11488,13 +11542,13 @@ mod tests {
 
         runtime.block_on(async move {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-verify-success",
                 "Run verify success",
                 ExecutionTier::Wave,
             );
-            run.run_verify_command = "true".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            run.spec.run_verify_command = Some("true".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             let scope = CompletedRunVerifyScope {
                 scope_id: "run-verify-success".to_string(),
                 scope_kind: RunVerifyScopeKind::Run,
@@ -11503,10 +11557,14 @@ mod tests {
 
             execute_run_verification(temp_dir.path(), &mut run, &scope).await;
 
-            let verify = run.latest_run_verify.as_ref().expect("verification result");
+            let verify = run
+                .dispatch
+                .latest_run_verify
+                .as_ref()
+                .expect("verification result");
             assert!(verify.ok);
             assert_eq!(verify.scope_id, "run-verify-success");
-            assert_eq!(run.lifecycle, RunLifecycle::Pending);
+            assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
         });
     }
 
@@ -11519,13 +11577,13 @@ mod tests {
 
         runtime.block_on(async move {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let mut run = RunStatus::new(
+            let mut run = test_run_snapshot(
                 "run-verify-failure",
                 "Run verify failure",
                 ExecutionTier::Wave,
             );
-            run.run_verify_command = "false".to_string();
-            run.run_verify_timeout_sec = Some(30);
+            run.spec.run_verify_command = Some("false".to_string());
+            run.spec.run_verify_timeout_sec = Some(30);
             let scope = CompletedRunVerifyScope {
                 scope_id: "run-verify-failure".to_string(),
                 scope_kind: RunVerifyScopeKind::Run,
@@ -11534,10 +11592,14 @@ mod tests {
 
             execute_run_verification(temp_dir.path(), &mut run, &scope).await;
 
-            let verify = run.latest_run_verify.as_ref().expect("verification result");
+            let verify = run
+                .dispatch
+                .latest_run_verify
+                .as_ref()
+                .expect("verification result");
             assert!(!verify.ok);
             assert_eq!(verify.scope_id, "run-verify-failure");
-            assert_eq!(run.lifecycle, RunLifecycle::Failed);
+            assert_eq!(run_lifecycle(&run), RunLifecycle::Failed);
         });
     }
 

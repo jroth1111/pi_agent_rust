@@ -386,6 +386,26 @@ fn assert_err(resp: &Value, command: &str) {
     );
 }
 
+fn run_data(resp: &Value) -> &Value {
+    &resp["data"]["run"]
+}
+
+fn run_spec(resp: &Value) -> &Value {
+    &run_data(resp)["spec"]
+}
+
+fn run_dispatch(resp: &Value) -> &Value {
+    &run_data(resp)["dispatch"]
+}
+
+fn run_summary(resp: &Value) -> &Value {
+    &run_data(resp)["summary"]
+}
+
+fn run_phase(resp: &Value) -> &Value {
+    &run_data(resp)["phase"]
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Configuration commands
 // ---------------------------------------------------------------------------
@@ -745,7 +765,7 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -765,7 +785,7 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
             grants.is_empty(),
             "automated wave dispatch should not return live leases"
         );
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&dispatch), "completed");
 
         let get_cmd = json!({
             "id": "3",
@@ -775,8 +795,8 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
         .to_string();
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
-        assert_eq!(get["data"]["run"]["runId"], run_id);
-        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 2);
+        assert_eq!(run_spec(&get)["runId"], run_id);
+        assert_eq!(run_summary(&get)["taskCounts"]["terminal"], 2);
 
         drop(in_tx);
         let result = server.await;
@@ -825,7 +845,7 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -845,8 +865,8 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
             grants.is_empty(),
             "inline dispatch should not return live leases"
         );
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 1);
+        assert_eq!(run_phase(&dispatch), "completed");
+        assert_eq!(run_summary(&dispatch)["taskCounts"]["terminal"], 1);
 
         let get_cmd = json!({
             "id": "3",
@@ -856,8 +876,8 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
         .to_string();
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
-        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 1);
+        assert_eq!(run_phase(&get), "completed");
+        assert_eq!(run_summary(&get)["taskCounts"]["terminal"], 1);
 
         drop(in_tx);
         let result = server.await;
@@ -919,7 +939,7 @@ fn rpc_orchestration_dispatch_run_applies_created_file_changes() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -932,13 +952,13 @@ fn rpc_orchestration_dispatch_run_applies_created_file_changes() {
         let dispatch =
             send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
         assert_ok(&dispatch, "orchestration.dispatch_run");
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&dispatch), "completed");
         assert_eq!(
-            dispatch["data"]["run"]["taskReports"]["task-e2e-create"]["changedFiles"],
+            run_dispatch(&dispatch)["taskReports"]["task-e2e-create"]["changedFiles"],
             json!(["src/new_file.rs"])
         );
         assert_eq!(
-            dispatch["data"]["run"]["taskReports"]["task-e2e-create"]["verifyExitCode"],
+            run_dispatch(&dispatch)["taskReports"]["task-e2e-create"]["verifyExitCode"],
             0
         );
 
@@ -954,9 +974,9 @@ fn rpc_orchestration_dispatch_run_applies_created_file_changes() {
         .to_string();
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
-        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&get), "completed");
         assert_eq!(
-            get["data"]["run"]["taskReports"]["task-e2e-create"]["changedFiles"],
+            run_dispatch(&get)["taskReports"]["task-e2e-create"]["changedFiles"],
             json!(["src/new_file.rs"])
         );
 
@@ -1021,7 +1041,7 @@ fn rpc_orchestration_dispatch_run_advances_dependency_waves() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1041,8 +1061,8 @@ fn rpc_orchestration_dispatch_run_advances_dependency_waves() {
             grants.is_empty(),
             "automated dependency dispatch should not return live leases"
         );
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 2);
+        assert_eq!(run_phase(&dispatch), "completed");
+        assert_eq!(run_summary(&dispatch)["taskCounts"]["terminal"], 2);
 
         let get_cmd = json!({
             "id": "3",
@@ -1052,8 +1072,8 @@ fn rpc_orchestration_dispatch_run_advances_dependency_waves() {
         .to_string();
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
-        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 2);
+        assert_eq!(run_phase(&get), "completed");
+        assert_eq!(run_summary(&get)["taskCounts"]["terminal"], 2);
 
         drop(in_tx);
         let result = server.await;
@@ -1141,7 +1161,7 @@ fn rpc_orchestration_dispatch_run_rebases_same_touch_dependency_chain() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1161,21 +1181,21 @@ fn rpc_orchestration_dispatch_run_rebases_same_touch_dependency_chain() {
             grants.is_empty(),
             "automated same-touch dependency dispatch should not return live leases"
         );
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&dispatch), "completed");
         assert_eq!(
-            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-a"]["verifyExitCode"],
+            run_dispatch(&dispatch)["taskReports"]["task-e2e-overlap-a"]["verifyExitCode"],
             0
         );
         assert_eq!(
-            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-b"]["verifyExitCode"],
+            run_dispatch(&dispatch)["taskReports"]["task-e2e-overlap-b"]["verifyExitCode"],
             0
         );
         assert_eq!(
-            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-a"]["changedFiles"],
+            run_dispatch(&dispatch)["taskReports"]["task-e2e-overlap-a"]["changedFiles"],
             json!(["shared.txt"])
         );
         assert_eq!(
-            dispatch["data"]["run"]["taskReports"]["task-e2e-overlap-b"]["changedFiles"],
+            run_dispatch(&dispatch)["taskReports"]["task-e2e-overlap-b"]["changedFiles"],
             json!(["shared.txt"])
         );
 
@@ -1193,9 +1213,9 @@ fn rpc_orchestration_dispatch_run_rebases_same_touch_dependency_chain() {
         .to_string();
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
-        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&get), "completed");
         assert_eq!(
-            get["data"]["run"]["taskReports"]["task-e2e-overlap-b"]["verifyExitCode"],
+            run_dispatch(&get)["taskReports"]["task-e2e-overlap-b"]["verifyExitCode"],
             0
         );
 
@@ -1248,7 +1268,7 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1268,8 +1288,8 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
             grants.is_empty(),
             "inline dispatch should complete in-process without external leases"
         );
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "failed");
-        assert_eq!(dispatch["data"]["run"]["latestRunVerify"]["ok"], false);
+        assert_eq!(run_phase(&dispatch), "failed");
+        assert_eq!(run_dispatch(&dispatch)["latestRunVerify"]["ok"], false);
 
         let failed_get_cmd = json!({
             "id": "3",
@@ -1279,8 +1299,8 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         .to_string();
         let failed_get = send_recv(&in_tx, &out_rx, &failed_get_cmd, "orchestration.get_run").await;
         assert_ok(&failed_get, "orchestration.get_run");
-        assert_eq!(failed_get["data"]["run"]["lifecycle"], "failed");
-        assert_eq!(failed_get["data"]["run"]["latestRunVerify"]["ok"], false);
+        assert_eq!(run_phase(&failed_get), "failed");
+        assert_eq!(run_dispatch(&failed_get)["latestRunVerify"]["ok"], false);
 
         let touch_cmd = json!({
             "id": "4",
@@ -1299,8 +1319,8 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         .to_string();
         let resumed = send_recv(&in_tx, &out_rx, &resume_cmd, "orchestration.resume_run").await;
         assert_ok(&resumed, "orchestration.resume_run");
-        assert_eq!(resumed["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(resumed["data"]["run"]["latestRunVerify"]["ok"], true);
+        assert_eq!(run_phase(&resumed), "completed");
+        assert_eq!(run_dispatch(&resumed)["latestRunVerify"]["ok"], true);
 
         drop(in_tx);
         let result = server.await;
@@ -1349,7 +1369,7 @@ fn rpc_orchestration_resume_run_redispatches_due_recoverable_task() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
 
         let request_dispatch_cmd = json!({
             "id": "2",
@@ -1404,9 +1424,9 @@ fn rpc_orchestration_resume_run_redispatches_due_recoverable_task() {
         .to_string();
         let resumed = send_recv(&in_tx, &out_rx, &resume_cmd, "orchestration.resume_run").await;
         assert_ok(&resumed, "orchestration.resume_run");
-        assert_eq!(resumed["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&resumed), "completed");
         assert_eq!(
-            resumed["data"]["run"]["taskReports"]["task-e2e-recoverable"]["verifyExitCode"],
+            run_dispatch(&resumed)["taskReports"]["task-e2e-recoverable"]["verifyExitCode"],
             0
         );
 
@@ -1458,7 +1478,7 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
 
         let request_dispatch_cmd = json!({
             "id": "2",
@@ -1486,10 +1506,10 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         .to_string();
         let canceled = send_recv(&in_tx, &out_rx, &cancel_cmd, "orchestration.cancel_run").await;
         assert_ok(&canceled, "orchestration.cancel_run");
-        assert_eq!(canceled["data"]["run"]["lifecycle"], "canceled");
-        assert!(canceled["data"]["run"]["activeWave"].is_null());
+        assert_eq!(run_phase(&canceled), "canceled");
+        assert!(run_dispatch(&canceled)["activeWave"].is_null());
         assert!(
-            canceled["data"]["run"]["taskReports"]["task-e2e-cancel"]["summary"]
+            run_dispatch(&canceled)["taskReports"]["task-e2e-cancel"]["summary"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("canceled dispatch"))
         );
@@ -1502,10 +1522,10 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         .to_string();
         let fetched = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&fetched, "orchestration.get_run");
-        assert_eq!(fetched["data"]["run"]["lifecycle"], "canceled");
-        assert!(fetched["data"]["run"]["activeWave"].is_null());
+        assert_eq!(run_phase(&fetched), "canceled");
+        assert!(run_dispatch(&fetched)["activeWave"].is_null());
         assert!(
-            fetched["data"]["run"]["taskReports"]["task-e2e-cancel"]["summary"]
+            run_dispatch(&fetched)["taskReports"]["task-e2e-cancel"]["summary"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("canceled dispatch"))
         );
@@ -1558,7 +1578,7 @@ fn rpc_orchestration_dispatch_run_persists_worker_failure_report() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "inline");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1585,14 +1605,14 @@ fn rpc_orchestration_dispatch_run_persists_worker_failure_report() {
         .to_string();
         let fetched = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&fetched, "orchestration.get_run");
-        assert_eq!(fetched["data"]["run"]["lifecycle"], "pending");
-        assert_eq!(fetched["data"]["run"]["taskCounts"]["ready"], 1);
+        assert_eq!(run_phase(&fetched), "dispatching");
+        assert_eq!(run_summary(&fetched)["taskCounts"]["ready"], 1);
         assert_eq!(
-            fetched["data"]["run"]["taskReports"]["task-e2e-worker-fail"]["failureClass"],
+            run_dispatch(&fetched)["taskReports"]["task-e2e-worker-fail"]["failureClass"],
             "orchestration_execution_error"
         );
         assert!(
-            fetched["data"]["run"]["taskReports"]["task-e2e-worker-fail"]["summary"]
+            run_dispatch(&fetched)["taskReports"]["task-e2e-worker-fail"]["summary"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("scripted provider exhausted its steps"))
         );
@@ -1657,7 +1677,7 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "wave");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1670,8 +1690,8 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
         let dispatch =
             send_recv(&in_tx, &out_rx, &dispatch_cmd, "orchestration.dispatch_run").await;
         assert_ok(&dispatch, "orchestration.dispatch_run");
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "failed");
-        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 2);
+        assert_eq!(run_phase(&dispatch), "failed");
+        assert_eq!(run_summary(&dispatch)["taskCounts"]["terminal"], 2);
 
         let get_cmd = json!({
             "id": "3",
@@ -1681,10 +1701,10 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
         .to_string();
         let fetched = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&fetched, "orchestration.get_run");
-        assert_eq!(fetched["data"]["run"]["lifecycle"], "failed");
-        assert_eq!(fetched["data"]["run"]["taskCounts"]["terminal"], 2);
+        assert_eq!(run_phase(&fetched), "failed");
+        assert_eq!(run_summary(&fetched)["taskCounts"]["terminal"], 2);
 
-        let reports = fetched["data"]["run"]["taskReports"]
+        let reports = run_dispatch(&fetched)["taskReports"]
             .as_object()
             .expect("task reports object");
         assert_eq!(reports.len(), 2);
@@ -1803,9 +1823,9 @@ fn rpc_orchestration_dispatch_run_waits_for_due_recoverable_task() {
         let dispatch_run =
             send_recv(&in_tx, &out_rx, &dispatch_run_cmd, "orchestration.dispatch_run").await;
         assert_ok(&dispatch_run, "orchestration.dispatch_run");
-        assert_eq!(dispatch_run["data"]["run"]["lifecycle"], "succeeded");
+        assert_eq!(run_phase(&dispatch_run), "completed");
         assert_eq!(
-            dispatch_run["data"]["run"]["taskReports"]["task-e2e-dispatch-recoverable"]
+            run_dispatch(&dispatch_run)["taskReports"]["task-e2e-dispatch-recoverable"]
                 ["verifyExitCode"],
             0
         );
@@ -1870,7 +1890,7 @@ fn rpc_orchestration_dispatch_run_executes_hierarchical_run() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(start["data"]["run"]["selectedTier"], "hierarchical");
+        assert_eq!(run_dispatch(&start)["selectedTier"], "hierarchical");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1890,8 +1910,8 @@ fn rpc_orchestration_dispatch_run_executes_hierarchical_run() {
             grants.is_empty(),
             "hierarchical automation should not return live leases"
         );
-        assert_eq!(dispatch["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(dispatch["data"]["run"]["taskCounts"]["terminal"], 5);
+        assert_eq!(run_phase(&dispatch), "completed");
+        assert_eq!(run_summary(&dispatch)["taskCounts"]["terminal"], 5);
 
         let get_cmd = json!({
             "id": "3",
@@ -1901,8 +1921,8 @@ fn rpc_orchestration_dispatch_run_executes_hierarchical_run() {
         .to_string();
         let get = send_recv(&in_tx, &out_rx, &get_cmd, "orchestration.get_run").await;
         assert_ok(&get, "orchestration.get_run");
-        assert_eq!(get["data"]["run"]["lifecycle"], "succeeded");
-        assert_eq!(get["data"]["run"]["taskCounts"]["terminal"], 5);
+        assert_eq!(run_phase(&get), "completed");
+        assert_eq!(run_summary(&get)["taskCounts"]["terminal"], 5);
 
         drop(in_tx);
         let result = server.await;

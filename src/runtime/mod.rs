@@ -28,7 +28,7 @@ pub use types::{
     ApprovalCheckpoint, ApprovalState, ArtifactRef, AutonomyLevel, ContinuationReason,
     ExecutionTier, FailureRecord, JobId, JobKind, JobRecord, JobState, LeaseRecord, ModelProfile,
     ModelSelector, PlanArtifact, PlanId, RunBudgets, RunConstraints, RunDispatchState, RunId,
-    RunLifecycle, RunPhase, RunSnapshot, RunSpec, RunStatus, RunSummary, RunVerifyScopeKind,
-    RunVerifyStatus, SubrunPlan, TaskId, TaskNode, TaskReport, TaskRuntime, TaskSpec, TaskState,
-    VerifySpec, WaveStatus,
+    RunLifecycle, RunPhase, RunSnapshot, RunSpec, RunSummary, RunVerifyScopeKind, RunVerifyStatus,
+    SubrunPlan, TaskId, TaskNode, TaskReport, TaskRuntime, TaskSpec, TaskState, VerifySpec,
+    WaveStatus,
 };
