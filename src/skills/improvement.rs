@@ -83,6 +83,8 @@ pub struct SkillAmendment {
     pub skill_path: PathBuf,
     pub previous_digest: String,
     pub new_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_guardrails: Vec<String>,
     pub guardrails: Vec<String>,
     pub evidence: Vec<String>,
 }
@@ -460,6 +462,7 @@ pub fn handle_skill_doctor(
     let criteria = SkillSuccessCriteria::default();
     let observations = load_observations(cwd)?;
     let feedback = load_feedback(cwd)?;
+    let amendments = load_amendments(cwd)?;
     let mut grouped_observations: BTreeMap<String, Vec<SkillObservation>> = BTreeMap::new();
     for observation in observations.iter().cloned() {
         grouped_observations
@@ -496,25 +499,44 @@ pub fn handle_skill_doctor(
     let mut applied_amendments = Vec::new();
     if fix {
         for index in 0..skills.len() {
-            if skills[index].status != SkillHealthStatus::NeedsAmendment
-                || skills[index].proposed_guardrails.is_empty()
-            {
-                continue;
-            }
-
-            if let Some(amendment) = apply_guardrail_patch(
-                &skills[index].skill_name,
-                &skills[index].skill_path,
-                &skills[index].proposed_guardrails,
-                &skills[index].evidence,
-                cwd,
-            )? {
-                mark_report_pending_for_unobserved_revision(
-                    &mut skills[index],
-                    &criteria,
-                    amendment.new_digest.clone(),
-                );
-                applied_amendments.push(amendment);
+            match skills[index].status {
+                SkillHealthStatus::Regressed => {
+                    if let Some(amendment) = rollback_guardrail_patch(
+                        &skills[index].skill_name,
+                        &skills[index].skill_path,
+                        &skills[index].current_digest,
+                        &skills[index].evidence,
+                        &amendments,
+                        cwd,
+                    )? {
+                        mark_report_pending_for_unobserved_revision(
+                            &mut skills[index],
+                            &criteria,
+                            amendment.new_digest.clone(),
+                        );
+                        applied_amendments.push(amendment);
+                    }
+                }
+                SkillHealthStatus::NeedsAmendment => {
+                    if skills[index].proposed_guardrails.is_empty() {
+                        continue;
+                    }
+                    if let Some(amendment) = apply_guardrail_patch(
+                        &skills[index].skill_name,
+                        &skills[index].skill_path,
+                        &skills[index].proposed_guardrails,
+                        &skills[index].evidence,
+                        cwd,
+                    )? {
+                        mark_report_pending_for_unobserved_revision(
+                            &mut skills[index],
+                            &criteria,
+                            amendment.new_digest.clone(),
+                        );
+                        applied_amendments.push(amendment);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -992,6 +1014,7 @@ fn apply_guardrail_patch(
         ))
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
+    let previous_guardrails = extract_guardrails_from_raw(&raw);
     let block = guardrail_block(guardrails);
     let updated = replace_or_insert_guardrail_block(&raw, &block);
     if updated == raw {
@@ -1012,8 +1035,65 @@ fn apply_guardrail_patch(
         skill_path: skill_path.to_path_buf(),
         previous_digest,
         new_digest,
+        previous_guardrails,
         guardrails: guardrails.to_vec(),
         evidence: evidence.to_vec(),
+    };
+    append_jsonl_records(&skill_amendment_ledger_path(cwd), &[amendment.clone()])?;
+    Ok(Some(amendment))
+}
+
+fn rollback_guardrail_patch(
+    skill_name: &str,
+    skill_path: &Path,
+    current_digest: &str,
+    evidence: &[String],
+    amendments: &[SkillAmendment],
+    cwd: &Path,
+) -> Result<Option<SkillAmendment>> {
+    let Some(source_amendment) = amendments.iter().rev().find(|amendment| {
+        amendment.skill_name == skill_name
+            && amendment.skill_path == skill_path
+            && amendment.new_digest == current_digest
+    }) else {
+        return Ok(None);
+    };
+
+    let raw = fs::read_to_string(skill_path).map_err(|err| {
+        Error::config(format!(
+            "failed to read skill file {}: {err}",
+            skill_path.display()
+        ))
+    })?;
+    let previous_digest = sha256_hex_standalone(&raw);
+    let current_guardrails = extract_guardrails_from_raw(&raw);
+    let updated = restore_guardrail_block(&raw, &source_amendment.previous_guardrails);
+    if updated == raw {
+        return Ok(None);
+    }
+
+    fs::write(skill_path, &updated).map_err(|err| {
+        Error::config(format!(
+            "failed to update skill file {}: {err}",
+            skill_path.display()
+        ))
+    })?;
+    let new_digest = sha256_hex_standalone(&updated);
+    let mut rollback_evidence = vec![format!(
+        "Automatically rolled back regressed managed guardrails from revision {}.",
+        shorten_digest(current_digest)
+    )];
+    rollback_evidence.extend(evidence.iter().cloned());
+    let amendment = SkillAmendment {
+        version: 1,
+        applied_at_utc: timestamp_now(),
+        skill_name: skill_name.to_string(),
+        skill_path: skill_path.to_path_buf(),
+        previous_digest,
+        new_digest,
+        previous_guardrails: current_guardrails,
+        guardrails: source_amendment.previous_guardrails.clone(),
+        evidence: rollback_evidence,
     };
     append_jsonl_records(&skill_amendment_ledger_path(cwd), &[amendment.clone()])?;
     Ok(Some(amendment))
@@ -1048,6 +1128,39 @@ fn replace_or_insert_guardrail_block(raw: &str, block: &str) -> String {
     format!("{block}\n\n{raw}")
 }
 
+fn restore_guardrail_block(raw: &str, guardrails: &[String]) -> String {
+    if guardrails.is_empty() {
+        remove_guardrail_block(raw)
+    } else {
+        replace_or_insert_guardrail_block(raw, &guardrail_block(guardrails))
+    }
+}
+
+fn remove_guardrail_block(raw: &str) -> String {
+    let (Some(start), Some(end_marker)) = (
+        raw.find(GUARDRAIL_BLOCK_BEGIN),
+        raw.find(GUARDRAIL_BLOCK_END),
+    ) else {
+        return raw.to_string();
+    };
+    let mut remove_start = start;
+    while remove_start > 0 && raw[..remove_start].ends_with('\n') {
+        remove_start -= 1;
+    }
+    let mut remove_end = end_marker + GUARDRAIL_BLOCK_END.len();
+    while remove_end < raw.len() && raw[remove_end..].starts_with('\n') {
+        remove_end += 1;
+    }
+
+    let mut updated = String::with_capacity(raw.len());
+    updated.push_str(&raw[..remove_start]);
+    if !updated.is_empty() && !raw[remove_end..].is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&raw[remove_end..]);
+    updated
+}
+
 fn guardrail_block(guardrails: &[String]) -> String {
     let body = guardrails
         .iter()
@@ -1055,6 +1168,21 @@ fn guardrail_block(guardrails: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{GUARDRAIL_BLOCK_BEGIN}\n## Operational Guardrails\n{body}\n{GUARDRAIL_BLOCK_END}")
+}
+
+fn extract_guardrails_from_raw(raw: &str) -> Vec<String> {
+    let (Some(start), Some(end_marker)) = (
+        raw.find(GUARDRAIL_BLOCK_BEGIN),
+        raw.find(GUARDRAIL_BLOCK_END),
+    ) else {
+        return Vec::new();
+    };
+    raw[start + GUARDRAIL_BLOCK_BEGIN.len()..end_marker]
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("- "))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
@@ -1217,6 +1345,10 @@ fn load_observations(cwd: &Path) -> Result<Vec<SkillObservation>> {
 
 fn load_feedback(cwd: &Path) -> Result<Vec<SkillFeedback>> {
     load_jsonl_records(&skill_feedback_ledger_path(cwd))
+}
+
+fn load_amendments(cwd: &Path) -> Result<Vec<SkillAmendment>> {
+    load_jsonl_records(&skill_amendment_ledger_path(cwd))
 }
 
 fn skill_observation_ledger_path(cwd: &Path) -> PathBuf {
@@ -1681,6 +1813,17 @@ mod tests {
         );
         assert!(replaced.contains("Guardrail three"));
         assert!(!replaced.contains("Guardrail one"));
+    }
+
+    #[test]
+    fn restore_guardrail_block_removes_managed_block() {
+        let raw = "---\nname: bug-triage\ndescription: triage bugs\n---\nBody\n";
+        let updated = replace_or_insert_guardrail_block(
+            raw,
+            &guardrail_block(&["Guardrail one".to_string()]),
+        );
+        let restored = restore_guardrail_block(&updated, &[]);
+        assert_eq!(restored, raw);
     }
 
     #[test]
@@ -2177,5 +2320,161 @@ mod tests {
         assert_eq!(improved_skill.previous_average_feedback_score, Some(1.5));
         assert_eq!(improved_skill.latest_average_feedback_score, Some(4.5));
         assert!(improved_skill.proposed_guardrails.is_empty());
+    }
+
+    #[test]
+    fn doctor_fix_rolls_back_regressed_managed_guardrails() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("summarize")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: summarize\ndescription: summarize text\n---\nReturn concise summaries.\n",
+        )
+        .expect("write skill");
+        let original_digest = file_digest(&skill_path);
+        let healthy_entries = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                session_id: None,
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize first".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                session_id: None,
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize second".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                session_id: None,
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: original_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize third".to_string(),
+                outcome: SkillRunOutcome::Success,
+                tool_failures: Vec::new(),
+                agent_error: None,
+            },
+        ];
+        append_jsonl_records(&skill_observation_ledger_path(dir.path()), &healthy_entries)
+            .expect("write healthy observations");
+
+        let forward_amendment = apply_guardrail_patch(
+            "summarize",
+            &skill_path,
+            &["Always emit exactly three bullet points.".to_string()],
+            &["manual test amendment".to_string()],
+            dir.path(),
+        )
+        .expect("apply amendment")
+        .expect("amendment");
+        let amended_digest = forward_amendment.new_digest.clone();
+        assert_eq!(forward_amendment.previous_guardrails, Vec::<String>::new());
+
+        let regressed_entries = vec![
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
+                session_id: None,
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize after amendment".to_string(),
+                outcome: SkillRunOutcome::ToolFailure,
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "write".to_string(),
+                    signature: "unexpected output".to_string(),
+                    message: "unexpected output".to_string(),
+                }],
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
+                session_id: None,
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize after amendment again".to_string(),
+                outcome: SkillRunOutcome::ToolFailure,
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "write".to_string(),
+                    signature: "unexpected output".to_string(),
+                    message: "unexpected output".to_string(),
+                }],
+                agent_error: None,
+            },
+            SkillObservation {
+                version: 1,
+                recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
+                session_id: None,
+                skill_name: "summarize".to_string(),
+                skill_path: skill_path.clone(),
+                skill_digest: amended_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: "summarize after amendment one more".to_string(),
+                outcome: SkillRunOutcome::ToolFailure,
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "write".to_string(),
+                    signature: "unexpected output".to_string(),
+                    message: "unexpected output".to_string(),
+                }],
+                agent_error: None,
+            },
+        ];
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &regressed_entries,
+        )
+        .expect("write regressed observations");
+
+        let regressed_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let regressed_skill = regressed_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "summarize")
+            .expect("regressed skill report");
+        assert_eq!(regressed_skill.status, SkillHealthStatus::Regressed);
+
+        let rollback_report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
+        let rollback_skill = rollback_report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "summarize")
+            .expect("rollback skill report");
+        assert_eq!(rollback_skill.status, SkillHealthStatus::PendingData);
+        assert_eq!(rollback_skill.current_digest, original_digest);
+        assert_eq!(rollback_report.applied_amendments.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&skill_path).expect("read rolled back skill"),
+            "---\nname: summarize\ndescription: summarize text\n---\nReturn concise summaries.\n"
+        );
     }
 }

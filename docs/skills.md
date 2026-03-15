@@ -104,6 +104,8 @@ If a skill has been amended but the new revision has not been observed yet, `pi 
 
 The doctor now evaluates both execution evidence and user feedback. A skill can therefore be marked unhealthy even when tool calls succeeded, if the resulting output repeatedly earned low ratings.
 
+If a Pi-managed guardrail amendment regresses, `pi skills doctor --fix` now rolls that managed block back automatically and waits for fresh observations before judging the restored revision again.
+
 ### Success Criteria
 
 - Minimum sample size: 3 observed runs per skill version
