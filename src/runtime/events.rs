@@ -154,6 +154,8 @@ mod tests {
             root_workspace: PathBuf::from("/tmp"),
             policy_profile: "default".to_string(),
             model_profile: "default".to_string(),
+            run_verify_command: Some("cargo test".to_string()),
+            run_verify_timeout_sec: Some(60),
             budgets: RunBudgets::default(),
             constraints: RunConstraints::default(),
             created_at: Utc::now(),

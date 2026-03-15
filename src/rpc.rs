@@ -44,8 +44,8 @@ use crate::runtime::model_routing::{ModelRoute, PhaseModelRouter};
 use crate::runtime::policy::PolicySet;
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
-    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints, RunSpec,
-    TaskConstraints, TaskNode, TaskSpec, VerifySpec,
+    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints, RunPhase,
+    RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState, VerifySpec,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -1387,6 +1387,114 @@ async fn persist_runtime_bootstrap(
     Ok(())
 }
 
+fn runtime_phase_to_run_lifecycle(phase: RunPhase) -> RunLifecycle {
+    match phase {
+        RunPhase::Created | RunPhase::Planning | RunPhase::Dispatching => RunLifecycle::Pending,
+        RunPhase::Running | RunPhase::Verifying | RunPhase::Recovering => RunLifecycle::Running,
+        RunPhase::AwaitingHuman => RunLifecycle::AwaitingHuman,
+        RunPhase::Completed => RunLifecycle::Succeeded,
+        RunPhase::Failed => RunLifecycle::Failed,
+        RunPhase::Canceled => RunLifecycle::Canceled,
+    }
+}
+
+fn runtime_task_state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Draft | TaskState::Blocked => "blocked",
+        TaskState::Ready => "ready",
+        TaskState::Leased | TaskState::Executing => "leased",
+        TaskState::Verifying => "verifying",
+        TaskState::AwaitingHuman => "awaiting_human",
+        TaskState::Recoverable => "recoverable",
+        TaskState::Succeeded | TaskState::Failed | TaskState::Canceled | TaskState::Superseded => {
+            "terminal"
+        }
+    }
+}
+
+fn runtime_snapshot_dag_depth(snapshot: &RunSnapshot) -> usize {
+    fn visit(
+        task_id: &str,
+        deps: &HashMap<String, Vec<String>>,
+        memo: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(depth) = memo.get(task_id) {
+            return *depth;
+        }
+        if !visiting.insert(task_id.to_string()) {
+            return 1;
+        }
+        let depth = deps
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|dep| 1 + visit(dep, deps, memo, visiting))
+            .max()
+            .unwrap_or(1);
+        visiting.remove(task_id);
+        memo.insert(task_id.to_string(), depth);
+        depth
+    }
+
+    let deps = snapshot
+        .tasks
+        .iter()
+        .map(|(task_id, task)| (task_id.clone(), task.deps.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    snapshot
+        .tasks
+        .keys()
+        .map(|task_id| visit(task_id, &deps, &mut memo, &mut visiting))
+        .max()
+        .unwrap_or(0)
+}
+
+fn runtime_snapshot_execution_tier(snapshot: &RunSnapshot) -> ExecutionTier {
+    match snapshot.tasks.len() {
+        0 | 1 => ExecutionTier::Inline,
+        2..=24 if runtime_snapshot_dag_depth(snapshot) <= 4 => ExecutionTier::Wave,
+        _ => ExecutionTier::Hierarchical,
+    }
+}
+
+fn project_runtime_run_status(snapshot: &RunSnapshot) -> RunStatus {
+    let mut task_counts = BTreeMap::new();
+    for task in snapshot.tasks.values() {
+        *task_counts
+            .entry(runtime_task_state_label(task.runtime.state).to_string())
+            .or_insert(0) += 1;
+    }
+
+    RunStatus {
+        run_id: snapshot.spec.run_id.clone(),
+        objective: snapshot.spec.objective.clone(),
+        selected_tier: runtime_snapshot_execution_tier(snapshot),
+        lifecycle: runtime_phase_to_run_lifecycle(snapshot.phase),
+        run_verify_command: snapshot.spec.run_verify_command.clone().unwrap_or_default(),
+        run_verify_timeout_sec: snapshot.spec.run_verify_timeout_sec,
+        max_parallelism: snapshot.spec.budgets.max_parallelism.max(1),
+        task_ids: snapshot.tasks.keys().cloned().collect(),
+        active_subrun_id: None,
+        active_wave: None,
+        planned_subruns: Vec::new(),
+        task_counts,
+        task_reports: BTreeMap::new(),
+        latest_run_verify: None,
+        created_at: snapshot.created_at,
+        updated_at: snapshot.updated_at,
+    }
+}
+
+fn load_runtime_run_projection(runtime_store: &RuntimeStore, run_id: &str) -> Option<RunStatus> {
+    runtime_store
+        .load_snapshot(run_id)
+        .ok()
+        .map(|snapshot| project_runtime_run_status(&snapshot))
+}
+
 fn runtime_model_selector(
     entry: &ModelEntry,
     thinking_level: Option<crate::model::ThinkingLevel>,
@@ -1584,6 +1692,8 @@ async fn bootstrap_runtime_run(
         root_workspace: std::env::current_dir().map_err(|err| Error::Io(Box::new(err)))?,
         policy_profile: "default".to_string(),
         model_profile: "current_session".to_string(),
+        run_verify_command: Some(req.run_verify_command.clone()),
+        run_verify_timeout_sec: Some(run_verify_timeout_sec),
         budgets: RunBudgets {
             max_parallelism: req
                 .max_parallelism
@@ -1762,9 +1872,13 @@ async fn append_dispatch_rollback_session_entry(
 fn ensure_run_id_available(
     orchestration: &RpcOrchestrationState,
     run_store: &RunStore,
+    runtime_store: &RuntimeStore,
     run_id: &str,
 ) -> Result<()> {
-    if orchestration.get_run(run_id).is_some() || run_store.exists(run_id) {
+    if orchestration.get_run(run_id).is_some()
+        || run_store.exists(run_id)
+        || runtime_store.exists(run_id)
+    {
         return Err(Error::validation(format!(
             "orchestration run already exists: {run_id}"
         )));
@@ -4771,7 +4885,9 @@ pub async fn run(
                     let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
-                    if let Err(err) = ensure_run_id_available(&orchestration, &run_store, &run_id) {
+                    if let Err(err) =
+                        ensure_run_id_available(&orchestration, &run_store, &runtime_store, &run_id)
+                    {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.start_run",
@@ -4780,25 +4896,6 @@ pub async fn run(
                         continue;
                     }
                 }
-                let selected_tier = select_execution_tier(&req.tasks);
-                let task_ids = req
-                    .tasks
-                    .iter()
-                    .map(|task| task.task_id.clone())
-                    .collect::<Vec<_>>();
-                let mut status =
-                    RunStatus::new(run_id.clone(), req.objective.clone(), selected_tier);
-                status.lifecycle = RunLifecycle::Pending;
-                status.run_verify_command = req.run_verify_command.clone();
-                status.run_verify_timeout_sec = Some(
-                    req.run_verify_timeout_sec
-                        .unwrap_or(options.config.reliability_verify_timeout_sec_default()),
-                );
-                status.max_parallelism = req
-                    .max_parallelism
-                    .unwrap_or(RunStatus::DEFAULT_MAX_PARALLELISM);
-                status.task_ids = task_ids.clone();
-
                 let result = {
                     let mut rel = reliability_state
                         .lock(&cx)
@@ -4811,7 +4908,6 @@ pub async fn run(
                         rel.reconcile_prerequisites(contract)?;
                     }
                     rel.refresh_dependency_states();
-                    refresh_run_from_reliability(&rel, &mut status);
                     Ok::<(), Error>(())
                 };
                 if let Err(err) = result {
@@ -4848,25 +4944,32 @@ pub async fn run(
                 }
 
                 {
+                    let mut status = project_runtime_run_status(&runtime_bootstrap.snapshot);
+                    {
+                        let rel = reliability_state.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("reliability lock failed: {err}"))
+                        })?;
+                        refresh_run_from_reliability(&rel, &mut status);
+                    }
                     let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
                         Error::session(format!("orchestration lock failed: {err}"))
                     })?;
                     orchestration.register_run(status.clone());
-                }
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &status).await {
-                    let _ = out_tx.send(response_error_with_hints(
+                    drop(orchestration);
+                    if let Err(err) = persist_run_status(&cx, &session, &run_store, &status).await {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.start_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                    let _ = out_tx.send(response_ok(
                         id,
                         "orchestration.start_run",
-                        &err,
+                        Some(json!({ "run": status })),
                     ));
-                    continue;
                 }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "orchestration.start_run",
-                    Some(json!({ "run": status })),
-                ));
             }
 
             "orchestration.get_run" => {
@@ -4890,7 +4993,10 @@ pub async fn run(
                     orchestration.get_run(&req.run_id)
                 };
 
-                if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
+                if let Some(run) = cached_run
+                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
+                    .or_else(|| run_store.load(&req.run_id).ok())
+                {
                     let run = match refresh_run_if_live(
                         &cx,
                         &session,
@@ -4950,7 +5056,9 @@ pub async fn run(
                     })?;
                     orchestration.get_run(&req.run_id)
                 };
-                let run = if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok())
+                let run = if let Some(run) = cached_run
+                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
+                    .or_else(|| run_store.load(&req.run_id).ok())
                 {
                     run
                 } else {
@@ -5023,19 +5131,21 @@ pub async fn run(
                     })?;
                     orchestration.get_run(&req.run_id)
                 };
-                let mut run =
-                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.cancel_run",
-                            &err,
-                        ));
-                        continue;
-                    };
+                let mut run = if let Some(run) = cached_run
+                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
+                    .or_else(|| run_store.load(&req.run_id).ok())
+                {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.cancel_run",
+                        &err,
+                    ));
+                    continue;
+                };
                 let has_live_tasks = {
                     let rel = reliability_state
                         .lock(&cx)
@@ -5109,19 +5219,21 @@ pub async fn run(
                     })?;
                     orchestration.get_run(&req.run_id)
                 };
-                let mut run =
-                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.resume_run",
-                            &err,
-                        ));
-                        continue;
-                    };
+                let mut run = if let Some(run) = cached_run
+                    .or_else(|| load_runtime_run_projection(&runtime_store, &req.run_id))
+                    .or_else(|| run_store.load(&req.run_id).ok())
+                {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.resume_run",
+                        &err,
+                    ));
+                    continue;
+                };
                 if matches!(
                     run.lifecycle,
                     RunLifecycle::Canceled | RunLifecycle::Blocked | RunLifecycle::Failed
