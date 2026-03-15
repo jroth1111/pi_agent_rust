@@ -774,6 +774,70 @@ fn compact_split_turn_calls_provider_twice_and_formats_sections() {
 }
 
 #[test]
+fn compact_split_turn_without_history_keeps_previous_structured_summary() {
+    let harness =
+        TestHarness::new("compact_split_turn_without_history_keeps_previous_structured_summary");
+
+    let previous_structured = json!({
+        "structuredSummary": {
+            "userIntent": "keep prior goal",
+            "completedTasks": [{"task": "done task", "result": "success", "details": "kept"}],
+            "pendingTasks": ["follow up"],
+            "filesExamined": [{"path": "src/lib.rs", "purpose": "inspect", "keyInsights": ["insight"]}],
+            "filesModified": [{"path": "src/lib.rs", "changeType": "modified", "summary": "updated"}],
+            "currentState": "prior state",
+            "keyDecisions": [{"decision": "use rust", "rationale": "deterministic"}],
+            "errorHistory": [{"error": "old error", "resolution": "fixed"}]
+        }
+    });
+
+    let entries = vec![
+        message_entry("pre_u", None, user_text("pre")),
+        message_entry("pre_a", Some("pre_u"), assistant_text("pre", 0)),
+        compaction_entry(
+            "c1",
+            Some("pre_a"),
+            "PREV_CHECKPOINT",
+            "pre_a",
+            100,
+            Some(previous_structured),
+            None,
+        ),
+        message_entry("u1", Some("c1"), user_text("current task")),
+        message_entry(
+            "a1",
+            Some("u1"),
+            assistant_with_tool_calls(vec![("read", json!({"path": "src/lib.rs"}))]),
+        ),
+        message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
+        message_entry("a2", Some("tr1"), assistant_text(text_of_tokens(1), 100)),
+    ];
+
+    let prep = prepare_compaction(&entries, make_settings(2)).expect("prep");
+    log_preparation(&harness, &entries, &prep);
+    assert!(prep.is_split_turn);
+    assert!(prep.messages_to_summarize.is_empty());
+    assert!(!prep.turn_prefix_messages.is_empty());
+
+    let provider = Arc::new(ScriptedProvider::new(["TURN_PREFIX_SUMMARY"]));
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+
+    let result = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
+        .expect("compact");
+    log_result(&harness, &result);
+
+    assert!(result.summary.contains("goal: keep prior goal"));
+    assert!(result.summary.contains("done task"));
+    assert!(result.summary.contains("follow up"));
+    assert!(
+        result
+            .summary
+            .contains("Split-turn carry-over: TURN_PREFIX_SUMMARY")
+    );
+    assert_eq!(provider.prompts().len(), 1);
+}
+
+#[test]
 fn compact_appends_file_operations_and_sorts_lists() {
     let harness = TestHarness::new("compact_appends_file_operations_and_sorts_lists");
 
@@ -811,6 +875,69 @@ fn compact_appends_file_operations_and_sorts_lists() {
         result.details.modified_files,
         vec!["a.txt".to_string(), "c.txt".to_string()]
     );
+}
+
+#[test]
+fn compact_prompt_dedups_repeated_reads_before_summarization() {
+    let harness = TestHarness::new("compact_prompt_dedups_repeated_reads_before_summarization");
+
+    let entries = vec![
+        message_entry("u1", None, user_text(text_of_tokens(1))),
+        message_entry(
+            "a1",
+            Some("u1"),
+            assistant_message(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-0".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({"path": "src/lib.rs"}),
+                    thought_signature: None,
+                })],
+                Usage::default(),
+                StopReason::Stop,
+            ),
+        ),
+        message_entry(
+            "tr1",
+            Some("a1"),
+            tool_result("call-0", "read", "same contents"),
+        ),
+        message_entry(
+            "a2",
+            Some("tr1"),
+            assistant_message(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({"path": "src/lib.rs"}),
+                    thought_signature: None,
+                })],
+                Usage::default(),
+                StopReason::Stop,
+            ),
+        ),
+        message_entry(
+            "tr2",
+            Some("a2"),
+            tool_result("call-1", "read", "same contents"),
+        ),
+        message_entry("a3", Some("tr2"), assistant_text(text_of_tokens(1), 100)),
+    ];
+
+    let prep = prepare_compaction(&entries, make_settings(0)).expect("prep");
+    log_preparation(&harness, &entries, &prep);
+
+    let provider = Arc::new(ScriptedProvider::new([checkpoint_json("SUMMARY")]));
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+
+    let _ = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })
+        .expect("compact");
+
+    let prompts = provider.prompts();
+    let prompt = prompts.first().expect("prompt");
+    assert!(prompt.contains("[Tool result]: same contents"));
+    assert_eq!(prompt.matches("[Tool result]: same contents").count(), 1);
+    assert!(prompt.contains("Repeated read omitted"));
 }
 
 #[test]

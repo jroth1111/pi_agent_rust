@@ -2570,6 +2570,25 @@ impl Session {
         )))]
     }
 
+    fn dedupable_read_fingerprint(blocks: &[ContentBlock]) -> Option<String> {
+        let mut text = String::new();
+        let mut saw_text = false;
+        for block in blocks {
+            match block {
+                ContentBlock::Text(content) => {
+                    if saw_text {
+                        text.push('\n');
+                    }
+                    text.push_str(&content.text);
+                    saw_text = true;
+                }
+                _ => return None,
+            }
+        }
+
+        saw_text.then_some(text)
+    }
+
     fn append_model_message_for_entry(
         messages: &mut Vec<Message>,
         entry: &SessionEntry,
@@ -3635,7 +3654,7 @@ struct PromptContextState {
 }
 
 impl PromptContextState {
-    fn to_model_message(&mut self, message: &SessionMessage) -> Option<Message> {
+    fn transform_message_for_prompt(&mut self, message: &SessionMessage) -> Option<SessionMessage> {
         match message {
             SessionMessage::Assistant { message: assistant } => {
                 for block in &assistant.content {
@@ -3649,7 +3668,7 @@ impl PromptContextState {
                         );
                     }
                 }
-                session_message_to_model(message)
+                Some(message.clone())
             }
             SessionMessage::ToolResult {
                 tool_call_id,
@@ -3658,19 +3677,22 @@ impl PromptContextState {
                 details,
                 is_error,
                 timestamp,
-            } => {
-                let transformed = self.transform_tool_result(
-                    tool_call_id,
-                    tool_name,
-                    content,
-                    details.clone(),
-                    *is_error,
-                    *timestamp,
-                );
-                session_message_to_model(&transformed)
-            }
-            _ => session_message_to_model(message),
+            } => Some(self.transform_tool_result(
+                tool_call_id,
+                tool_name,
+                content,
+                details.clone(),
+                *is_error,
+                *timestamp,
+            )),
+            _ => Some(message.clone()),
         }
+    }
+
+    fn to_model_message(&mut self, message: &SessionMessage) -> Option<Message> {
+        self.transform_message_for_prompt(message)
+            .as_ref()
+            .and_then(session_message_to_model)
     }
 
     fn transform_tool_result(
@@ -3695,32 +3717,35 @@ impl PromptContextState {
                         if let Some(path) = &metadata.path {
                             let version = self.file_versions.get(path).copied().unwrap_or_default();
                             let key = (path.clone(), version);
-                            let text = Session::text_from_blocks(content);
-                            if let Some(existing) = self.read_results.get_mut(&key) {
-                                if existing.content == text {
-                                    existing.repeat_count = existing.repeat_count.saturating_add(1);
-                                    return SessionMessage::ToolResult {
-                                        tool_call_id: tool_call_id.to_string(),
-                                        tool_name: tool_name.to_string(),
-                                        content: Session::repeated_read_notice(
-                                            path,
-                                            existing.repeat_count,
-                                        ),
-                                        details,
-                                        is_error,
-                                        timestamp,
-                                    };
+                            if let Some(fingerprint) = Session::dedupable_read_fingerprint(content)
+                            {
+                                if let Some(existing) = self.read_results.get_mut(&key) {
+                                    if existing.content == fingerprint {
+                                        existing.repeat_count =
+                                            existing.repeat_count.saturating_add(1);
+                                        return SessionMessage::ToolResult {
+                                            tool_call_id: tool_call_id.to_string(),
+                                            tool_name: tool_name.to_string(),
+                                            content: Session::repeated_read_notice(
+                                                path,
+                                                existing.repeat_count,
+                                            ),
+                                            details,
+                                            is_error,
+                                            timestamp,
+                                        };
+                                    }
+                                    existing.content = fingerprint;
+                                    existing.repeat_count = 1;
+                                } else {
+                                    self.read_results.insert(
+                                        key,
+                                        PromptReadRecord {
+                                            content: fingerprint,
+                                            repeat_count: 1,
+                                        },
+                                    );
                                 }
-                                existing.content = text;
-                                existing.repeat_count = 1;
-                            } else {
-                                self.read_results.insert(
-                                    key,
-                                    PromptReadRecord {
-                                        content: text,
-                                        repeat_count: 1,
-                                    },
-                                );
                             }
                         }
                     }
@@ -3738,6 +3763,14 @@ impl PromptContextState {
             timestamp,
         }
     }
+}
+
+pub(crate) fn prompt_transform_messages(messages: &[SessionMessage]) -> Vec<SessionMessage> {
+    let mut context_state = PromptContextState::default();
+    messages
+        .iter()
+        .filter_map(|message| context_state.transform_message_for_prompt(message))
+        .collect()
 }
 
 // ============================================================================
@@ -5975,6 +6008,55 @@ mod tests {
         };
 
         assert_eq!(reread, "same contents");
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_keeps_repeated_image_reads() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("read the image twice"));
+        session.append_message(make_test_tool_call("call-1", "read", "image.png"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read image file [image/png]")),
+                ContentBlock::Image(crate::model::ImageContent {
+                    data: "ZmFrZQ==".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: Some(0),
+        });
+        session.append_message(make_test_tool_call("call-2", "read", "image.png"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-2".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read image file [image/png]")),
+                ContentBlock::Image(crate::model::ImageContent {
+                    data: "ZmFrZQ==".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: Some(0),
+        });
+
+        let messages = session.to_messages_for_current_path();
+        let repeated = match &messages[4] {
+            Message::ToolResult(result) => &result.content,
+            other => panic!("expected repeated image tool result, got {other:?}"),
+        };
+
+        assert!(
+            repeated
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_))),
+            "repeated image reads must preserve the image attachment"
+        );
     }
 
     #[test]

@@ -18,7 +18,9 @@ use crate::model::{
     Usage, UserContent, UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions};
-use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
+use crate::session::{
+    SessionEntry, SessionMessage, prompt_transform_messages, session_message_to_model,
+};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -657,6 +659,8 @@ const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assis
 const SUMMARIZATION_PROMPT: &str = "Summarize the conversation into a compact checkpoint for a future coding agent turn.\n\nReturn EXACTLY one JSON object with this shape:\n{\n  \"userIntent\": string,\n  \"completedTasks\": [{\"task\": string, \"result\": \"success\"|\"partial\"|\"failed\", \"details\": string}],\n  \"pendingTasks\": [string],\n  \"filesExamined\": [{\"path\": string, \"purpose\": string, \"keyInsights\": [string]}],\n  \"filesModified\": [{\"path\": string, \"changeType\": \"created\"|\"modified\"|\"deleted\", \"summary\": string}],\n  \"currentState\": string,\n  \"keyDecisions\": [{\"decision\": string, \"rationale\": string}],\n  \"errorHistory\": [{\"error\": string, \"resolution\": string|null}]\n}\n\nRules:\n- Preserve exact file paths, function names, command names, and error messages.\n- Prefer short factual strings over prose.\n- Omit duplicate items.\n- If a section has no data, use an empty string or empty array.";
 
 const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to merge into the existing checkpoint.\n\nIf <previous-summary-json> is present, treat it as authoritative structured state. If only <previous-summary> is present, preserve that information while converting it into the JSON schema.\n\nReturn EXACTLY one JSON object with the same schema as before.\n\nRules:\n- Preserve existing facts unless contradicted by the new messages.\n- Move tasks from pending to completed when they are finished.\n- Remove blockers only when the new messages show they were resolved.\n- Keep the result concise, deduplicated, and factual.\n- Preserve exact file paths, function names, command names, and error messages.";
+
+const TURN_PREFIX_SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Read the retained turn prefix and return plain text only. Do not emit JSON, markdown fences, or any conversational framing.";
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
@@ -1325,7 +1329,8 @@ async fn generate_summary(
         let _ = write!(prompt, "\n\nAdditional focus: {custom}");
     }
 
-    let llm_messages = messages
+    let prompt_messages = prompt_transform_messages(messages);
+    let llm_messages = prompt_messages
         .iter()
         .filter_map(session_message_to_model)
         .collect::<Vec<_>>();
@@ -1375,7 +1380,8 @@ async fn generate_turn_prefix_summary(
     api_key: &str,
     settings: &ResolvedCompactionSettings,
 ) -> Result<String> {
-    let llm_messages = messages
+    let prompt_messages = prompt_transform_messages(messages);
+    let llm_messages = prompt_messages
         .iter()
         .filter_map(session_message_to_model)
         .collect::<Vec<_>>();
@@ -1386,7 +1392,7 @@ async fn generate_turn_prefix_summary(
 
     let assistant = complete_simple(
         provider,
-        SUMMARIZATION_SYSTEM_PROMPT,
+        TURN_PREFIX_SUMMARIZATION_SYSTEM_PROMPT,
         prompt_text,
         api_key,
         settings.reserve_tokens,
@@ -1403,6 +1409,29 @@ async fn generate_turn_prefix_summary(
     }
 
     Ok(text)
+}
+
+fn seed_split_turn_history_summary(preparation: &CompactionPreparation) -> CompactionSummary {
+    if let Some(previous) = &preparation.previous_structured_summary {
+        return previous.clone();
+    }
+
+    if let Some(previous) = preparation
+        .previous_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        return CompactionSummary {
+            current_state: previous.to_string(),
+            ..Default::default()
+        };
+    }
+
+    CompactionSummary {
+        current_state: "No prior history before the retained split-turn suffix.".to_string(),
+        ..Default::default()
+    }
 }
 
 // =============================================================================
@@ -1609,11 +1638,7 @@ pub async fn compact(
 ) -> Result<CompactionResult> {
     let mut summary = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
         let mut history_summary = if preparation.messages_to_summarize.is_empty() {
-            CompactionSummary {
-                current_state: "No prior history before the retained split-turn suffix."
-                    .to_string(),
-                ..Default::default()
-            }
+            seed_split_turn_history_summary(&preparation)
         } else {
             generate_summary(
                 &preparation.messages_to_summarize,
