@@ -1,7 +1,6 @@
-use crate::reliability::state::{FailureClass, PlanRequirement, RuntimeState, TerminalState};
+use crate::reliability::state::{FailureClass, RuntimeState, TerminalState};
 use crate::reliability::task::TaskRuntime;
 use chrono::Utc;
-use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub enum TransitionEvent {
@@ -50,28 +49,6 @@ pub enum TransitionError {
     FenceMismatch { expected: u64, actual: u64 },
     #[error("lease mismatch: expected {expected}, got {actual}")]
     LeaseMismatch { expected: String, actual: String },
-    #[error("plan required but not provided: {reason}")]
-    PlanRequired { reason: String },
-}
-
-/// Optional plan validation data for Ready -> Leased transitions
-#[derive(Debug, Clone)]
-pub struct PlanGate {
-    /// The plan requirement level
-    pub requirement: PlanRequirement,
-    /// Optional plan validation if a plan was provided
-    pub validation: Option<PlanValidationData>,
-}
-
-/// Data from a validated plan
-#[derive(Debug, Clone)]
-pub struct PlanValidationData {
-    /// Files the plan touches
-    pub touches: Vec<String>,
-    /// Test perspectives covered
-    pub perspectives: Vec<String>,
-    /// Evidence references (if applicable)
-    pub evidence_refs: Vec<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -79,20 +56,6 @@ pub fn apply_transition(
     runtime: &mut TaskRuntime,
     event: &TransitionEvent,
     max_attempts: u8,
-) -> Result<(), TransitionError> {
-    apply_transition_with_plan_gate(runtime, event, max_attempts, None)
-}
-
-/// Apply transition with optional plan validation gate
-///
-/// The plan gate is checked when transitioning from Ready to Leased state.
-/// If a plan is required but not provided, the transition is blocked.
-#[allow(clippy::too_many_lines)]
-pub fn apply_transition_with_plan_gate(
-    runtime: &mut TaskRuntime,
-    event: &TransitionEvent,
-    max_attempts: u8,
-    plan_gate: Option<&PlanGate>,
 ) -> Result<(), TransitionError> {
     let next_state = match (&runtime.state, event) {
         (RuntimeState::Blocked { .. }, TransitionEvent::DependenciesMet)
@@ -110,18 +73,12 @@ pub fn apply_transition_with_plan_gate(
                 fence_token,
                 expires_at,
             },
-        ) => {
-            // Check plan requirement gate before allowing execution
-            if let Some(gate) = plan_gate {
-                check_plan_requirement(gate)?;
-            }
-            RuntimeState::Leased {
-                lease_id: lease_id.clone(),
-                agent_id: agent_id.clone(),
-                fence_token: *fence_token,
-                expires_at: *expires_at,
-            }
-        }
+        ) => RuntimeState::Leased {
+            lease_id: lease_id.clone(),
+            agent_id: agent_id.clone(),
+            fence_token: *fence_token,
+            expires_at: *expires_at,
+        },
 
         (
             RuntimeState::Leased {
@@ -281,62 +238,6 @@ fn validate_lease_fence(
         });
     }
     Ok(())
-}
-
-/// Check if plan requirement is satisfied before allowing Ready -> Leased transition
-fn check_plan_requirement(gate: &PlanGate) -> Result<(), TransitionError> {
-    match gate.requirement {
-        PlanRequirement::None | PlanRequirement::Optional => Ok(()),
-        PlanRequirement::Required => {
-            if gate.validation.is_none() {
-                let msg =
-                    "Plan required but not provided. Specify files to touch and test perspectives.";
-                warn!("Plan requirement violation: {}", msg);
-                return Err(TransitionError::PlanRequired {
-                    reason: msg.to_string(),
-                });
-            }
-            // Validate that required fields are present
-            let validation = gate.validation.as_ref().unwrap();
-            if validation.touches.is_empty() {
-                return Err(TransitionError::PlanRequired {
-                    reason: "Plan must specify files to touch".to_string(),
-                });
-            }
-            if validation.perspectives.is_empty() {
-                return Err(TransitionError::PlanRequired {
-                    reason: "Plan must specify test perspectives".to_string(),
-                });
-            }
-            Ok(())
-        }
-        PlanRequirement::RequiredWithEvidence => {
-            if gate.validation.is_none() {
-                let msg = "Plan with evidence required but not provided.";
-                warn!("Plan requirement violation: {}", msg);
-                return Err(TransitionError::PlanRequired {
-                    reason: msg.to_string(),
-                });
-            }
-            let validation = gate.validation.as_ref().unwrap();
-            if validation.touches.is_empty() {
-                return Err(TransitionError::PlanRequired {
-                    reason: "Plan must specify files to touch".to_string(),
-                });
-            }
-            if validation.perspectives.is_empty() {
-                return Err(TransitionError::PlanRequired {
-                    reason: "Plan must specify test perspectives".to_string(),
-                });
-            }
-            if validation.evidence_refs.is_empty() {
-                return Err(TransitionError::PlanRequired {
-                    reason: "Plan must provide evidence references (file:line format)".to_string(),
-                });
-            }
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -605,197 +506,5 @@ mod tests {
         )
         .expect_err("terminal state should be immutable");
         assert!(matches!(err, TransitionError::InvalidTransition { .. }));
-    }
-
-    // Plan gate tests
-    #[test]
-    fn plan_gate_allows_dispatch_when_none_required() {
-        let mut runtime = TaskRuntime::new();
-        let gate = PlanGate {
-            requirement: PlanRequirement::None,
-            validation: None,
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let result = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        );
-        assert!(result.is_ok());
-        assert!(matches!(runtime.state, RuntimeState::Leased { .. }));
-    }
-
-    #[test]
-    fn plan_gate_allows_dispatch_when_optional_with_no_plan() {
-        let mut runtime = TaskRuntime::new();
-        let gate = PlanGate {
-            requirement: PlanRequirement::Optional,
-            validation: None,
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let result = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn plan_gate_blocks_dispatch_when_required_no_plan() {
-        let mut runtime = TaskRuntime::new();
-        let gate = PlanGate {
-            requirement: PlanRequirement::Required,
-            validation: None,
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let err = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        )
-        .expect_err("should block when plan required but not provided");
-
-        assert!(matches!(err, TransitionError::PlanRequired { .. }));
-        assert!(matches!(runtime.state, RuntimeState::Ready));
-    }
-
-    #[test]
-    fn plan_gate_allows_dispatch_when_required_with_valid_plan() {
-        let mut runtime = TaskRuntime::new();
-        let validation = PlanValidationData {
-            touches: vec!["src/main.rs".to_string()],
-            perspectives: vec!["HappyPath".to_string()],
-            evidence_refs: vec![],
-        };
-        let gate = PlanGate {
-            requirement: PlanRequirement::Required,
-            validation: Some(validation),
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let result = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        );
-        assert!(result.is_ok());
-        assert!(matches!(runtime.state, RuntimeState::Leased { .. }));
-    }
-
-    #[test]
-    fn plan_gate_blocks_dispatch_when_required_but_empty_touches() {
-        let mut runtime = TaskRuntime::new();
-        let validation = PlanValidationData {
-            touches: vec![],
-            perspectives: vec!["HappyPath".to_string()],
-            evidence_refs: vec![],
-        };
-        let gate = PlanGate {
-            requirement: PlanRequirement::Required,
-            validation: Some(validation),
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let err = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        )
-        .expect_err("should block when plan has no touches");
-
-        assert!(matches!(err, TransitionError::PlanRequired { .. }));
-    }
-
-    #[test]
-    fn plan_gate_blocks_dispatch_when_required_with_evidence_no_evidence() {
-        let mut runtime = TaskRuntime::new();
-        let validation = PlanValidationData {
-            touches: vec!["src/main.rs".to_string()],
-            perspectives: vec!["HappyPath".to_string()],
-            evidence_refs: vec![],
-        };
-        let gate = PlanGate {
-            requirement: PlanRequirement::RequiredWithEvidence,
-            validation: Some(validation),
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let err = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        )
-        .expect_err("should block when evidence required but not provided");
-
-        assert!(matches!(err, TransitionError::PlanRequired { .. }));
-    }
-
-    #[test]
-    fn plan_gate_allows_dispatch_when_required_with_evidence_and_valid() {
-        let mut runtime = TaskRuntime::new();
-        let validation = PlanValidationData {
-            touches: vec!["src/main.rs".to_string()],
-            perspectives: vec!["HappyPath".to_string()],
-            evidence_refs: vec!["src/main.rs:42".to_string()],
-        };
-        let gate = PlanGate {
-            requirement: PlanRequirement::RequiredWithEvidence,
-            validation: Some(validation),
-        };
-        let expires_at = Utc::now() + Duration::hours(1);
-
-        let result = apply_transition_with_plan_gate(
-            &mut runtime,
-            &TransitionEvent::Dispatch {
-                lease_id: "l1".into(),
-                agent_id: "a1".into(),
-                fence_token: 1,
-                expires_at,
-            },
-            3,
-            Some(&gate),
-        );
-        assert!(result.is_ok());
-        assert!(matches!(runtime.state, RuntimeState::Leased { .. }));
     }
 }

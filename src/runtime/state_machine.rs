@@ -73,25 +73,21 @@ impl RuntimeStateMachine {
                 self.snapshot.wake_at = None;
                 self.snapshot.summary.next_action = Some("materialize plan".to_string());
             }
-            RuntimeEventKind::PlanAccepted { plan, tasks } => {
+            RuntimeEventKind::PlanMaterialized { plan, tasks } => {
                 self.snapshot.plan_required = true;
-                self.snapshot.plan_accepted = true;
-                self.snapshot.phase = if self.snapshot.auto_proceed_after_planning {
-                    RunPhase::Dispatching
-                } else {
-                    RunPhase::Planning
-                };
+                self.snapshot.plan_accepted = false;
+                self.snapshot.phase = RunPhase::Planning;
                 self.snapshot.plan = Some(plan);
                 self.install_tasks(tasks);
                 self.snapshot.wake_at = None;
-                self.snapshot.summary.next_action = Some(
-                    if self.snapshot.auto_proceed_after_planning {
-                        "dispatch ready tasks"
-                    } else {
-                        "await explicit dispatch after planning"
-                    }
-                    .to_string(),
-                );
+                self.snapshot.summary.next_action = Some("accept plan before dispatch".to_string());
+            }
+            RuntimeEventKind::PlanAccepted => {
+                self.snapshot.plan_required = true;
+                self.snapshot.plan_accepted = true;
+                self.snapshot.phase = RunPhase::Dispatching;
+                self.snapshot.wake_at = None;
+                self.snapshot.summary.next_action = Some("dispatch ready tasks".to_string());
             }
             RuntimeEventKind::PhaseChanged { phase, summary } => {
                 self.snapshot.phase = phase;
@@ -309,11 +305,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_acceptance_materializes_ready_tasks() {
+    fn plan_materialization_keeps_run_in_planning() {
         let mut machine = RuntimeStateMachine::new(sample_snapshot());
         let event = RuntimeEvent::new(
             "run-1",
-            RuntimeEventKind::PlanAccepted {
+            RuntimeEventKind::PlanMaterialized {
                 plan: crate::runtime::types::PlanArtifact {
                     plan_id: "plan-1".to_string(),
                     digest: "digest".to_string(),
@@ -328,8 +324,37 @@ mod tests {
             },
         );
         machine.apply(event).expect("apply");
-        assert_eq!(machine.snapshot().phase, RunPhase::Dispatching);
+        assert_eq!(machine.snapshot().phase, RunPhase::Planning);
+        assert!(!machine.snapshot().plan_accepted);
         assert_eq!(machine.snapshot().ready_queue.len(), 1);
+    }
+
+    #[test]
+    fn plan_acceptance_advances_run_to_dispatching() {
+        let mut machine = RuntimeStateMachine::new(sample_snapshot());
+        machine
+            .apply(RuntimeEvent::new(
+                "run-1",
+                RuntimeEventKind::PlanMaterialized {
+                    plan: crate::runtime::types::PlanArtifact {
+                        plan_id: "plan-1".to_string(),
+                        digest: "digest".to_string(),
+                        objective: "ship".to_string(),
+                        task_drafts: vec!["task-1".to_string()],
+                        touched_paths: Vec::new(),
+                        test_strategy: vec!["cargo test".to_string()],
+                        evidence_refs: Vec::new(),
+                        produced_at: Utc::now(),
+                    },
+                    tasks: vec![sample_task("task-1")],
+                },
+            ))
+            .expect("materialize plan");
+        machine
+            .apply(RuntimeEvent::new("run-1", RuntimeEventKind::PlanAccepted))
+            .expect("accept plan");
+        assert_eq!(machine.snapshot().phase, RunPhase::Dispatching);
+        assert!(machine.snapshot().plan_accepted);
     }
 
     #[test]

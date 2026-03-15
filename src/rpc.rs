@@ -1293,6 +1293,7 @@ fn normalize_command_type(command_type: &str) -> &str {
             "reliability.get_state_digest"
         }
         "orchestration.startRun" | "orchestration_start_run" => "orchestration.start_run",
+        "orchestration.acceptPlan" | "orchestration_accept_plan" => "orchestration.accept_plan",
         "orchestration.getRun" | "orchestration_get_run" => "orchestration.get_run",
         "orchestration.dispatchRun" | "orchestration_dispatch_run" => "orchestration.dispatch_run",
         "orchestration.cancelRun" | "orchestration_cancel_run" => "orchestration.cancel_run",
@@ -1351,7 +1352,7 @@ async fn persist_runtime_snapshot(
     Ok(())
 }
 
-async fn persist_runtime_bootstrap(
+async fn persist_runtime_output(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
     runtime_store: &RuntimeStore,
@@ -1464,6 +1465,10 @@ const fn run_lifecycle_to_runtime_phase(
 fn set_run_lifecycle(snapshot: &mut RunSnapshot, lifecycle: RunLifecycle) {
     snapshot.phase = run_lifecycle_to_runtime_phase(lifecycle, snapshot.phase);
     snapshot.touch();
+}
+
+const fn run_requires_plan_acceptance(snapshot: &RunSnapshot) -> bool {
+    snapshot.plan_required && !snapshot.plan_accepted
 }
 
 fn recompute_runtime_task_counts(snapshot: &mut RunSnapshot) {
@@ -1699,11 +1704,26 @@ async fn bootstrap_runtime_run(
             spec,
             plan,
             tasks,
-            auto_proceed_after_planning: true,
+            auto_proceed_after_planning: false,
         })
         .map_err(|err| Error::session(format!("runtime bootstrap failed: {err}")))?;
     output.snapshot.dispatch.selected_tier = selected_tier;
     Ok(output)
+}
+
+async fn accept_runtime_plan(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    options: &RpcOptions,
+    snapshot: RunSnapshot,
+) -> Result<RuntimeControllerOutput> {
+    let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
+    let route = ModelRoute::from_profile(&model_profile);
+    let mut controller =
+        RuntimeController::from_snapshot(snapshot, PhaseModelRouter::new(route), PolicySet::new());
+    controller
+        .handle(RuntimeCommand::AcceptPlan)
+        .map_err(|err| Error::session(format!("plan acceptance failed: {err}")))
 }
 
 async fn append_dispatch_grants_session_entries(
@@ -2434,7 +2454,7 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
     run.summary.task_counts = reliability.task_counts_for(&task_ids);
     run.dispatch.planned_subruns = planned_subruns(reliability, run);
 
-    if preserve_canceled {
+    if preserve_canceled || run_requires_plan_acceptance(run) {
         run.dispatch.active_subrun_id = None;
         run.dispatch.active_wave = None;
     } else {
@@ -2475,7 +2495,10 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
             next_active_wave(run.dispatch.active_wave.take(), active_task_ids);
     }
 
-    if !preserve_canceled {
+    if run_requires_plan_acceptance(run) {
+        run.phase = RunPhase::Planning;
+        run.summary.next_action = Some("accept plan before dispatch".to_string());
+    } else if !preserve_canceled {
         set_run_lifecycle(run, derive_run_lifecycle(reliability, &task_ids));
     }
     apply_run_verify_lifecycle(run);
@@ -4911,8 +4934,7 @@ pub async fn run(
                         }
                     };
                 if let Err(err) =
-                    persist_runtime_bootstrap(&cx, &session, &runtime_store, &runtime_bootstrap)
-                        .await
+                    persist_runtime_output(&cx, &session, &runtime_store, &runtime_bootstrap).await
                 {
                     let _ = out_tx.send(response_error_with_hints(
                         id,
@@ -5001,6 +5023,100 @@ pub async fn run(
                 }
             }
 
+            "orchestration.accept_plan" => {
+                let req: RunLookupRequest =
+                    match parse_command_payload(&parsed, "orchestration.accept_plan") {
+                        Ok(req) => req,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.accept_plan",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+
+                let run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
+                    run
+                } else {
+                    let err =
+                        Error::session(format!("orchestration run not found: {}", req.run_id));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.accept_plan",
+                        &err,
+                    ));
+                    continue;
+                };
+
+                if run.plan.is_none() {
+                    let err = Error::session(format!(
+                        "orchestration run {} does not have a materialized plan",
+                        req.run_id
+                    ));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.accept_plan",
+                        &err,
+                    ));
+                    continue;
+                }
+
+                let mut output = if run.plan_accepted {
+                    RuntimeControllerOutput {
+                        snapshot: run,
+                        events: Vec::new(),
+                        transitions: Vec::new(),
+                        routed_phases: Vec::new(),
+                        policy_decisions: Vec::new(),
+                    }
+                } else {
+                    match accept_runtime_plan(&cx, &session, &options, run).await {
+                        Ok(output) => output,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "orchestration.accept_plan",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    }
+                };
+
+                {
+                    let rel = reliability_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+                    refresh_run_from_reliability(&rel, &mut output.snapshot);
+                }
+                {
+                    let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("orchestration lock failed: {err}"))
+                    })?;
+                    orchestration
+                        .update_run(&output.snapshot.spec.run_id, &output.snapshot.task_ids());
+                };
+                if let Err(err) =
+                    persist_runtime_output(&cx, &session, &runtime_store, &output).await
+                {
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.accept_plan",
+                        &err,
+                    ));
+                    continue;
+                }
+
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "orchestration.accept_plan",
+                    Some(json!({ "run": output.snapshot })),
+                ));
+            }
+
             "orchestration.dispatch_run" => {
                 let req: DispatchRunRequest =
                     match parse_command_payload(&parsed, "orchestration.dispatch_run") {
@@ -5033,6 +5149,19 @@ pub async fn run(
                     ));
                     continue;
                 };
+
+                if run_requires_plan_acceptance(&run) {
+                    let err = Error::validation(format!(
+                        "Run {} is still in planning; accept the plan before dispatching",
+                        run.spec.run_id
+                    ));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id,
+                        "orchestration.dispatch_run",
+                        &err,
+                    ));
+                    continue;
+                }
 
                 let (run, grants) = match Box::pin(dispatch_run_until_quiescent(
                     &cx,

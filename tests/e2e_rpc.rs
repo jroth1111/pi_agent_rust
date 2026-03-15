@@ -369,6 +369,20 @@ async fn send_recv(
     parse_response(&line)
 }
 
+async fn accept_orchestration_plan(
+    in_tx: &asupersync::channel::mpsc::Sender<String>,
+    out_rx: &Arc<Mutex<Receiver<String>>>,
+    run_id: &str,
+) -> Value {
+    let command = json!({
+        "id": "accept-plan",
+        "type": "orchestration.accept_plan",
+        "runId": run_id,
+    })
+    .to_string();
+    send_recv(in_tx, out_rx, &command, "orchestration.accept_plan").await
+}
+
 /// Assert that a response indicates success with the expected command.
 fn assert_ok(resp: &Value, command: &str) {
     assert_eq!(resp["type"], "response", "response type for {command}");
@@ -766,6 +780,10 @@ fn rpc_orchestration_start_dispatch_and_get_run() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -846,6 +864,10 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -940,6 +962,10 @@ fn rpc_orchestration_dispatch_run_applies_created_file_changes() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1042,6 +1068,10 @@ fn rpc_orchestration_dispatch_run_advances_dependency_waves() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1162,6 +1192,10 @@ fn rpc_orchestration_dispatch_run_rebases_same_touch_dependency_chain() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1269,6 +1303,10 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1370,6 +1408,10 @@ fn rpc_orchestration_resume_run_redispatches_due_recoverable_task() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let request_dispatch_cmd = json!({
             "id": "2",
@@ -1479,6 +1521,10 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let request_dispatch_cmd = json!({
             "id": "2",
@@ -1579,6 +1625,10 @@ fn rpc_orchestration_dispatch_run_persists_worker_failure_report() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1678,6 +1728,10 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "wave");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",
@@ -1891,6 +1945,10 @@ fn rpc_orchestration_dispatch_run_executes_hierarchical_run() {
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
         assert_eq!(run_dispatch(&start)["selectedTier"], "hierarchical");
+        assert_eq!(run_phase(&start), "planning");
+        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
+        assert_ok(&accept, "orchestration.accept_plan");
+        assert_eq!(run_phase(&accept), "dispatching");
 
         let dispatch_cmd = json!({
             "id": "2",

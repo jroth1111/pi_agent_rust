@@ -18,6 +18,7 @@ pub enum RuntimeCommand {
         tasks: Vec<TaskNode>,
         auto_proceed_after_planning: bool,
     },
+    AcceptPlan,
     SetPhase {
         phase: RunPhase,
         summary: Option<String>,
@@ -188,7 +189,7 @@ where
                 ));
                 events.push(RuntimeEvent::new(
                     run_id,
-                    RuntimeEventKind::PlanAccepted { plan, tasks },
+                    RuntimeEventKind::PlanMaterialized { plan, tasks },
                 ));
 
                 let transitions = apply_events(&mut machine, &events)?;
@@ -211,6 +212,9 @@ where
                 let event = match command {
                     RuntimeCommand::SetPhase { phase, summary } => {
                         RuntimeEvent::new(run_id, RuntimeEventKind::PhaseChanged { phase, summary })
+                    }
+                    RuntimeCommand::AcceptPlan => {
+                        RuntimeEvent::new(run_id, RuntimeEventKind::PlanAccepted)
                     }
                     RuntimeCommand::MarkTaskState {
                         task_id,
@@ -394,9 +398,10 @@ mod tests {
                 auto_proceed_after_planning: true,
             })
             .expect("bootstrap");
-        assert_eq!(output.snapshot.phase, RunPhase::Dispatching);
+        assert_eq!(output.snapshot.phase, RunPhase::Planning);
         assert_eq!(output.events.len(), 3);
         assert_eq!(output.snapshot.tasks.len(), 1);
+        assert!(!output.snapshot.plan_accepted);
     }
 
     #[test]
@@ -409,9 +414,12 @@ mod tests {
                 spec: sample_spec(),
                 plan: sample_plan(),
                 tasks: vec![sample_task()],
-                auto_proceed_after_planning: true,
+                auto_proceed_after_planning: false,
             })
             .expect("bootstrap");
+        controller
+            .handle(RuntimeCommand::AcceptPlan)
+            .expect("accept plan");
         let output = controller
             .handle(RuntimeCommand::MarkTaskState {
                 task_id: "task-1".to_string(),
@@ -479,7 +487,7 @@ mod tests {
 
         assert_eq!(output.snapshot.phase, RunPhase::Planning);
         assert!(output.snapshot.plan_required);
-        assert!(output.snapshot.plan_accepted);
+        assert!(!output.snapshot.plan_accepted);
         assert!(!output.snapshot.auto_proceed_after_planning);
     }
 

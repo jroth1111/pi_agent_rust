@@ -502,7 +502,7 @@ pub struct RunSnapshot {
 
 impl RunSnapshot {
     const fn default_auto_proceed_after_planning() -> bool {
-        true
+        false
     }
 
     pub fn new(spec: RunSpec) -> Self {

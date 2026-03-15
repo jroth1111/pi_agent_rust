@@ -96,92 +96,9 @@ pub enum DeferTrigger {
     },
 }
 
-/// Requirements for planning before execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanRequirement {
-    /// No plan needed (single-step tasks)
-    #[default]
-    None,
-    /// Plan suggested but not enforced
-    Optional,
-    /// Plan required before execution
-    Required,
-    /// Plan required with evidence references
-    RequiredWithEvidence,
-}
-
-impl PlanRequirement {
-    /// Determine requirement based on task characteristics
-    pub fn infer(files_to_touch: usize, has_dependencies: bool, complexity: f32) -> Self {
-        // Dependencies always require planning
-        if has_dependencies {
-            return Self::Required;
-        }
-
-        // High complexity always requires planning
-        if complexity >= 0.6 {
-            return Self::Required;
-        }
-
-        // Many files require planning
-        if files_to_touch > 3 {
-            return Self::Required;
-        }
-
-        // Simple single-file task with low complexity
-        if files_to_touch <= 1 && complexity < 0.3 {
-            Self::None
-        } else if files_to_touch <= 3 && complexity < 0.6 {
-            Self::Optional
-        } else {
-            Self::Required
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plan_requirement_infer_simple_task() {
-        // Simple: 1 file, no deps, low complexity
-        let req = PlanRequirement::infer(1, false, 0.2);
-        assert_eq!(req, PlanRequirement::None);
-    }
-
-    #[test]
-    fn plan_requirement_infer_moderate_task() {
-        // Moderate: 2-3 files, low-mid complexity
-        let req = PlanRequirement::infer(2, false, 0.5);
-        assert_eq!(req, PlanRequirement::Optional);
-    }
-
-    #[test]
-    fn plan_requirement_infer_complex_task() {
-        // Complex: many files or high complexity
-        let req = PlanRequirement::infer(5, false, 0.7);
-        assert_eq!(req, PlanRequirement::Required);
-
-        let req = PlanRequirement::infer(2, true, 0.5);
-        assert_eq!(req, PlanRequirement::Required);
-    }
-
-    #[test]
-    fn plan_requirement_infer_with_dependencies() {
-        // Even with few files, dependencies push to Required
-        let req = PlanRequirement::infer(1, true, 0.2);
-        assert_eq!(req, PlanRequirement::Required);
-    }
-
-    #[test]
-    fn plan_requirement_serialization_roundtrip() {
-        let req = PlanRequirement::RequiredWithEvidence;
-        let json = serde_json::to_string(&req).unwrap();
-        let deser: PlanRequirement = serde_json::from_str(&json).unwrap();
-        assert_eq!(req, deser);
-    }
 
     #[test]
     fn defer_trigger_until_serialization_roundtrip() {

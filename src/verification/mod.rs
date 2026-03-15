@@ -44,10 +44,27 @@ pub use tokens::{
 
 use crate::error::Result;
 use crate::policy::ConstraintSet;
-use crate::reliability::PlanRequirement;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Validation strictness for a materialized plan artifact.
+///
+/// This validates plan structure only. Runtime orchestration decides whether a
+/// plan is required before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanValidationRequirement {
+    /// No structural plan checks are required.
+    #[default]
+    None,
+    /// A plan is optional and may be empty.
+    Optional,
+    /// A plan must declare touched files and test perspectives.
+    Required,
+    /// A plan must also include evidence references.
+    RequiredWithEvidence,
+}
 
 /// Plan for verification - externally defined, agent cannot modify.
 ///
@@ -195,13 +212,13 @@ impl PlanValidation {
     /// Validate plan meets requirements
     pub fn validate(
         &self,
-        requirement: PlanRequirement,
+        requirement: PlanValidationRequirement,
         constraints: &ConstraintSet,
     ) -> Result<()> {
         match requirement {
-            PlanRequirement::None => Ok(()),
-            PlanRequirement::Optional => Ok(()),
-            PlanRequirement::Required => {
+            PlanValidationRequirement::None => Ok(()),
+            PlanValidationRequirement::Optional => Ok(()),
+            PlanValidationRequirement::Required => {
                 if self.touches.is_empty() {
                     return Err(crate::error::Error::Validation(
                         "Plan required: must specify files to touch".to_string(),
@@ -227,7 +244,7 @@ impl PlanValidation {
 
                 Ok(())
             }
-            PlanRequirement::RequiredWithEvidence => {
+            PlanValidationRequirement::RequiredWithEvidence => {
                 // All of Required checks plus evidence
                 if self.touches.is_empty() {
                     return Err(crate::error::Error::Validation(
@@ -514,7 +531,7 @@ mod tests {
         let validation = PlanValidation::new(vec![], vec![]);
         assert!(
             validation
-                .validate(PlanRequirement::None, &constraints)
+                .validate(PlanValidationRequirement::None, &constraints)
                 .is_ok()
         );
     }
@@ -525,7 +542,7 @@ mod tests {
         let validation = PlanValidation::new(vec![], vec![]);
         assert!(
             validation
-                .validate(PlanRequirement::Optional, &constraints)
+                .validate(PlanValidationRequirement::Optional, &constraints)
                 .is_ok()
         );
     }
@@ -536,7 +553,7 @@ mod tests {
         let validation = PlanValidation::new(vec![], vec![TestPerspective::HappyPath]);
         assert!(
             validation
-                .validate(PlanRequirement::Required, &constraints)
+                .validate(PlanValidationRequirement::Required, &constraints)
                 .is_err()
         );
     }
@@ -547,7 +564,7 @@ mod tests {
         let validation = PlanValidation::new(vec![PathBuf::from("src/main.rs")], vec![]);
         assert!(
             validation
-                .validate(PlanRequirement::Required, &constraints)
+                .validate(PlanValidationRequirement::Required, &constraints)
                 .is_err()
         );
     }
@@ -561,7 +578,7 @@ mod tests {
         );
         assert!(
             validation
-                .validate(PlanRequirement::Required, &constraints)
+                .validate(PlanValidationRequirement::Required, &constraints)
                 .is_ok()
         );
     }
@@ -575,7 +592,10 @@ mod tests {
         );
         assert!(
             validation
-                .validate(PlanRequirement::RequiredWithEvidence, &constraints)
+                .validate(
+                    PlanValidationRequirement::RequiredWithEvidence,
+                    &constraints
+                )
                 .is_err()
         );
     }
@@ -590,7 +610,10 @@ mod tests {
         );
         assert!(
             validation
-                .validate(PlanRequirement::RequiredWithEvidence, &constraints)
+                .validate(
+                    PlanValidationRequirement::RequiredWithEvidence,
+                    &constraints
+                )
                 .is_ok()
         );
     }
@@ -605,7 +628,10 @@ mod tests {
         );
         assert!(
             validation
-                .validate(PlanRequirement::RequiredWithEvidence, &constraints)
+                .validate(
+                    PlanValidationRequirement::RequiredWithEvidence,
+                    &constraints
+                )
                 .is_err()
         );
     }
@@ -621,7 +647,7 @@ mod tests {
         );
         assert!(
             validation
-                .validate(PlanRequirement::Required, &constraints)
+                .validate(PlanValidationRequirement::Required, &constraints)
                 .is_err()
         );
     }

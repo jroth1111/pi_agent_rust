@@ -32,11 +32,8 @@ pub use retry::{
     Attempt, AttemptComparison, AttemptStats, RetryAgent, RetryConfig, RetryStats,
     ReviewSubmission, ReviewerScorer, TokenUsage, VerificationOutcome,
 };
-pub use state::{DeferTrigger, FailureClass, PlanRequirement, RuntimeState, TerminalState};
-pub use state_machine::{
-    PlanGate, PlanValidationData, TransitionError, TransitionEvent, apply_transition,
-    apply_transition_with_plan_gate,
-};
+pub use state::{DeferTrigger, FailureClass, RuntimeState, TerminalState};
+pub use state_machine::{TransitionError, TransitionEvent, apply_transition};
 pub use stuck::{StuckDetector, StuckPattern, StuckSeverity};
 pub use task::{
     NetworkPolicy, SpecValidationError, TaskConstraintSet, TaskNode, TaskRuntime, TaskSpec,

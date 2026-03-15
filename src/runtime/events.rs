@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 pub enum RuntimeEventKind {
     RunCreated,
     PlanningStarted,
-    PlanAccepted {
+    PlanMaterialized {
         plan: PlanArtifact,
         tasks: Vec<TaskNode>,
     },
+    PlanAccepted,
     PhaseChanged {
         phase: RunPhase,
         summary: Option<String>,
@@ -50,7 +51,8 @@ impl RuntimeEventKind {
         match self {
             Self::RunCreated => "run_created",
             Self::PlanningStarted => "planning_started",
-            Self::PlanAccepted { .. } => "plan_accepted",
+            Self::PlanMaterialized { .. } => "plan_materialized",
+            Self::PlanAccepted => "plan_accepted",
             Self::PhaseChanged { .. } => "phase_changed",
             Self::TaskStateChanged { .. } => "task_state_changed",
             Self::ApprovalRequested { .. } => "approval_requested",
@@ -125,12 +127,12 @@ mod tests {
     fn event_label_matches_kind() {
         let event = RuntimeEvent::new(
             "run-1",
-            RuntimeEventKind::PlanAccepted {
+            RuntimeEventKind::PlanMaterialized {
                 plan: sample_plan(),
                 tasks: vec![sample_task()],
             },
         );
-        assert_eq!(event.label(), "plan_accepted");
+        assert_eq!(event.label(), "plan_materialized");
         assert!(event.event_id.starts_with("evt-"));
     }
 
@@ -162,12 +164,12 @@ mod tests {
         };
         let payload = serde_json::to_value(RuntimeEvent::new(
             spec.run_id,
-            RuntimeEventKind::PlanAccepted {
+            RuntimeEventKind::PlanMaterialized {
                 plan: sample_plan(),
                 tasks: vec![sample_task()],
             },
         ))
         .expect("serialize");
-        assert_eq!(payload["kind"]["kind"], "plan_accepted");
+        assert_eq!(payload["kind"]["kind"], "plan_materialized");
     }
 }
