@@ -422,7 +422,9 @@ fn parse_section_items(lines: &[String]) -> Vec<String> {
         }
         if let Some(item) = strip_list_marker(trimmed) {
             flush_paragraph(&mut items, &mut paragraph);
-            items.push(item.to_string());
+            if !item.is_empty() {
+                items.push(item.to_string());
+            }
             continue;
         }
         paragraph.push(trimmed.to_string());
@@ -441,6 +443,9 @@ fn flush_paragraph(items: &mut Vec<String>, paragraph: &mut Vec<String>) {
 }
 
 fn strip_list_marker(trimmed: &str) -> Option<&str> {
+    if trimmed == "-" || trimmed == "*" {
+        return Some("");
+    }
     trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
@@ -681,6 +686,16 @@ mod tests {
         assert_eq!(
             sections.anti_trigger_examples,
             vec!["write a marketing email".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_skill_sections_ignores_blank_list_items() {
+        let sections = parse_skill_sections("## Trigger Examples\n- \n- actual request\n-   \n");
+
+        assert_eq!(
+            sections.trigger_examples,
+            vec!["actual request".to_string()]
         );
     }
 

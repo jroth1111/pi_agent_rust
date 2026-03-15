@@ -2,10 +2,12 @@ use super::improvement::SkillDoctorFormat;
 use super::loader::{LoadSkillsOptions, load_skills};
 #[cfg(test)]
 use super::schema::SkillSections;
-use super::schema::{Skill, validate_description, validate_name};
+use super::schema::{Skill, infer_skill_name, validate_description, validate_name};
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::resources::{DiagnosticKind, ResourceDiagnostic};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +51,7 @@ pub struct SkillLintReport {
     pub scope: String,
     pub skill_count: usize,
     pub finding_count: usize,
+    pub diagnostic_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillLintSkillReport>,
 }
@@ -98,6 +101,32 @@ pub fn handle_skill_lint(
     format: SkillDoctorFormat,
 ) -> Result<SkillLintReport> {
     let scope_root = skill_scope_root(cwd, global);
+    if !scope_root.exists() {
+        let report = SkillLintReport {
+            scope: scope_name(global).to_string(),
+            skill_count: 0,
+            finding_count: 0,
+            diagnostic_count: 0,
+            skills: Vec::new(),
+        };
+
+        match format {
+            SkillDoctorFormat::Text => {
+                println!("{}", render_skill_lint_report(&report)?);
+            }
+            SkillDoctorFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|err| Error::session(
+                        format!("serialize skill lint report: {err}")
+                    ))?
+                );
+            }
+        }
+
+        return Ok(report);
+    }
+
     let loaded = load_skills(LoadSkillsOptions {
         cwd: cwd.to_path_buf(),
         agent_dir: Config::global_dir(),
@@ -105,17 +134,31 @@ pub fn handle_skill_lint(
         include_defaults: false,
     });
 
-    let mut skills = loaded
+    let diagnostics = loaded.diagnostics;
+    let mut skills_by_path = loaded
         .skills
         .into_iter()
         .map(|skill| lint_skill(skill))
-        .collect::<Vec<_>>();
-    skills.sort_by(|left, right| left.skill_name.cmp(&right.skill_name));
+        .map(|skill| (skill.skill_path.clone(), skill))
+        .collect::<BTreeMap<_, _>>();
+
+    let diagnostic_count = diagnostics.len();
+    for diagnostic in diagnostics {
+        attach_loader_diagnostic(&mut skills_by_path, diagnostic);
+    }
+
+    let mut skills = skills_by_path.into_values().collect::<Vec<_>>();
+    skills.sort_by(|left, right| {
+        left.skill_name
+            .cmp(&right.skill_name)
+            .then_with(|| left.skill_path.cmp(&right.skill_path))
+    });
 
     let report = SkillLintReport {
         scope: scope_name(global).to_string(),
         skill_count: skills.len(),
         finding_count: skills.iter().map(|skill| skill.finding_count).sum(),
+        diagnostic_count,
         skills,
     };
 
@@ -299,7 +342,13 @@ fn lint_required_section(
     items: &[String],
     expect_multiple_examples: bool,
 ) {
-    if items.is_empty() {
+    let substantive_items = items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+
+    if substantive_items.is_empty() {
         findings.push(SkillLintFinding {
             code: format!("missing_{}", code),
             section: Some(section.to_string()),
@@ -307,7 +356,7 @@ fn lint_required_section(
         });
         return;
     }
-    if expect_multiple_examples && items.len() < 2 {
+    if expect_multiple_examples && substantive_items.len() < 2 {
         findings.push(SkillLintFinding {
             code: format!("{}_too_short", code),
             section: Some(section.to_string()),
@@ -316,13 +365,54 @@ fn lint_required_section(
             ),
         });
     }
-    if items.iter().any(|item| contains_placeholder(item)) {
+    if substantive_items
+        .iter()
+        .any(|item| contains_placeholder(item))
+    {
         findings.push(SkillLintFinding {
             code: format!("{}_contains_placeholder", code),
             section: Some(section.to_string()),
             message: format!("Replace scaffold placeholders in `{section}` with concrete content."),
         });
     }
+}
+
+fn attach_loader_diagnostic(
+    skills_by_path: &mut BTreeMap<PathBuf, SkillLintSkillReport>,
+    diagnostic: ResourceDiagnostic,
+) {
+    let path = diagnostic.path;
+    let entry = skills_by_path
+        .entry(path.clone())
+        .or_insert_with(|| SkillLintSkillReport {
+            skill_name: skill_name_for_diagnostic(&path),
+            skill_path: path.clone(),
+            finding_count: 0,
+            clean: true,
+            findings: Vec::new(),
+        });
+
+    entry.findings.push(SkillLintFinding {
+        code: match diagnostic.kind {
+            DiagnosticKind::Warning => "loader_warning".to_string(),
+            DiagnosticKind::Collision => "loader_collision".to_string(),
+        },
+        section: None,
+        message: diagnostic.message,
+    });
+    entry.finding_count = entry.findings.len();
+    entry.clean = false;
+}
+
+fn skill_name_for_diagnostic(path: &Path) -> String {
+    let inferred = infer_skill_name(path);
+    if !inferred.is_empty() {
+        return inferred;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn render_skill_template(
@@ -388,6 +478,8 @@ fn render_skill_lint_report(report: &SkillLintReport) -> Result<String> {
         .map_err(|err| Error::session(format!("render skill lint report: {err}")))?;
     writeln!(out, "Findings: {}", report.finding_count)
         .map_err(|err| Error::session(format!("render skill lint report: {err}")))?;
+    writeln!(out, "Loader diagnostics: {}", report.diagnostic_count)
+        .map_err(|err| Error::session(format!("render skill lint report: {err}")))?;
     if report.skills.is_empty() {
         writeln!(out, "No skills found in scope.")
             .map_err(|err| Error::session(format!("render skill lint report: {err}")))?;
@@ -441,6 +533,13 @@ fn trim_sentence(value: &str) -> &str {
 }
 
 fn scaffold_examples(examples: &[String], placeholder: &str) -> Vec<String> {
+    let examples = examples
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
     if examples.is_empty() {
         vec![
             format!("{TODO_MARKER} {placeholder}"),
@@ -448,9 +547,6 @@ fn scaffold_examples(examples: &[String], placeholder: &str) -> Vec<String> {
         ]
     } else {
         examples
-            .iter()
-            .map(|value| value.trim().to_string())
-            .collect()
     }
 }
 
@@ -552,6 +648,38 @@ mod tests {
     }
 
     #[test]
+    fn lint_includes_loader_diagnostics_for_skipped_skill() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".pi/skills/no-description");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: no-description\n---\nBody",
+        )
+        .unwrap();
+
+        let report = handle_skill_lint(tmp.path(), false, SkillDoctorFormat::Json).unwrap();
+        assert_eq!(report.diagnostic_count, 1);
+        let skill = report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_name == "no-description")
+            .unwrap();
+        assert!(
+            skill
+                .findings
+                .iter()
+                .any(|finding| finding.code == "loader_warning")
+        );
+        assert!(
+            skill
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("required"))
+        );
+    }
+
+    #[test]
     fn lint_accepts_complete_skill_structure() {
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join(".pi/skills/deploy-readiness");
@@ -647,6 +775,7 @@ mod tests {
         let report = handle_skill_lint(tmp.path(), false, SkillDoctorFormat::Json).unwrap();
         assert_eq!(report.scope, PROJECT_SCOPE);
         assert_eq!(report.skill_count, 0);
+        assert_eq!(report.diagnostic_count, 0);
     }
 
     #[test]
@@ -697,6 +826,38 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| finding.code == "trigger_examples_too_short")
+        );
+    }
+
+    #[test]
+    fn lint_treats_blank_examples_as_missing() {
+        let report = lint_skill(Skill {
+            name: "blank-trigger".to_string(),
+            description: "Review deploy readiness. Use when the user wants a release audit. Not for production incident response.".to_string(),
+            file_path: PathBuf::from("/tmp/blank-trigger/SKILL.md"),
+            base_dir: PathBuf::from("/tmp/blank-trigger"),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+            sections: SkillSections {
+                purpose: vec!["Review deploy readiness.".to_string()],
+                use_when: vec!["the user wants a release audit".to_string()],
+                not_for: vec!["production incident response".to_string()],
+                trigger_examples: vec!["".to_string(), "   ".to_string()],
+                anti_trigger_examples: vec![
+                    "fix a live outage".to_string(),
+                    "draft release notes".to_string(),
+                ],
+                inputs: vec!["release branch".to_string()],
+                output_contract: vec!["concise checklist".to_string()],
+                success_criteria: vec!["no critical blockers missed".to_string()],
+                instructions: vec!["inspect the release diff".to_string()],
+            },
+        });
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "missing_trigger_examples")
         );
     }
 }
