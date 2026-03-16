@@ -179,7 +179,7 @@ fn main_impl() -> Result<()> {
                         handle_skill_doctor(&cwd, SkillDoctorFormat::parse(format)?, *fix)?;
                     }
                     cli::SkillCommands::Feedback {
-                        skill,
+                        skill_id,
                         rating,
                         notes,
                         session_id,
@@ -187,7 +187,7 @@ fn main_impl() -> Result<()> {
                     } => {
                         handle_skill_feedback(
                             &cwd,
-                            skill,
+                            skill_id,
                             *rating,
                             notes.as_deref(),
                             session_id.as_deref(),
