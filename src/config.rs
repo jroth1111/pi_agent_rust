@@ -2311,10 +2311,10 @@ mod tests {
     }
 
     #[test]
-    fn extension_policy_metadata_standard_fails_closed() {
+    fn extension_policy_metadata_unknown_legacyish_profile_fails_closed() {
         let config = Config::default();
-        let resolved = config.resolve_extension_policy_with_metadata(Some("standard"));
-        assert_eq!(resolved.requested_profile, "standard");
+        let resolved = config.resolve_extension_policy_with_metadata(Some("legacy-profile"));
+        assert_eq!(resolved.requested_profile, "legacy-profile");
         assert_eq!(resolved.effective_profile, "safe");
         assert_eq!(
             resolved.policy.mode,

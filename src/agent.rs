@@ -5126,7 +5126,7 @@ impl AgentSession {
             requested = "quickjs",
             selected = "quickjs",
             fallback = false,
-            "Extension runtime engine selected (legacy JS/TS)"
+            "Extension runtime engine selected"
         );
         Ok(ExtensionRuntimeHandle::Js(runtime))
     }

@@ -830,7 +830,7 @@ async fn run(
                         requested = "quickjs",
                         selected = "quickjs",
                         fallback = false,
-                        "Extension runtime engine selected for prewarm (legacy JS/TS)"
+                        "Extension runtime engine selected for prewarm"
                     );
                     Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
                 }),
