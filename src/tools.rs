@@ -2,7 +2,7 @@
 //!
 //! Pi provides built-in tools for file IO, shell execution, web access, and
 //! code navigation: read, bash, edit, write, grep, find, ls, websearch,
-//! webfetch, lsp.
+//! webfetch, lsp, code.query, code.context, code.impact.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+mod code_context;
 mod html_extract;
 mod lsp;
 mod retry;
@@ -42,6 +43,7 @@ mod web_cache;
 mod webfetch;
 mod websearch;
 
+use self::code_context::{CodeContextTool, CodeImpactTool, CodeQueryTool};
 use self::lsp::LspTool;
 use self::webfetch::WebFetchTool;
 use self::websearch::WebSearchTool;
@@ -1171,6 +1173,9 @@ impl ToolRegistry {
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "websearch" => tools.push(Box::new(WebSearchTool::new())),
                 "webfetch" => tools.push(Box::new(WebFetchTool::new())),
+                "code.query" => tools.push(Box::new(CodeQueryTool::new(cwd))),
+                "code.context" => tools.push(Box::new(CodeContextTool::new(cwd))),
+                "code.impact" => tools.push(Box::new(CodeImpactTool::new(cwd))),
                 "lsp" => tools.push(Box::new(LspTool::new(cwd))),
                 _ => {}
             }

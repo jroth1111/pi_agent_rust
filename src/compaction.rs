@@ -13,7 +13,10 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ThinkingLevel, ToolCall,
     Usage, UserContent, UserMessage,
 };
-use crate::provider::{Context, Provider, StreamOptions};
+use crate::prompt_assembly::{
+    PromptAssemblyInputs, assemble_prompt_plan, context_from_prompt_plan,
+};
+use crate::provider::{CacheRetention, Provider, StreamOptions};
 use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
 use futures::StreamExt;
 use serde::Serialize;
@@ -867,22 +870,36 @@ async fn complete_simple(
     let max_tokens = (f64::from(reserve_tokens) * max_tokens_factor).floor() as u32;
     let max_tokens = max_tokens.max(256);
 
-    let context = Context {
-        system_prompt: Some(system_prompt.to_string().into()),
-        messages: vec![Message::User(UserMessage {
-            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(prompt_text))]),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-        })]
-        .into(),
-        tools: Vec::new().into(),
-    };
+    let prompt_message = Message::User(UserMessage {
+        content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(prompt_text))]),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    });
+    let plan = assemble_prompt_plan(PromptAssemblyInputs {
+        system_prompt: Some(system_prompt.to_string()),
+        fresh_turn: vec![prompt_message],
+        ..PromptAssemblyInputs::default()
+    });
+    tracing::debug!(
+        compaction_prompt_static_prefix = plan.token_breakdown.static_prefix,
+        compaction_prompt_repo_policy = plan.token_breakdown.repo_policy,
+        compaction_prompt_total_estimate = plan.token_breakdown.total_estimate(),
+        "Built compaction prompt assembly plan"
+    );
+    let context = context_from_prompt_plan(&plan);
 
-    let options = StreamOptions {
+    let mut options = StreamOptions {
         api_key: Some(api_key.to_string()),
         max_tokens: Some(max_tokens),
         thinking_level: Some(ThinkingLevel::High),
         ..Default::default()
     };
+    let stable_tokens = plan.token_breakdown.static_prefix + plan.token_breakdown.repo_policy;
+    if provider.name().eq_ignore_ascii_case("anthropic")
+        && options.cache_retention == CacheRetention::None
+        && stable_tokens >= 256
+    {
+        options.cache_retention = CacheRetention::Short;
+    }
 
     let mut stream = provider.stream(&context, &options).await?;
     let mut final_message: Option<AssistantMessage> = None;
@@ -1592,7 +1609,8 @@ mod tests {
     use crate::context::visibility::MessageMetadata;
     use crate::model::{ImageContent, ThinkingContent};
     use crate::session::{
-        BranchSummaryEntry, CompactionEntry, EntryBase, MessageEntry, ModelChangeEntry,
+        BranchSummaryEntry, CompactionEntry, EntryBase, MessageContextRefs, MessageEntry,
+        ModelChangeEntry,
     };
     use std::collections::HashMap;
 
@@ -1608,6 +1626,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_user_text(text),
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::new(),
         })
     }
@@ -1616,6 +1635,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_assistant_text(text, input, output),
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::new(),
         })
     }
@@ -1624,6 +1644,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_assistant_tool_call(tool_name, json!({"path": path})),
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::new(),
         })
     }
@@ -1632,6 +1653,7 @@ mod tests {
         SessionEntry::Message(MessageEntry {
             base: test_base(id),
             message: make_tool_result(text),
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::new(),
         })
     }
@@ -1670,6 +1692,7 @@ mod tests {
                 timestamp: None,
                 extra: HashMap::new(),
             },
+            context: MessageContextRefs::default(),
             metadata: Default::default(),
         })
     }
@@ -2556,6 +2579,7 @@ mod tests {
                         is_error: false,
                         timestamp: None,
                     },
+                    context: MessageContextRefs::default(),
                     metadata: MessageMetadata::new(),
                 }),
                 SessionEntry::Message(MessageEntry {
@@ -2568,6 +2592,7 @@ mod tests {
                         is_error: false,
                         timestamp: None,
                     },
+                    context: MessageContextRefs::default(),
                     metadata: MessageMetadata::new(),
                 }),
             ];
@@ -2597,7 +2622,7 @@ mod property_tests {
     use super::*;
     use crate::context::visibility::MessageMetadata;
     use crate::model::{AssistantMessage, Cost, StopReason, TextContent, Usage};
-    use crate::session::{EntryBase, MessageEntry};
+    use crate::session::{EntryBase, MessageContextRefs, MessageEntry};
     use proptest::collection::vec;
     use proptest::option;
     use proptest::prelude::*;
@@ -2721,6 +2746,7 @@ mod property_tests {
             MessageEntry {
                 base,
                 message,
+                context: MessageContextRefs::default(),
                 metadata: MessageMetadata::new(),
             }
         })

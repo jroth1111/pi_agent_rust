@@ -27490,8 +27490,8 @@ impl ExtensionManager {
         Ok(())
     }
 
-    /// Dispatch a `tool_call` event to registered extensions and return the first
-    /// blocking response (if any).
+    /// Dispatch a `tool_call` event to registered extensions and return the
+    /// effective response, short-circuiting on explicit blocks.
     #[allow(clippy::too_many_lines)]
     pub async fn dispatch_tool_call(
         &self,

@@ -123,6 +123,7 @@ fn message_entry(id: &str, parent_id: Option<&str>, message: SessionMessage) -> 
     SessionEntry::Message(MessageEntry {
         base: base(Some(id), parent_id),
         message,
+        context: pi::session::MessageContextRefs::default(),
         metadata: pi::context::MessageMetadata::default(),
     })
 }
@@ -492,6 +493,7 @@ fn prepare_compaction_returns_none_when_first_kept_entry_missing_id() {
     let entries = vec![SessionEntry::Message(MessageEntry {
         base: base(None, None),
         message: user_text("hello"),
+        context: pi::session::MessageContextRefs::default(),
         metadata: pi::context::MessageMetadata::default(),
     })];
 

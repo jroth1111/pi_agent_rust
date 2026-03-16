@@ -1036,6 +1036,7 @@ mod tests {
                 content: UserContent::Text(text.to_string()),
                 timestamp: Some(chrono::Utc::now().timestamp_millis()),
             },
+            context: crate::session::MessageContextRefs::default(),
             metadata: MessageMetadata::default(),
         })
     }

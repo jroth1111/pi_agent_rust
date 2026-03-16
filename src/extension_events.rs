@@ -117,7 +117,7 @@ impl ExtensionEvent {
 }
 
 /// Result from a tool_call event handler.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallEventResult {
     /// If true, block tool execution.
@@ -126,6 +126,24 @@ pub struct ToolCallEventResult {
 
     /// Reason for blocking (shown to user).
     pub reason: Option<String>,
+
+    /// Replacement tool arguments to execute instead of the original payload.
+    pub rewritten_arguments: Option<Value>,
+
+    /// Synthetic result to use instead of executing the real tool.
+    pub synthetic_result: Option<SyntheticToolResult>,
+
+    /// Opaque augmentation metadata captured for audit/debugging.
+    pub augmentation: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyntheticToolResult {
+    pub content: Vec<ContentBlock>,
+    pub details: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 /// Result from a tool_result event handler.
@@ -524,13 +542,11 @@ mod tests {
     fn result_types_deserialize_defaults() {
         let result: ToolCallEventResult =
             serde_json::from_value(json!({ "reason": "nope" })).expect("deserialize");
-        assert_eq!(
-            result,
-            ToolCallEventResult {
-                block: false,
-                reason: Some("nope".to_string())
-            }
-        );
+        assert!(!result.block);
+        assert_eq!(result.reason.as_deref(), Some("nope"));
+        assert!(result.rewritten_arguments.is_none());
+        assert!(result.synthetic_result.is_none());
+        assert!(result.augmentation.is_none());
     }
 
     #[test]
@@ -539,6 +555,9 @@ mod tests {
             serde_json::from_value(json!({ "block": true })).expect("deserialize tool_call");
         assert!(tool_call.block);
         assert_eq!(tool_call.reason, None);
+        assert!(tool_call.rewritten_arguments.is_none());
+        assert!(tool_call.synthetic_result.is_none());
+        assert!(tool_call.augmentation.is_none());
 
         let tool_result: ToolResultEventResult = serde_json::from_value(json!({
             "content": [{ "type": "text", "text": "hello" }],
@@ -727,6 +746,9 @@ mod tests {
         let result = ToolCallEventResult::default();
         assert!(!result.block);
         assert!(result.reason.is_none());
+        assert!(result.rewritten_arguments.is_none());
+        assert!(result.synthetic_result.is_none());
+        assert!(result.augmentation.is_none());
     }
 
     // ── InputEventResult equality ──────────────────────────────────────
@@ -1001,6 +1023,9 @@ mod tests {
                     serde_json::from_value(Value::Object(obj)).unwrap();
                 assert_eq!(back.block, block);
                 assert_eq!(back.reason, reason);
+                assert!(back.rewritten_arguments.is_none());
+                assert!(back.synthetic_result.is_none());
+                assert!(back.augmentation.is_none());
             }
 
             /// `ToolCallEventResult` default has block=false.
@@ -1009,6 +1034,9 @@ mod tests {
                 let d = ToolCallEventResult::default();
                 assert!(!d.block);
                 assert!(d.reason.is_none());
+                assert!(d.rewritten_arguments.is_none());
+                assert!(d.synthetic_result.is_none());
+                assert!(d.augmentation.is_none());
             }
 
             /// `InputEventResult` deserializes correctly.

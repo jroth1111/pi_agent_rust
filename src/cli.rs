@@ -358,8 +358,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,websearch,webfetch,lsp)
-    #[arg(long, default_value = "read,bash,edit,write")]
+    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,websearch,webfetch,code.query,code.context,code.impact,lsp)
+    #[arg(
+        long,
+        default_value = "read,bash,edit,write,code.query,code.context,code.impact"
+    )]
     pub tools: String,
 
     // === Extensions ===
@@ -859,7 +862,18 @@ mod tests {
     #[test]
     fn default_tools() {
         let cli = Cli::parse_from(["pi"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit", "write"]);
+        assert_eq!(
+            cli.enabled_tools(),
+            vec![
+                "read",
+                "bash",
+                "edit",
+                "write",
+                "code.query",
+                "code.context",
+                "code.impact",
+            ]
+        );
     }
 
     #[test]

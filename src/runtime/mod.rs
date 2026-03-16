@@ -19,6 +19,7 @@ pub mod store;
 pub mod types;
 pub mod verification;
 
+pub use crate::orchestration::flock::FlockWorkspace;
 pub use controller::{ControllerError, ControllerOutput, RuntimeCommand, RuntimeController};
 pub use dispatch::{
     DispatchRunHost, MAX_AUTOMATED_RECOVERABLE_WAIT, ORCHESTRATION_ROLLBACK_RETRY_DELAY,

@@ -35,12 +35,14 @@ fn test_compaction_usage_double_counting_bug() {
             content: UserContent::Text("hi".to_string()),
             timestamp: None,
         },
+        context: pi::session::MessageContextRefs::default(),
         metadata: pi::context::MessageMetadata::default(),
     });
 
     let assistant_entry = SessionEntry::Message(MessageEntry {
         base: EntryBase::new(None, "msg1".to_string()),
         message,
+        context: pi::session::MessageContextRefs::default(),
         metadata: pi::context::MessageMetadata::default(),
     });
 
@@ -52,6 +54,7 @@ fn test_compaction_usage_double_counting_bug() {
             content: UserContent::Text(String::new()),
             timestamp: None,
         },
+        context: pi::session::MessageContextRefs::default(),
         metadata: pi::context::MessageMetadata::default(),
     });
 

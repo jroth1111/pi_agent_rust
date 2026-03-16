@@ -1805,11 +1805,21 @@ impl Session {
 
     /// Append a session message entry.
     pub fn append_message(&mut self, message: SessionMessage) -> String {
+        self.append_message_with_context(message, MessageContextRefs::default())
+    }
+
+    /// Append a session message entry with task/workset/reference context.
+    pub fn append_message_with_context(
+        &mut self,
+        message: SessionMessage,
+        context: MessageContextRefs,
+    ) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
         let entry = SessionEntry::Message(MessageEntry {
             base,
             message,
+            context,
             metadata: MessageMetadata::default(),
         });
         self.leaf_id = Some(id.clone());
@@ -1823,7 +1833,16 @@ impl Session {
 
     /// Append a message from the model message types.
     pub fn append_model_message(&mut self, message: Message) -> String {
-        self.append_message(SessionMessage::from(message))
+        self.append_model_message_with_context(message, MessageContextRefs::default())
+    }
+
+    /// Append a model message with task/workset/reference context.
+    pub fn append_model_message_with_context(
+        &mut self,
+        message: Message,
+        context: MessageContextRefs,
+    ) -> String {
+        self.append_message_with_context(SessionMessage::from(message), context)
     }
 
     pub fn append_model_change(&mut self, provider: String, model_id: String) -> String {
@@ -2106,6 +2125,7 @@ impl Session {
                 timestamp: Some(chrono::Utc::now().timestamp_millis()),
                 extra: HashMap::new(),
             },
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::default(),
         });
         self.leaf_id = Some(id.clone());
@@ -2541,11 +2561,65 @@ impl Session {
         Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
     }
 
+    /// Convert session entries along the current path to model messages for an
+    /// active task/workset scope. Messages without explicit scope remain
+    /// visible so shared conversation context is preserved.
+    pub fn to_messages_for_prompt_scope(
+        &self,
+        task_id: Option<&str>,
+        workset_id: Option<&str>,
+    ) -> Vec<Message> {
+        if task_id.is_none() && workset_id.is_none() {
+            return self.to_messages_for_current_path();
+        }
+
+        if self.leaf_id.is_none() {
+            return Vec::new();
+        }
+
+        if self.is_linear {
+            return Self::to_messages_from_path_scoped(
+                self.entries.len(),
+                |idx| &self.entries[idx],
+                task_id,
+                workset_id,
+            );
+        }
+
+        let path_entries = self.entries_for_current_path();
+        Self::to_messages_from_path_scoped(
+            path_entries.len(),
+            |idx| path_entries[idx],
+            task_id,
+            workset_id,
+        )
+    }
+
     fn append_model_message_for_entry(messages: &mut Vec<Message>, entry: &SessionEntry) {
+        Self::append_model_message_for_entry_scoped(messages, entry, None, None);
+    }
+
+    fn append_model_message_for_entry_scoped(
+        messages: &mut Vec<Message>,
+        entry: &SessionEntry,
+        task_id: Option<&str>,
+        workset_id: Option<&str>,
+    ) {
         match entry {
             SessionEntry::Message(msg_entry) => {
                 // Skip messages that are not visible to the agent
                 if !msg_entry.is_agent_visible() {
+                    return;
+                }
+                let context_scoped_replay = matches!(
+                    msg_entry.message,
+                    SessionMessage::ToolResult { .. }
+                        | SessionMessage::Custom { .. }
+                        | SessionMessage::BashExecution { .. }
+                );
+                if context_scoped_replay
+                    && !Self::message_context_matches(&msg_entry.context, task_id, workset_id)
+                {
                     return;
                 }
                 if let Some(message) = session_message_to_model(&msg_entry.message) {
@@ -2565,7 +2639,34 @@ impl Session {
         }
     }
 
+    fn message_context_matches(
+        context: &MessageContextRefs,
+        task_id: Option<&str>,
+        workset_id: Option<&str>,
+    ) -> bool {
+        if task_id.is_none() && workset_id.is_none() {
+            return true;
+        }
+        if context.is_empty() {
+            return true;
+        }
+        task_id.is_some_and(|candidate| context.task_id.as_deref() == Some(candidate))
+            || workset_id.is_some_and(|candidate| context.workset_id.as_deref() == Some(candidate))
+    }
+
     fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<Message>
+    where
+        F: Fn(usize) -> &'a SessionEntry,
+    {
+        Self::to_messages_from_path_scoped(path_len, entry_at, None, None)
+    }
+
+    fn to_messages_from_path_scoped<'a, F>(
+        path_len: usize,
+        entry_at: F,
+        task_id: Option<&str>,
+        workset_id: Option<&str>,
+    ) -> Vec<Message>
     where
         F: Fn(usize) -> &'a SessionEntry,
     {
@@ -2620,7 +2721,12 @@ impl Session {
                         continue;
                     }
                 }
-                Self::append_model_message_for_entry(&mut messages, entry);
+                Self::append_model_message_for_entry_scoped(
+                    &mut messages,
+                    entry,
+                    task_id,
+                    workset_id,
+                );
             }
 
             return messages;
@@ -2628,7 +2734,12 @@ impl Session {
 
         let mut messages = Vec::new();
         for idx in 0..path_len {
-            Self::append_model_message_for_entry(&mut messages, entry_at(idx));
+            Self::append_model_message_for_entry_scoped(
+                &mut messages,
+                entry_at(idx),
+                task_id,
+                workset_id,
+            );
         }
         messages
     }
@@ -3192,10 +3303,37 @@ pub struct MessageEntry {
     #[serde(flatten)]
     pub base: EntryBase,
     pub message: SessionMessage,
+    #[serde(flatten, default, skip_serializing_if = "MessageContextRefs::is_empty")]
+    pub context: MessageContextRefs,
     /// Visibility metadata controlling UI and agent context visibility.
     /// Defaults to both visible for backward compatibility.
     #[serde(default, skip_serializing_if = "MessageMetadata::is_default")]
     pub metadata: MessageMetadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageContextRefs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieval_refs: Vec<String>,
+}
+
+impl MessageContextRefs {
+    pub fn is_empty(&self) -> bool {
+        self.task_id.is_none()
+            && self.workset_id.is_none()
+            && self.artifact_refs.is_empty()
+            && self.evidence_refs.is_empty()
+            && self.retrieval_refs.is_empty()
+    }
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -5792,6 +5930,7 @@ mod tests {
                 timestamp: Some(0),
                 extra,
             },
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::default(),
         });
         session.leaf_id = Some(id);
@@ -5831,6 +5970,113 @@ mod tests {
                 panic!("expected Custom");
             }
         }
+    }
+
+    #[test]
+    fn test_append_message_with_context_persists_task_scoped_refs() {
+        let mut session = Session::in_memory();
+
+        let id = session.append_message_with_context(
+            make_test_message("scoped"),
+            MessageContextRefs {
+                task_id: Some("task-123".to_string()),
+                workset_id: Some("workset-a".to_string()),
+                artifact_refs: vec!["artifact://a".to_string()],
+                evidence_refs: vec!["evidence://a".to_string()],
+                retrieval_refs: vec!["retrieval://a".to_string()],
+            },
+        );
+
+        let entry = session.get_entry(&id).expect("message entry");
+        let SessionEntry::Message(message) = entry else {
+            panic!("expected message entry");
+        };
+
+        assert_eq!(message.context.task_id.as_deref(), Some("task-123"));
+        assert_eq!(message.context.workset_id.as_deref(), Some("workset-a"));
+        assert_eq!(message.context.artifact_refs, vec!["artifact://a"]);
+        assert_eq!(message.context.evidence_refs, vec!["evidence://a"]);
+        assert_eq!(message.context.retrieval_refs, vec!["retrieval://a"]);
+    }
+
+    #[test]
+    fn test_message_entry_context_roundtrip_omits_empty_refs() {
+        let entry = MessageEntry {
+            base: EntryBase {
+                id: Some("entry-1".to_string()),
+                parent_id: None,
+                timestamp: "2026-03-17T00:00:00.000Z".to_string(),
+            },
+            message: make_test_message("hello"),
+            context: MessageContextRefs::default(),
+            metadata: MessageMetadata::default(),
+        };
+
+        let serialized = serde_json::to_value(&entry).expect("serialize");
+        let object = serialized.as_object().expect("object");
+
+        assert!(!object.contains_key("taskId"));
+        assert!(!object.contains_key("worksetId"));
+        assert!(!object.contains_key("artifactRefs"));
+        assert!(!object.contains_key("evidenceRefs"));
+        assert!(!object.contains_key("retrievalRefs"));
+
+        let deserialized: MessageEntry = serde_json::from_value(serialized).expect("deserialize");
+        assert!(deserialized.context.is_empty());
+    }
+
+    #[test]
+    fn test_to_messages_for_prompt_scope_filters_task_scoped_tool_outputs() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("global"));
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-a".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-a tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-a".to_string()),
+                ..MessageContextRefs::default()
+            },
+        );
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-b".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-b tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-b".to_string()),
+                ..MessageContextRefs::default()
+            },
+        );
+
+        let scoped = session.to_messages_for_prompt_scope(Some("task-a"), None);
+        let rendered: Vec<_> = scoped
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user_content_to_text(&user.content)),
+                Message::ToolResult(result) => {
+                    result.content.iter().find_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec!["global".to_string(), "task-a tool".to_string()]
+        );
     }
 
     #[test]
@@ -6585,6 +6831,7 @@ mod tests {
                     content: UserContent::Text("test".to_string()),
                     timestamp: Some(0),
                 },
+                context: MessageContextRefs::default(),
                 metadata: MessageMetadata::default(),
             }),
             SessionEntry::Message(MessageEntry {
@@ -6597,6 +6844,7 @@ mod tests {
                     content: UserContent::Text("test2".to_string()),
                     timestamp: Some(0),
                 },
+                context: MessageContextRefs::default(),
                 metadata: MessageMetadata::default(),
             }),
         ];
@@ -7763,6 +8011,7 @@ mod tests {
                             content: UserContent::Text(format!("msg {i}")),
                             timestamp: Some(0),
                         },
+                        context: MessageContextRefs::default(),
                         metadata: MessageMetadata::default(),
                     })
                 }).collect();
@@ -10047,15 +10296,38 @@ mod property_tests {
         })
     }
 
+    fn message_context_refs_strategy() -> impl Strategy<Value = MessageContextRefs> {
+        (
+            prop::option::of(any::<String>()),
+            prop::option::of(any::<String>()),
+            vec(any::<String>(), 0..3),
+            vec(any::<String>(), 0..3),
+            vec(any::<String>(), 0..3),
+        )
+            .prop_map(
+                |(task_id, workset_id, artifact_refs, evidence_refs, retrieval_refs)| {
+                    MessageContextRefs {
+                        task_id,
+                        workset_id,
+                        artifact_refs,
+                        evidence_refs,
+                        retrieval_refs,
+                    }
+                },
+            )
+    }
+
     fn message_entry_strategy() -> impl Strategy<Value = MessageEntry> {
         (
             entry_base_strategy(),
             session_message_strategy(),
+            message_context_refs_strategy(),
             message_metadata_strategy(),
         )
-            .prop_map(|(base, message, metadata)| MessageEntry {
+            .prop_map(|(base, message, context, metadata)| MessageEntry {
                 base,
                 message,
+                context,
                 metadata,
             })
     }

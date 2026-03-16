@@ -212,7 +212,22 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         ("ls", "List directory contents"),
         ("websearch", "Search the web for relevant URLs and snippets"),
         ("webfetch", "Fetch and summarize content from a URL"),
-        ("lsp", "Symbol lookup and diagnostics for code navigation"),
+        (
+            "code.query",
+            "Retrieval-first code search for symbols and identifiers",
+        ),
+        (
+            "code.context",
+            "Outline-first code context for files and symbols",
+        ),
+        (
+            "code.impact",
+            "Reference and test impact search for symbols or files",
+        ),
+        (
+            "lsp",
+            "Fallback symbol lookup and diagnostics for code navigation",
+        ),
     ];
 
     let mut tools = Vec::new();
@@ -238,6 +253,9 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let has_read = has_tool("read");
     let has_websearch = has_tool("websearch");
     let has_webfetch = has_tool("webfetch");
+    let has_code_query = has_tool("code.query");
+    let has_code_context = has_tool("code.context");
+    let has_code_impact = has_tool("code.impact");
     let has_lsp = has_tool("lsp");
 
     let mut guidelines_list = Vec::new();
@@ -269,9 +287,15 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         guidelines_list
             .push("Use websearch to discover sources first, then webfetch to read specific URLs.");
     }
+    if has_code_query || has_code_context || has_code_impact {
+        guidelines_list.push(
+            "Prefer code.query, code.context, and code.impact for code navigation before broad grep/find churn.",
+        );
+    }
     if has_lsp {
-        guidelines_list
-            .push("Prefer lsp for symbol definitions/references before broad text search.");
+        guidelines_list.push(
+            "Use lsp only as a fallback when the code.* tools do not provide enough context.",
+        );
     }
 
     guidelines_list.push("Be concise in your responses");

@@ -18,7 +18,9 @@ use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::config::{Config, ReliabilityEnforcementMode, RetrySettings};
 use crate::error::{Error, Result};
 use crate::events::Action;
-use crate::extension_events::{InputEventOutcome, apply_input_event_response};
+use crate::extension_events::{
+    InputEventOutcome, SyntheticToolResult, ToolCallEventResult, apply_input_event_response,
+};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExecMediationLedgerEntry, ExtensionDeliverAs, ExtensionEventName,
@@ -42,14 +44,14 @@ use crate::prompt_assembly::{
     PromptAssemblyInputs, assemble_prompt_plan, context_from_prompt_plan,
 };
 use crate::prompt_plan::PromptAssemblyPlan;
-use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
 #[allow(unused_imports)]
 use crate::runtime::reliability::{
     ArtifactStore, Attempt, AttemptStats, CloseOutcomeKind, ClosePayload, CloseResult,
     EvidenceRecord, FsArtifactStore, LeaseManager, RetryAgent, RetryConfig, ReviewSubmission,
     ReviewerScorer, StateDigest, StuckDetector, TokenUsage, VerificationOutcome,
 };
-use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
+use crate::session::{AutosaveFlushTrigger, MessageContextRefs, Session, SessionHandle};
 use crate::state::{
     CompletionGate as StateCompletionGate, DiscoveryPriority, DiscoveryTracker, Evidence,
     EvidenceGate, TaskEventKind, TaskEventLog, TaskResult,
@@ -429,6 +431,16 @@ pub struct Agent {
 
     /// Optional per-turn scope objective used by the scope boundary guard.
     scope_objective: Option<String>,
+
+    /// Structured prompt controls for the active turn.
+    prompt_runtime: PromptRuntimeContext,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PromptRuntimeContext {
+    task_manifest: Option<String>,
+    retrieval_bundle: Option<String>,
+    evidence: Option<String>,
 }
 
 impl Agent {
@@ -445,6 +457,7 @@ impl Agent {
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             scope_objective: None,
+            prompt_runtime: PromptRuntimeContext::default(),
         }
     }
 
@@ -479,6 +492,23 @@ impl Agent {
     /// Clear any active scope objective.
     pub fn clear_scope_objective(&mut self) {
         self.scope_objective = None;
+    }
+
+    pub fn set_prompt_runtime_context(
+        &mut self,
+        task_manifest: Option<String>,
+        retrieval_bundle: Option<String>,
+        evidence: Option<String>,
+    ) {
+        self.prompt_runtime = PromptRuntimeContext {
+            task_manifest,
+            retrieval_bundle,
+            evidence,
+        };
+    }
+
+    pub fn clear_prompt_runtime_context(&mut self) {
+        self.prompt_runtime = PromptRuntimeContext::default();
     }
 
     /// Replace the provider implementation (used for model/provider switching).
@@ -602,17 +632,41 @@ impl Agent {
     fn build_prompt_plan(&mut self) -> PromptAssemblyPlan {
         let messages = self.provider_visible_messages().into_owned();
         let tools = self.build_tool_defs();
-        assemble_prompt_plan(PromptAssemblyInputs::from_history(
-            self.config.system_prompt.clone(),
+        assemble_prompt_plan(PromptAssemblyInputs {
+            system_prompt: self.config.system_prompt.clone(),
             tools,
-            messages,
-        ))
+            task_manifest: self.prompt_runtime.task_manifest.clone(),
+            retrieval_bundle: self.prompt_runtime.retrieval_bundle.clone(),
+            evidence: self.prompt_runtime.evidence.clone(),
+            fallback_history: messages,
+            ..PromptAssemblyInputs::default()
+        })
     }
 
     /// Build context for a completion request.
     fn build_context(&mut self) -> Context<'static> {
         let plan = self.build_prompt_plan();
         context_from_prompt_plan(&plan)
+    }
+
+    fn apply_prompt_cache_retention(
+        &self,
+        plan: &PromptAssemblyPlan,
+        stream_options: &mut StreamOptions,
+    ) {
+        if stream_options.cache_retention != CacheRetention::None {
+            return;
+        }
+        if !self.provider.name().eq_ignore_ascii_case("anthropic") {
+            return;
+        }
+
+        let stable_tokens = plan.token_breakdown.static_prefix
+            + plan.token_breakdown.repo_policy
+            + plan.token_breakdown.task_manifest;
+        if stable_tokens >= 256 {
+            stream_options.cache_retention = CacheRetention::Short;
+        }
     }
 
     /// Run the agent with a user message.
@@ -1045,8 +1099,21 @@ impl Agent {
     ) -> Result<AssistantMessage> {
         // Build context and stream completion
         let provider = Arc::clone(&self.provider);
-        let stream_options = self.config.stream_options.clone();
-        let context = self.build_context();
+        let plan = self.build_prompt_plan();
+        let mut stream_options = self.config.stream_options.clone();
+        self.apply_prompt_cache_retention(&plan, &mut stream_options);
+        tracing::debug!(
+            prompt_static_prefix = plan.token_breakdown.static_prefix,
+            prompt_repo_policy = plan.token_breakdown.repo_policy,
+            prompt_task_manifest = plan.token_breakdown.task_manifest,
+            prompt_retrieval_bundle = plan.token_breakdown.retrieval_bundle,
+            prompt_evidence = plan.token_breakdown.evidence,
+            prompt_fresh_turn = plan.token_breakdown.fresh_turn,
+            prompt_fallback_history = plan.token_breakdown.fallback_history,
+            prompt_total_estimate = plan.token_breakdown.total_estimate(),
+            "Built prompt assembly plan"
+        );
+        let context = context_from_prompt_plan(&plan);
         let mut stream = provider.stream(&context, &stream_options).await?;
 
         let mut added_partial = false;
@@ -1455,7 +1522,7 @@ impl Agent {
 
     async fn execute_parallel_batch(
         &self,
-        batch: Vec<(usize, ToolCall)>,
+        batch: Vec<(usize, PreparedToolCall)>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Vec<(usize, (ToolOutput, bool))> {
@@ -1503,35 +1570,40 @@ impl Agent {
             });
         }
 
-        // Phase 1: Emit start events for ALL tools up front.
+        let mut prepared_calls = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
+            prepared_calls.push(self.prepare_tool_call(tool_call.clone()).await);
+        }
+
+        // Phase 1: Emit start events for ALL tools up front using effective arguments.
+        for prepared in &prepared_calls {
             on_event(AgentEvent::ToolExecutionStart {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                args: tool_call.arguments.clone(),
+                tool_call_id: prepared.original.id.clone(),
+                tool_name: prepared.original.name.clone(),
+                args: prepared.effective.arguments.clone(),
             });
         }
 
         // Phase 2: Execute tools with safety barriers.
-        let mut pending_parallel: Vec<(usize, ToolCall)> = Vec::new();
-        let mut tool_outputs: Vec<Option<(ToolOutput, bool)>> = vec![None; tool_calls.len()];
+        let mut pending_parallel: Vec<(usize, PreparedToolCall)> = Vec::new();
+        let mut tool_outputs: Vec<Option<(ToolOutput, bool)>> = vec![None; prepared_calls.len()];
 
         // Iterate through tools. If read-only, buffer. If unsafe, flush buffer then run unsafe.
-        for (index, tool_call) in tool_calls.iter().enumerate() {
+        for (index, prepared) in prepared_calls.iter().cloned().enumerate() {
             if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
                 break;
             }
 
-            if self.should_block_tool_call_for_scope(tool_call) {
-                tool_outputs[index] = Some((self.scope_blocked_tool_output(tool_call), true));
+            if self.should_block_tool_call_for_scope(&prepared.effective) {
+                tool_outputs[index] =
+                    Some((self.scope_blocked_tool_output(&prepared.effective), true));
                 continue;
             }
 
-            let is_read_only =
-                matches!(self.tools.get(&tool_call.name), Some(tool) if tool.is_read_only());
+            let is_read_only = matches!(self.tools.get(&prepared.effective.name), Some(tool) if tool.is_read_only());
 
             if is_read_only {
-                pending_parallel.push((index, tool_call.clone()));
+                pending_parallel.push((index, prepared));
             } else {
                 // Check steering BEFORE flushing parallel or running unsafe.
                 let steering = self.drain_steering_messages().await;
@@ -1564,7 +1636,7 @@ impl Agent {
                 }
 
                 let result = self
-                    .execute_tool(tool_call.clone(), Arc::clone(&on_event))
+                    .execute_prepared_tool(prepared, Arc::clone(&on_event))
                     .await;
                 tool_outputs[index] = Some(result);
             }
@@ -1591,7 +1663,7 @@ impl Agent {
         }
 
         // Phase 3: Process results sequentially and handle skips.
-        for (index, tool_call) in tool_calls.iter().enumerate() {
+        for (index, prepared) in prepared_calls.iter().enumerate() {
             // Check for new steering if we haven't already found some.
             // This catches steering messages that arrived during the *last* tool's execution.
             if steering_messages.is_none() && !abort.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -1608,8 +1680,8 @@ impl Agent {
                 // Tool executed normally.
                 // Always emit ToolExecutionEnd to close the lifecycle.
                 on_event(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
+                    tool_call_id: prepared.original.id.clone(),
+                    tool_name: prepared.original.name.clone(),
                     result: ToolOutput {
                         content: output.content.clone(),
                         details: output.details.clone(),
@@ -1619,8 +1691,8 @@ impl Agent {
                 });
 
                 let tool_result = Arc::new(ToolResultMessage {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
+                    tool_call_id: prepared.original.id.clone(),
+                    tool_name: prepared.original.name.clone(),
                     content: output.content,
                     details: output.details,
                     is_error,
@@ -1639,7 +1711,7 @@ impl Agent {
                 results.push(tool_result);
             } else if steering_messages.is_some() {
                 // Skipped due to steering.
-                results.push(self.skip_tool_call(tool_call, &on_event, new_messages));
+                results.push(self.skip_tool_call(prepared, &on_event, new_messages));
             } else {
                 // Aborted or otherwise failed to run (e.g. abort signal).
                 let output = ToolOutput {
@@ -1651,9 +1723,9 @@ impl Agent {
                 };
 
                 on_event(AgentEvent::ToolExecutionUpdate {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
-                    args: tool_call.arguments.clone(),
+                    tool_call_id: prepared.original.id.clone(),
+                    tool_name: prepared.original.name.clone(),
+                    args: prepared.effective.arguments.clone(),
                     partial_result: ToolOutput {
                         content: output.content.clone(),
                         details: output.details.clone(),
@@ -1662,8 +1734,8 @@ impl Agent {
                 });
 
                 on_event(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
+                    tool_call_id: prepared.original.id.clone(),
+                    tool_name: prepared.original.name.clone(),
                     result: ToolOutput {
                         content: output.content.clone(),
                         details: output.details.clone(),
@@ -1673,8 +1745,8 @@ impl Agent {
                 });
 
                 let tool_result = Arc::new(ToolResultMessage {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
+                    tool_call_id: prepared.original.id.clone(),
+                    tool_name: prepared.original.name.clone(),
                     content: output.content,
                     details: output.details,
                     is_error: true,
@@ -1773,35 +1845,41 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
     ) -> (ToolOutput, bool) {
+        let prepared = self.prepare_tool_call(tool_call).await;
+        self.execute_prepared_tool(prepared, on_event).await
+    }
+
+    async fn execute_prepared_tool(
+        &self,
+        prepared: PreparedToolCall,
+        on_event: AgentEventHandler,
+    ) -> (ToolOutput, bool) {
         let extensions = self.extensions.clone();
 
-        let (mut output, is_error) = if let Some(extensions) = &extensions {
-            match Self::dispatch_tool_call_hook(extensions, &tool_call).await {
-                Some(blocked_output) => (blocked_output, true),
-                None => {
-                    self.execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
-                        .await
-                }
-            }
+        let (mut output, is_error) = if let Some(output) = prepared.synthetic_output.clone() {
+            let is_error = output.is_error;
+            (output, is_error)
         } else {
-            self.execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+            self.execute_tool_without_hooks(&prepared.effective, Arc::clone(&on_event))
                 .await
         };
 
         if let Some(extensions) = &extensions {
-            Self::record_builtin_bash_mediation(extensions, &tool_call, &output);
-            Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
+            Self::record_builtin_bash_mediation(extensions, &prepared.effective, &output);
+            Self::apply_tool_result_hook(extensions, &prepared.effective, &mut output, is_error)
+                .await;
         }
+        Self::merge_tool_augmentation(&mut output.details, prepared.augmentation.as_ref());
 
         (output, is_error)
     }
 
     async fn execute_tool_owned(
         &self,
-        tool_call: ToolCall,
+        tool_call: PreparedToolCall,
         on_event: AgentEventHandler,
     ) -> (ToolOutput, bool) {
-        self.execute_tool(tool_call, on_event).await
+        self.execute_prepared_tool(tool_call, on_event).await
     }
 
     async fn execute_tool_without_hooks(
@@ -1865,21 +1943,76 @@ impl Agent {
         }
     }
 
+    async fn prepare_tool_call(&self, tool_call: ToolCall) -> PreparedToolCall {
+        let mut prepared = PreparedToolCall {
+            original: tool_call.clone(),
+            effective: tool_call,
+            synthetic_output: None,
+            augmentation: None,
+        };
+
+        let Some(extensions) = &self.extensions else {
+            return prepared;
+        };
+
+        match Self::dispatch_tool_call_hook(extensions, &prepared.effective).await {
+            Ok(Some(result)) => {
+                if let Some(arguments) = result.rewritten_arguments.clone() {
+                    prepared.effective.arguments = arguments;
+                }
+                prepared.augmentation = result.augmentation.clone();
+
+                if result.block {
+                    prepared.synthetic_output =
+                        Some(Self::tool_call_blocked_output(result.reason.as_deref()));
+                } else if let Some(synthetic) = result.synthetic_result.as_ref() {
+                    prepared.synthetic_output = Some(Self::synthetic_tool_output(synthetic));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!("tool_call extension hook failed (fail-open): {err}"),
+        }
+
+        prepared
+    }
+
     async fn dispatch_tool_call_hook(
         extensions: &ExtensionManager,
         tool_call: &ToolCall,
-    ) -> Option<ToolOutput> {
-        match extensions
+    ) -> Result<Option<ToolCallEventResult>> {
+        extensions
             .dispatch_tool_call(tool_call, EXTENSION_EVENT_TIMEOUT_MS)
             .await
-        {
-            Ok(Some(result)) if result.block => {
-                Some(Self::tool_call_blocked_output(result.reason.as_deref()))
+    }
+
+    fn synthetic_tool_output(result: &SyntheticToolResult) -> ToolOutput {
+        ToolOutput {
+            content: result.content.clone(),
+            details: result.details.clone(),
+            is_error: result.is_error,
+        }
+    }
+
+    fn merge_tool_augmentation(details: &mut Option<Value>, augmentation: Option<&Value>) {
+        let Some(augmentation) = augmentation else {
+            return;
+        };
+
+        match details.take() {
+            Some(Value::Object(mut map)) => {
+                map.insert("toolCallAugmentation".to_string(), augmentation.clone());
+                *details = Some(Value::Object(map));
             }
-            Ok(_) => None,
-            Err(err) => {
-                tracing::warn!("tool_call extension hook failed (fail-open): {err}");
-                None
+            Some(existing) => {
+                *details = Some(json!({
+                    "toolCallAugmentation": augmentation,
+                    "toolDetails": existing,
+                }));
+            }
+            None => {
+                *details = Some(json!({
+                    "toolCallAugmentation": augmentation,
+                }));
             }
         }
     }
@@ -2051,7 +2184,7 @@ impl Agent {
 
     fn skip_tool_call(
         &mut self,
-        tool_call: &ToolCall,
+        tool_call: &PreparedToolCall,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         new_messages: &mut Vec<Message>,
     ) -> Arc<ToolResultMessage> {
@@ -2066,21 +2199,21 @@ impl Agent {
         // Note: Phase 1 already emitted ToolExecutionStart for all tools,
         // so we only emit Update and End here.
         on_event(AgentEvent::ToolExecutionUpdate {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            args: tool_call.arguments.clone(),
+            tool_call_id: tool_call.original.id.clone(),
+            tool_name: tool_call.original.name.clone(),
+            args: tool_call.effective.arguments.clone(),
             partial_result: output.clone(),
         });
         on_event(AgentEvent::ToolExecutionEnd {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
+            tool_call_id: tool_call.original.id.clone(),
+            tool_name: tool_call.original.name.clone(),
             result: output.clone(),
             is_error: true,
         });
 
         let tool_result = Arc::new(ToolResultMessage {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
+            tool_call_id: tool_call.original.id.clone(),
+            tool_name: tool_call.original.name.clone(),
             content: output.content,
             details: output.details,
             is_error: true,
@@ -2107,6 +2240,14 @@ impl Agent {
 struct ToolExecutionOutcome {
     tool_results: Vec<Arc<ToolResultMessage>>,
     steering_messages: Option<Vec<Message>>,
+}
+
+#[derive(Clone)]
+struct PreparedToolCall {
+    original: ToolCall,
+    effective: ToolCall,
+    synthetic_output: Option<ToolOutput>,
+    augmentation: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -2155,6 +2296,7 @@ pub struct AgentSession {
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
+    active_message_context: MessageContextRefs,
 }
 
 #[derive(Debug, Default)]
@@ -2895,6 +3037,42 @@ mod extensions_integration_tests {
             Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("ok"))],
                 details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct EchoArgsTool;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Tool for EchoArgsTool {
+        fn name(&self) -> &str {
+            "echo_args"
+        }
+
+        fn label(&self) -> &str {
+            "echo_args"
+        }
+
+        fn description(&self) -> &str {
+            "echo tool arguments"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(input.to_string()))],
+                details: Some(json!({ "seen": input })),
                 is_error: false,
             })
         }
@@ -3663,6 +3841,139 @@ mod extensions_integration_tests {
             );
             if let [ContentBlock::Text(text)] = output.content.as_slice() {
                 assert_eq!(text.text, "Tool execution blocked: blocked bash in test");
+            }
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_can_rewrite_arguments_before_execution() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async (event) => {
+                    if (event && event.toolName === "echo_args") {
+                      return { rewrittenArguments: { rewritten: true, originalInput: event.input } };
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::from_tools(vec![Box::new(EchoArgsTool)]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "echo_args".to_string(),
+                arguments: json!({ "original": true }),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session.agent.execute_tool(tool_call, on_event).await;
+
+            assert!(!is_error);
+            assert!(!output.is_error);
+            assert_eq!(
+                output.details,
+                Some(json!({
+                    "seen": {
+                        "rewritten": true,
+                        "originalInput": { "original": true }
+                    }
+                }))
+            );
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_can_return_synthetic_result() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async (event) => {
+                    if (event && event.toolName === "count_tool") {
+                      return {
+                        syntheticResult: {
+                          content: [{ type: "text", text: "synthetic" }],
+                          details: { synthetic: true },
+                          isError: false
+                        },
+                        augmentation: { source: "test" }
+                      };
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session.agent.execute_tool(tool_call, on_event).await;
+
+            assert!(!is_error);
+            assert!(!output.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                output.details,
+                Some(json!({
+                    "synthetic": true,
+                    "toolCallAugmentation": { "source": "test" }
+                }))
+            );
+            assert!(matches!(output.content.as_slice(), [ContentBlock::Text(_)]));
+            if let [ContentBlock::Text(text)] = output.content.as_slice() {
+                assert_eq!(text.text, "synthetic");
             }
         });
     }
@@ -5167,6 +5478,7 @@ impl AgentSession {
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
+            active_message_context: MessageContextRefs::default(),
         }
     }
 
@@ -5399,6 +5711,47 @@ impl AgentSession {
 
     fn reliability_task_id() -> String {
         format!("agent-turn-{}", Utc::now().timestamp_millis())
+    }
+
+    fn turn_message_context(task_id: &str) -> MessageContextRefs {
+        MessageContextRefs {
+            task_id: Some(task_id.to_string()),
+            ..MessageContextRefs::default()
+        }
+    }
+
+    fn turn_task_manifest(task_id: &str, objective: &str) -> String {
+        format!("active_task={task_id}\nobjective={objective}\nnext_action=respond_or_use_tools")
+    }
+
+    fn turn_retrieval_bundle(objective: &str) -> String {
+        format!(
+            "objective={objective}\nretrieval_ladder=code.query -> code.context -> code.impact -> read -> grep/find"
+        )
+    }
+
+    async fn scoped_prompt_history(&self, task_id: &str) -> Result<Vec<Message>> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(session.to_messages_for_prompt_scope(Some(task_id), None))
+    }
+
+    fn apply_active_turn_prompt_context(&mut self, task_id: &str, objective: &str) {
+        self.active_message_context = Self::turn_message_context(task_id);
+        self.agent.set_prompt_runtime_context(
+            Some(Self::turn_task_manifest(task_id, objective)),
+            Some(Self::turn_retrieval_bundle(objective)),
+            None,
+        );
+    }
+
+    fn clear_active_turn_prompt_context(&mut self) {
+        self.active_message_context = MessageContextRefs::default();
+        self.agent.clear_prompt_runtime_context();
     }
 
     fn reliability_objective(raw: &str) -> String {
@@ -6655,19 +7008,13 @@ impl AgentSession {
         let oauth_context = self.oauth_runtime_context();
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
-        let history = {
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            session.to_messages_for_current_path()
-        };
+        let reliability_objective = Self::reliability_objective(&input);
+        let task_id = Self::reliability_task_id();
+        let history = self.scoped_prompt_history(&task_id).await?;
         self.agent.replace_messages(history);
+        self.apply_active_turn_prompt_context(&task_id, &reliability_objective);
 
         let start_len = self.agent.messages().len();
-        let reliability_objective = Self::reliability_objective(&input);
         let reliability_artifact_store = self
             .reliability_enabled
             .then(Self::reliability_artifact_store)
@@ -6692,7 +7039,10 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.append_model_message(user_message.clone());
+            session.append_model_message_with_context(
+                user_message.clone(),
+                self.active_message_context.clone(),
+            );
             if self.save_enabled {
                 session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
             }
@@ -6700,7 +7050,7 @@ impl AgentSession {
 
         let reliability_capture = self.reliability_enabled.then(|| {
             Arc::new(StdMutex::new(ReliabilityTraceCapture::new(
-                Self::reliability_task_id(),
+                task_id.clone(),
                 reliability_objective,
                 Some(format!(
                     "{}/{}",
@@ -6740,16 +7090,23 @@ impl AgentSession {
                         self.reliability_enforcement_mode,
                         ReliabilityEnforcementMode::Hard
                     ) {
+                        self.clear_active_turn_prompt_context();
                         return Err(err);
                     }
                     tracing::warn!("Failed to append reliability trace entries: {err}");
                 }
             }
         }
-        let result = result?;
-        // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
-        self.persist_new_messages(start_len + 1).await?;
-        Ok(result)
+        let outcome = match result {
+            Ok(message) => {
+                self.persist_new_messages(start_len + 1, self.active_message_context.clone())
+                    .await?;
+                Ok(message)
+            }
+            Err(err) => Err(err),
+        };
+        self.clear_active_turn_prompt_context();
+        outcome
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6779,20 +7136,14 @@ impl AgentSession {
         let oauth_context = self.oauth_runtime_context();
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
-        let history = {
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            session.to_messages_for_current_path()
-        };
-        self.agent.replace_messages(history);
-
-        let start_len = self.agent.messages().len();
         let (objective_text, _) = Self::split_content_blocks_for_input(&content);
         let reliability_objective = Self::reliability_objective(&objective_text);
+        let task_id = Self::reliability_task_id();
+        let history = self.scoped_prompt_history(&task_id).await?;
+        self.agent.replace_messages(history);
+        self.apply_active_turn_prompt_context(&task_id, &reliability_objective);
+
+        let start_len = self.agent.messages().len();
         let reliability_artifact_store = self
             .reliability_enabled
             .then(Self::reliability_artifact_store)
@@ -6817,7 +7168,10 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.append_model_message(user_message.clone());
+            session.append_model_message_with_context(
+                user_message.clone(),
+                self.active_message_context.clone(),
+            );
             if self.save_enabled {
                 session.flush_autosave(AutosaveFlushTrigger::Manual).await?;
             }
@@ -6825,7 +7179,7 @@ impl AgentSession {
 
         let reliability_capture = self.reliability_enabled.then(|| {
             Arc::new(StdMutex::new(ReliabilityTraceCapture::new(
-                Self::reliability_task_id(),
+                task_id.clone(),
                 reliability_objective,
                 Some(format!(
                     "{}/{}",
@@ -6865,19 +7219,30 @@ impl AgentSession {
                         self.reliability_enforcement_mode,
                         ReliabilityEnforcementMode::Hard
                     ) {
+                        self.clear_active_turn_prompt_context();
                         return Err(err);
                     }
                     tracing::warn!("Failed to append reliability trace entries: {err}");
                 }
             }
         }
-        let result = result?;
-        // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
-        self.persist_new_messages(start_len + 1).await?;
-        Ok(result)
+        let outcome = match result {
+            Ok(message) => {
+                self.persist_new_messages(start_len + 1, self.active_message_context.clone())
+                    .await?;
+                Ok(message)
+            }
+            Err(err) => Err(err),
+        };
+        self.clear_active_turn_prompt_context();
+        outcome
     }
 
-    async fn persist_new_messages(&self, start_len: usize) -> Result<()> {
+    async fn persist_new_messages(
+        &self,
+        start_len: usize,
+        context: MessageContextRefs,
+    ) -> Result<()> {
         let new_messages = self.agent.messages()[start_len..].to_vec();
         {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -6887,7 +7252,7 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             for message in new_messages {
-                session.append_model_message(message);
+                session.append_model_message_with_context(message, context.clone());
             }
             if self.save_enabled {
                 session
@@ -7414,6 +7779,41 @@ mod tests {
 
         assert_eq!(plan.messages.len(), 1);
         assert!(matches!(plan.messages[0], Message::User(_)));
+    }
+
+    #[test]
+    fn build_prompt_plan_includes_runtime_manifest_sections() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&["code.query"], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.set_prompt_runtime_context(
+            Some("active_task=task-1".to_string()),
+            Some("retrieval_ladder=code.query -> code.context".to_string()),
+            Some("evidence=none".to_string()),
+        );
+        agent.add_message(user_message("hello"));
+
+        let plan = agent.build_prompt_plan();
+
+        assert!(
+            plan.sections
+                .iter()
+                .any(|section| section.kind == crate::prompt_plan::PromptSectionKind::TaskManifest)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|section| section.kind
+                    == crate::prompt_plan::PromptSectionKind::RetrievalBundle)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|section| section.kind == crate::prompt_plan::PromptSectionKind::Evidence)
+        );
+        assert!(matches!(plan.messages[0], Message::Custom(_)));
     }
 
     #[test]

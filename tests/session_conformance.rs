@@ -159,6 +159,7 @@ fn proptest_message_entries() -> impl Strategy<Value = Vec<SessionEntry>> {
                 entries.push(SessionEntry::Message(pi::session::MessageEntry {
                     base,
                     message,
+                    context: pi::session::MessageContextRefs::default(),
                     metadata: pi::context::MessageMetadata::default(),
                 }));
             }

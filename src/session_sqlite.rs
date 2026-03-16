@@ -193,7 +193,9 @@ mod tests {
     use super::*;
     use crate::context::MessageMetadata;
     use crate::model::UserContent;
-    use crate::session::{EntryBase, MessageEntry, SessionInfoEntry, SessionMessage};
+    use crate::session::{
+        EntryBase, MessageContextRefs, MessageEntry, SessionInfoEntry, SessionMessage,
+    };
 
     fn dummy_base() -> EntryBase {
         EntryBase {
@@ -210,6 +212,7 @@ mod tests {
                 content: UserContent::Text("hello".to_string()),
                 timestamp: None,
             },
+            context: MessageContextRefs::default(),
             metadata: MessageMetadata::default(),
         })
     }
