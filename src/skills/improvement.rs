@@ -206,6 +206,7 @@ impl Default for SkillSuccessCriteria {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillHealthReport {
+    pub skill_id: String,
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub latest_digest: String,
@@ -580,35 +581,45 @@ pub fn handle_skill_doctor(
     let mut grouped_observations: BTreeMap<String, Vec<SkillObservation>> = BTreeMap::new();
     for observation in observations.iter().cloned() {
         grouped_observations
-            .entry(observation.skill_name.clone())
+            .entry(observation.skill_id.clone())
             .or_default()
             .push(observation);
     }
     let mut grouped_feedback: BTreeMap<String, Vec<SkillFeedback>> = BTreeMap::new();
     for entry in feedback.iter().cloned() {
         grouped_feedback
-            .entry(entry.skill_name.clone())
+            .entry(entry.skill_id.clone())
             .or_default()
             .push(entry);
     }
 
-    let mut skill_names = BTreeSet::new();
-    skill_names.extend(grouped_observations.keys().cloned());
-    skill_names.extend(grouped_feedback.keys().cloned());
+    let mut skill_ids = BTreeSet::new();
+    skill_ids.extend(grouped_observations.keys().cloned());
+    skill_ids.extend(grouped_feedback.keys().cloned());
     let mut skills = Vec::new();
-    for skill_name in skill_names {
-        let mut entries = grouped_observations.remove(&skill_name).unwrap_or_default();
+    for skill_id in skill_ids {
+        let mut entries = grouped_observations.remove(&skill_id).unwrap_or_default();
         entries.sort_by(|a, b| a.recorded_at_utc.cmp(&b.recorded_at_utc));
-        let mut feedback_entries = grouped_feedback.remove(&skill_name).unwrap_or_default();
+        let mut feedback_entries = grouped_feedback.remove(&skill_id).unwrap_or_default();
         feedback_entries.sort_by(|a, b| a.recorded_at_utc.cmp(&b.recorded_at_utc));
+        let skill_name = entries
+            .last()
+            .map(|entry| entry.skill_name.clone())
+            .or_else(|| feedback_entries.last().map(|entry| entry.skill_name.clone()))
+            .unwrap_or_else(|| skill_id.clone());
         skills.push(build_skill_health_report(
+            &skill_id,
             &skill_name,
             &entries,
             &feedback_entries,
             &criteria,
         ));
     }
-    skills.sort_by(|a, b| a.skill_name.cmp(&b.skill_name));
+    skills.sort_by(|a, b| {
+        a.skill_name
+            .cmp(&b.skill_name)
+            .then_with(|| a.skill_id.cmp(&b.skill_id))
+    });
 
     let mut applied_amendments = Vec::new();
     if fix {
@@ -693,6 +704,7 @@ pub fn handle_skill_doctor(
 }
 
 fn build_skill_health_report(
+    skill_id: &str,
     skill_name: &str,
     observations: &[SkillObservation],
     feedback: &[SkillFeedback],
@@ -709,7 +721,7 @@ fn build_skill_health_report(
     let (previous_observations, latest_observations) =
         split_observations_by_digest(observations, &latest_digest);
     let (previous_feedback, latest_feedback) = split_feedback_by_digest(feedback, &latest_digest);
-    let current_digest = file_digest(&latest_path);
+    let current_digest = current_skill_revision_digest(&latest_path, skill_id);
     let run_count = latest_observations.len();
     let success_rate = success_rate(latest_observations);
     let consecutive_failures = consecutive_failures(latest_observations);
@@ -725,6 +737,7 @@ fn build_skill_health_report(
     let has_unobserved_revision = current_digest != "missing" && current_digest != latest_digest;
     if has_unobserved_revision {
         let mut report = SkillHealthReport {
+            skill_id: skill_id.to_string(),
             skill_name: skill_name.to_string(),
             skill_path: latest_path,
             latest_digest,
@@ -773,6 +786,7 @@ fn build_skill_health_report(
     }
 
     SkillHealthReport {
+        skill_id: skill_id.to_string(),
         skill_name: skill_name.to_string(),
         skill_path: latest_path,
         latest_digest,
@@ -1039,6 +1053,18 @@ fn pending_revision_evidence(criteria: &SkillSuccessCriteria) -> String {
         "Current skill revision has not been observed yet; collect at least {} post-amend runs before judging it.",
         criteria.min_post_amend_runs
     )
+}
+
+fn current_skill_revision_digest(skill_path: &Path, expected_skill_id: &str) -> String {
+    let raw = match fs::read_to_string(skill_path) {
+        Ok(raw) => raw,
+        Err(_) => return "missing".to_string(),
+    };
+    let current_skill_id = skill_id_from_raw(&raw, skill_path);
+    if current_skill_id != expected_skill_id {
+        return "missing".to_string();
+    }
+    sha256_hex_standalone(&raw)
 }
 
 fn evaluate_latest_revision(
@@ -2501,6 +2527,7 @@ mod tests {
             },
         ];
         let report = build_skill_health_report(
+            &test_skill_id("bug-triage"),
             "bug-triage",
             &entries,
             &[],
@@ -2538,6 +2565,7 @@ mod tests {
             ),
         ];
         let report = build_skill_health_report(
+            &test_skill_id("summarize"),
             "summarize",
             &[],
             &feedback,
@@ -2631,6 +2659,7 @@ mod tests {
         ];
 
         let report = build_skill_health_report(
+            &test_skill_id("code-review"),
             "code-review",
             &observations,
             &feedback,
@@ -2831,7 +2860,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: summarize\ndescription: summarize text\n---\nVersion one\n",
+            "---\nname: summarize\nskill-id: summarize-id\ndescription: summarize text\n---\nVersion one\n",
         )
         .expect("write skill");
         let observed_digest = file_digest(&skill_path);
@@ -2857,7 +2886,7 @@ mod tests {
 
         fs::write(
             &skill_path,
-            "---\nname: summarize\ndescription: summarize text\n---\nVersion two\n",
+            "---\nname: summarize\nskill-id: summarize-id\ndescription: summarize text\n---\nVersion two\n",
         )
         .expect("rewrite skill");
         let current_digest = file_digest(&skill_path);
@@ -2891,7 +2920,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: bug-triage\ndescription: triage bugs\n---\nUse bash\n",
+            "---\nname: bug-triage\nskill-id: bug-triage-id\ndescription: triage bugs\n---\nUse bash\n",
         )
         .expect("write skill");
         let original_digest = file_digest(&skill_path);
@@ -3061,7 +3090,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: code-review\ndescription: review code\n---\n## Use When\n- inspect a code diff\n\n## Not For\n- writing product copy\n\n## Instructions\n1. Review the diff\n",
+            "---\nname: code-review\nskill-id: code-review-id\ndescription: review code\n---\n## Use When\n- inspect a code diff\n\n## Not For\n- writing product copy\n\n## Instructions\n1. Review the diff\n",
         )
         .expect("write skill");
         let original_digest = file_digest(&skill_path);
@@ -3202,7 +3231,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: code-review\ndescription: review code\n---\nReturn findings\n",
+            "---\nname: code-review\nskill-id: code-review-id\ndescription: review code\n---\nReturn findings\n",
         )
         .expect("write skill");
         let original_digest = file_digest(&skill_path);
@@ -3394,6 +3423,166 @@ mod tests {
     }
 
     #[test]
+    fn doctor_separates_same_name_skills_by_skill_id() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("bug-triage")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            format!(
+                "---\nname: bug-triage\nskill-id: {}\ndescription: triage bugs\n---\nOld revision\n",
+                test_skill_id("bug-triage-old")
+            ),
+        )
+        .expect("write original skill");
+        let original_digest = file_digest(&skill_path);
+
+        fs::write(
+            &skill_path,
+            format!(
+                "---\nname: bug-triage\nskill-id: {}\ndescription: triage bugs\n---\nNew revision\n",
+                test_skill_id("bug-triage-new")
+            ),
+        )
+        .expect("rewrite skill");
+        let recreated_digest = file_digest(&skill_path);
+
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("bug-triage-old"),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: original_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old run one".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "missing binary".to_string(),
+                        message: "missing binary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("bug-triage-old"),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: original_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old run two".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "missing binary".to_string(),
+                        message: "missing binary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("bug-triage-old"),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: original_digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old run three".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "missing binary".to_string(),
+                        message: "missing binary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("bug-triage-new"),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: recreated_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "new run one".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("bug-triage-new"),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: recreated_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "new run two".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("bug-triage-new"),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: recreated_digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "new run three".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write observations");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let old_skill = report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == test_skill_id("bug-triage-old"))
+            .expect("old skill");
+        let new_skill = report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == test_skill_id("bug-triage-new"))
+            .expect("new skill");
+
+        assert_eq!(old_skill.skill_name, "bug-triage");
+        assert_eq!(old_skill.status, SkillHealthStatus::NeedsAmendment);
+        assert_eq!(old_skill.current_digest, "missing");
+        assert_eq!(new_skill.skill_name, "bug-triage");
+        assert_eq!(new_skill.status, SkillHealthStatus::Healthy);
+        assert_eq!(new_skill.current_digest, new_skill.latest_digest);
+    }
+
+    #[test]
     fn doctor_rolls_child_outcomes_up_to_creator_report() {
         let dir = tempdir().expect("tempdir");
         let healthy_skill_path = dir
@@ -3405,7 +3594,7 @@ mod tests {
         fs::create_dir_all(healthy_skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &healthy_skill_path,
-            "---\nname: deploy-readiness\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    intended-outcome: catch release blockers before deploy\n    baseline: manual checklist review\n---\nReady\n",
+            "---\nname: deploy-readiness\nskill-id: deploy-readiness-id\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    intended-outcome: catch release blockers before deploy\n    baseline: manual checklist review\n---\nReady\n",
         )
         .expect("write healthy skill");
         let failing_skill_path = dir
@@ -3417,7 +3606,7 @@ mod tests {
         fs::create_dir_all(failing_skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &failing_skill_path,
-            "---\nname: release-notes\ndescription: draft release notes\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    intended-outcome: produce accurate notes\n    baseline: manual note drafting\n---\nDraft\n",
+            "---\nname: release-notes\nskill-id: release-notes-id\ndescription: draft release notes\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    intended-outcome: produce accurate notes\n    baseline: manual note drafting\n---\nDraft\n",
         )
         .expect("write failing skill");
 
@@ -3562,7 +3751,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: deploy-readiness\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    last-improved-by-skill: pi-skills-doctor\n    last-improved-by-revision: managed-patch-v1\n    intended-outcome: catch release blockers before deploy\n    baseline: manual checklist review\n---\nReady\n",
+            "---\nname: deploy-readiness\nskill-id: deploy-readiness-id\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    last-improved-by-skill: pi-skills-doctor\n    last-improved-by-revision: managed-patch-v1\n    intended-outcome: catch release blockers before deploy\n    baseline: manual checklist review\n---\nReady\n",
         )
         .expect("write skill");
         let digest = file_digest(&skill_path);
@@ -3646,7 +3835,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: bug-triage\ndescription: triage bugs\n---\nUse bash\n",
+            "---\nname: bug-triage\nskill-id: bug-triage-id\ndescription: triage bugs\n---\nUse bash\n",
         )
         .expect("write skill");
         let digest = file_digest(&skill_path);
@@ -3747,7 +3936,7 @@ mod tests {
         fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
         fs::write(
             &skill_path,
-            "---\nname: summarize\ndescription: summarize text\n---\nReturn concise summaries.\n",
+            "---\nname: summarize\nskill-id: summarize-id\ndescription: summarize text\n---\nReturn concise summaries.\n",
         )
         .expect("write skill");
         let original_digest = file_digest(&skill_path);
