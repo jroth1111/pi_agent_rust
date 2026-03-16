@@ -209,6 +209,7 @@ Producer rollups are now ledger-first and dual-attributed:
 - a descendant skill contributes to both its `creator` and its latest `improver` when both provenance links exist
 - recreated skills with the same `name` remain separate because rollups key on immutable `skill-id`
 - deleted, renamed, or otherwise orphaned descendants still count in producer effectiveness instead of disappearing with the filesystem
+- producer effectiveness metrics are weighted by descendant evidence volume, so a barely-observed child does not count the same as a heavily-observed one
 
 Ledger parsing now fails loudly. If a skill observation, feedback, or amendment row is malformed, `pi skills doctor` returns an error rather than silently dropping evidence and changing the score.
 

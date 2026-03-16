@@ -978,26 +978,38 @@ fn build_skill_producer_report(
         .filter(|descendant| descendant.orphaned)
         .count();
     let mut effective_descendant_skill_count = 0usize;
+    let mut effective_descendant_weight = 0.0;
     let mut pending_descendant_skill_count = 0usize;
     let mut needs_amendment_descendant_skill_count = 0usize;
     let mut regressed_descendant_skill_count = 0usize;
-    let mut success_rates = Vec::new();
-    let mut feedback_scores = Vec::new();
+    let mut total_descendant_weight = 0.0;
+    let mut success_weighted_sum = 0.0;
+    let mut success_weight = 0.0;
+    let mut feedback_weighted_sum = 0.0;
+    let mut feedback_weight = 0.0;
     let mut evidence_counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for descendant in descendants {
+        let weight = producer_descendant_weight(descendant);
+        total_descendant_weight += weight;
+
         let Some(report) = descendant.report.as_ref() else {
             continue;
         };
         if report.run_count > 0 {
-            success_rates.push(report.success_rate);
+            let run_weight = report.run_count as f64;
+            success_weighted_sum += report.success_rate * run_weight;
+            success_weight += run_weight;
         }
         if let Some(score) = report.average_feedback_score {
-            feedback_scores.push(score);
+            let feedback_count = report.feedback_count.max(1) as f64;
+            feedback_weighted_sum += score * feedback_count;
+            feedback_weight += feedback_count;
         }
         match report.status {
             SkillHealthStatus::Healthy | SkillHealthStatus::Improved => {
                 effective_descendant_skill_count += 1;
+                effective_descendant_weight += weight;
             }
             SkillHealthStatus::PendingData => {
                 pending_descendant_skill_count += 1;
@@ -1022,15 +1034,15 @@ fn build_skill_producer_report(
         }
     }
 
-    let effective_descendant_rate = if descendant_skill_count == 0 {
+    let effective_descendant_rate = if total_descendant_weight == 0.0 {
         0.0
     } else {
-        effective_descendant_skill_count as f64 / descendant_skill_count as f64
+        effective_descendant_weight / total_descendant_weight
     };
-    let average_descendant_success_rate = (!success_rates.is_empty())
-        .then(|| success_rates.iter().sum::<f64>() / success_rates.len() as f64);
-    let average_descendant_feedback_score = (!feedback_scores.is_empty())
-        .then(|| feedback_scores.iter().sum::<f64>() / feedback_scores.len() as f64);
+    let average_descendant_success_rate =
+        (success_weight > 0.0).then(|| success_weighted_sum / success_weight);
+    let average_descendant_feedback_score =
+        (feedback_weight > 0.0).then(|| feedback_weighted_sum / feedback_weight);
 
     let mut evidence = vec![format!(
         "{effective_descendant_skill_count}/{descendant_skill_count} descendant skills are healthy or improved."
@@ -1094,6 +1106,12 @@ fn build_skill_producer_report(
         average_descendant_feedback_score,
         evidence,
     }
+}
+
+fn producer_descendant_weight(descendant: &ProducerDescendant) -> f64 {
+    descendant.report.as_ref().map_or(1.0, |report| {
+        report.run_count.max(report.feedback_count).max(1) as f64
+    })
 }
 
 fn build_latest_skill_snapshots(
@@ -4202,6 +4220,93 @@ mod tests {
         assert_eq!(producer.effective_descendant_skill_count, 1);
         assert_eq!(producer.needs_amendment_descendant_skill_count, 1);
         assert_eq!(producer.regressed_descendant_skill_count, 0);
+    }
+
+    #[test]
+    fn producer_effectiveness_weights_descendants_by_evidence_volume() {
+        let dir = tempdir().expect("tempdir");
+        let strong_skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("deploy-readiness")
+            .join("SKILL.md");
+        let weak_skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("release-notes")
+            .join("SKILL.md");
+        fs::create_dir_all(strong_skill_path.parent().expect("parent")).expect("create dir");
+        fs::create_dir_all(weak_skill_path.parent().expect("parent")).expect("create dir");
+        fs::write(
+            &strong_skill_path,
+            "---\nname: deploy-readiness\nskill-id: deploy-readiness-id\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n---\nReady\n",
+        )
+        .expect("write strong skill");
+        fs::write(
+            &weak_skill_path,
+            "---\nname: release-notes\nskill-id: release-notes-id\ndescription: draft release notes\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n---\nDraft\n",
+        )
+        .expect("write weak skill");
+        let strong_digest = file_digest(&strong_skill_path);
+        let weak_digest = file_digest(&weak_skill_path);
+        let mut observations = Vec::new();
+        for index in 0..10 {
+            observations.push(SkillObservation {
+                version: 2,
+                recorded_at_utc: format!("2026-03-15T10:{index:02}:00Z"),
+                session_id: None,
+                skill_id: test_skill_id("deploy-readiness"),
+                skill_name: "deploy-readiness".to_string(),
+                skill_path: strong_skill_path.clone(),
+                skill_digest: strong_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: format!("strong run {index}"),
+                outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
+                tool_failures: Vec::new(),
+                agent_error: None,
+            });
+        }
+        for index in 0..3 {
+            observations.push(SkillObservation {
+                version: 2,
+                recorded_at_utc: format!("2026-03-15T11:{index:02}:00Z"),
+                session_id: None,
+                skill_id: test_skill_id("release-notes"),
+                skill_name: "release-notes".to_string(),
+                skill_path: weak_skill_path.clone(),
+                skill_digest: weak_digest.clone(),
+                activation_source: SkillActivationSource::SlashCommand,
+                task_preview: format!("weak run {index}"),
+                outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
+                tool_failures: vec![SkillToolFailure {
+                    tool_name: "write".to_string(),
+                    signature: "missing summary".to_string(),
+                    message: "missing summary".to_string(),
+                }],
+                agent_error: None,
+            });
+        }
+        append_jsonl_records(&skill_observation_ledger_path(dir.path()), &observations)
+            .expect("write observations");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let producer = report
+            .producers
+            .iter()
+            .find(|producer| {
+                producer.producer_skill_name == "skill-creator"
+                    && producer.role == SkillProducerRole::Creator
+            })
+            .expect("creator report");
+        assert_eq!(producer.descendant_skill_count, 2);
+        assert_eq!(producer.effective_descendant_skill_count, 1);
+        assert!(producer.effective_descendant_rate > 0.7);
+        assert_eq!(producer.average_descendant_success_rate, Some(10.0 / 13.0));
     }
 
     #[test]
