@@ -46,6 +46,7 @@ use crate::reliability::{
     EvidenceRecord, FsArtifactStore, LeaseManager, RetryAgent, RetryConfig, ReviewSubmission,
     ReviewerScorer, StateDigest, StuckDetector, TokenUsage, VerificationOutcome,
 };
+use crate::retrieval::symbol_outline_for_text;
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::state::{
     CompletionGate as StateCompletionGate, DiscoveryPriority, DiscoveryTracker, Evidence,
@@ -190,8 +191,13 @@ fn estimate_context_bytes(context: &Context<'_>) -> usize {
 }
 
 fn maybe_compact_tool_output(tool_call: &ToolCall, output: &mut ToolOutput, is_error: bool) {
-    if tool_call.name == "bash" {
-        compact_bash_tool_output(tool_call, output, is_error);
+    match tool_call.name.as_str() {
+        "bash" => compact_bash_tool_output(tool_call, output, is_error),
+        "read" => annotate_read_output_replay_summary(tool_call, output, is_error),
+        "grep" => annotate_grep_output_replay_summary(tool_call, output, is_error),
+        "find" => annotate_find_output_replay_summary(tool_call, output, is_error),
+        "ls" => annotate_ls_output_replay_summary(tool_call, output, is_error),
+        _ => {}
     }
 }
 
@@ -230,8 +236,126 @@ fn compact_bash_tool_output(tool_call: &ToolCall, output: &mut ToolOutput, is_er
         return;
     };
 
-    annotate_tool_output_compaction(&mut output.details, family, artifact_path.as_deref());
+    annotate_tool_output_compaction(
+        &mut output.details,
+        bash_output_family_label(family),
+        "semantic_summary",
+        artifact_path.as_deref(),
+        None,
+    );
     output.content = vec![ContentBlock::Text(TextContent::new(summary))];
+}
+
+fn annotate_read_output_replay_summary(
+    tool_call: &ToolCall,
+    output: &mut ToolOutput,
+    is_error: bool,
+) {
+    if is_error {
+        return;
+    }
+    let Some(text) = text_output_from_tool_blocks(&output.content) else {
+        return;
+    };
+    if !should_annotate_read_replay_summary(&text, output.details.as_ref()) {
+        return;
+    }
+    let Some(summary) = summarize_read_output_for_replay(tool_call, &text) else {
+        return;
+    };
+    annotate_tool_output_compaction(
+        &mut output.details,
+        "read",
+        "replay_summary",
+        None,
+        Some(summary),
+    );
+}
+
+fn annotate_grep_output_replay_summary(
+    tool_call: &ToolCall,
+    output: &mut ToolOutput,
+    is_error: bool,
+) {
+    if is_error {
+        return;
+    }
+    let Some(text) = text_output_from_tool_blocks(&output.content) else {
+        return;
+    };
+    if !should_annotate_search_replay_summary(&text, output.details.as_ref()) {
+        return;
+    }
+    let artifact_path = ensure_output_artifact_path("grep", &text, &mut output.details);
+    let Some(summary) =
+        summarize_grep_output_for_replay(tool_call, &text, artifact_path.as_deref())
+    else {
+        return;
+    };
+    annotate_tool_output_compaction(
+        &mut output.details,
+        "grep",
+        "replay_summary",
+        artifact_path.as_deref(),
+        Some(summary),
+    );
+}
+
+fn annotate_find_output_replay_summary(
+    tool_call: &ToolCall,
+    output: &mut ToolOutput,
+    is_error: bool,
+) {
+    if is_error {
+        return;
+    }
+    let Some(text) = text_output_from_tool_blocks(&output.content) else {
+        return;
+    };
+    if !should_annotate_search_replay_summary(&text, output.details.as_ref()) {
+        return;
+    }
+    let artifact_path = ensure_output_artifact_path("find", &text, &mut output.details);
+    let Some(summary) =
+        summarize_find_output_for_replay(tool_call, &text, artifact_path.as_deref())
+    else {
+        return;
+    };
+    annotate_tool_output_compaction(
+        &mut output.details,
+        "find",
+        "replay_summary",
+        artifact_path.as_deref(),
+        Some(summary),
+    );
+}
+
+fn annotate_ls_output_replay_summary(
+    tool_call: &ToolCall,
+    output: &mut ToolOutput,
+    is_error: bool,
+) {
+    if is_error {
+        return;
+    }
+    let Some(text) = text_output_from_tool_blocks(&output.content) else {
+        return;
+    };
+    if !should_annotate_search_replay_summary(&text, output.details.as_ref()) {
+        return;
+    }
+    let artifact_path = ensure_output_artifact_path("ls", &text, &mut output.details);
+    let Some(summary) = summarize_ls_output_for_replay(tool_call, &text, artifact_path.as_deref())
+    else {
+        return;
+    };
+    annotate_tool_output_compaction(
+        &mut output.details,
+        "ls",
+        "replay_summary",
+        artifact_path.as_deref(),
+        Some(summary),
+    );
 }
 
 fn classify_bash_output_family(command: &str) -> BashOutputFamily {
@@ -403,6 +527,252 @@ fn summarize_git_diff_output(
     })
 }
 
+fn summarize_read_output_for_replay(tool_call: &ToolCall, text: &str) -> Option<String> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map_or("file", |path| path);
+    let line_span = extract_read_line_span(text)
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let stripped = strip_read_line_numbers(text);
+    let outline = symbol_outline_for_text(&stripped, TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS);
+    if outline.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "[Consumed read output folded into retrieval manifest for {}; lines={line_span}; outline={}]",
+        normalize_compact_value(path, 96),
+        normalize_compact_value(&outline, 160),
+    ))
+}
+
+fn summarize_grep_output_for_replay(
+    tool_call: &ToolCall,
+    text: &str,
+    artifact_path: Option<&str>,
+) -> Option<String> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let pattern = tool_call
+        .arguments
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let matches = grep_match_refs(text);
+    if matches.is_empty() && artifact_path.is_none() {
+        return None;
+    }
+    let files = matches
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let sample = matches
+        .iter()
+        .take(TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS)
+        .map(|(path, line)| format!("{path}:{line}"))
+        .collect::<Vec<_>>();
+    let sample = if sample.is_empty() {
+        "none".to_string()
+    } else {
+        sample.join(", ")
+    };
+
+    Some(match artifact_path {
+        Some(path_ref) => format!(
+            "[Consumed grep output folded into retrieval manifest for {}; pattern={}; files={}; matches={}; sample={}; full={path_ref}]",
+            normalize_compact_value(path, 72),
+            normalize_compact_value(pattern, 64),
+            files.len(),
+            matches.len(),
+            normalize_compact_value(&sample, 160),
+        ),
+        None => format!(
+            "[Consumed grep output folded into retrieval manifest for {}; pattern={}; files={}; matches={}; sample={}]",
+            normalize_compact_value(path, 72),
+            normalize_compact_value(pattern, 64),
+            files.len(),
+            matches.len(),
+            normalize_compact_value(&sample, 160),
+        ),
+    })
+}
+
+fn summarize_find_output_for_replay(
+    tool_call: &ToolCall,
+    text: &str,
+    artifact_path: Option<&str>,
+) -> Option<String> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let pattern = tool_call
+        .arguments
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let entries = compact_listing_entries(text);
+    if entries.is_empty() && artifact_path.is_none() {
+        return None;
+    }
+    let sample = entries
+        .iter()
+        .take(TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let sample = if sample.is_empty() {
+        "none".to_string()
+    } else {
+        sample.join(", ")
+    };
+
+    Some(match artifact_path {
+        Some(path_ref) => format!(
+            "[Consumed find output folded into retrieval manifest for {}; pattern={}; entries={}; sample={}; full={path_ref}]",
+            normalize_compact_value(path, 72),
+            normalize_compact_value(pattern, 64),
+            entries.len(),
+            normalize_compact_value(&sample, 160),
+        ),
+        None => format!(
+            "[Consumed find output folded into retrieval manifest for {}; pattern={}; entries={}; sample={}]",
+            normalize_compact_value(path, 72),
+            normalize_compact_value(pattern, 64),
+            entries.len(),
+            normalize_compact_value(&sample, 160),
+        ),
+    })
+}
+
+fn summarize_ls_output_for_replay(
+    tool_call: &ToolCall,
+    text: &str,
+    artifact_path: Option<&str>,
+) -> Option<String> {
+    let path = tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let entries = compact_listing_entries(text);
+    if entries.is_empty() && artifact_path.is_none() {
+        return None;
+    }
+    let directories = entries.iter().filter(|entry| entry.ends_with('/')).count();
+    let sample = entries
+        .iter()
+        .take(TOOL_OUTPUT_COMPACTION_MAX_HIGHLIGHTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let sample = if sample.is_empty() {
+        "none".to_string()
+    } else {
+        sample.join(", ")
+    };
+
+    Some(match artifact_path {
+        Some(path_ref) => format!(
+            "[Consumed ls output folded into retrieval manifest for {}; entries={}; dirs={directories}; sample={}; full={path_ref}]",
+            normalize_compact_value(path, 72),
+            entries.len(),
+            normalize_compact_value(&sample, 160),
+        ),
+        None => format!(
+            "[Consumed ls output folded into retrieval manifest for {}; entries={}; dirs={directories}; sample={}]",
+            normalize_compact_value(path, 72),
+            entries.len(),
+            normalize_compact_value(&sample, 160),
+        ),
+    })
+}
+
+fn should_annotate_read_replay_summary(text: &str, details: Option<&Value>) -> bool {
+    details.and_then(|value| value.get("truncation")).is_some()
+        || text.len() >= TOOL_OUTPUT_COMPACTION_MIN_BYTES / 2
+        || text.lines().count() >= 24
+}
+
+fn should_annotate_search_replay_summary(text: &str, details: Option<&Value>) -> bool {
+    details.and_then(|value| value.get("truncation")).is_some()
+        || details
+            .and_then(|value| value.get("matchLimitReached"))
+            .is_some()
+        || details
+            .and_then(|value| value.get("resultLimitReached"))
+            .is_some()
+        || details
+            .and_then(|value| value.get("entryLimitReached"))
+            .is_some()
+        || text.len() >= TOOL_OUTPUT_COMPACTION_MIN_BYTES / 2
+        || text.lines().count() >= 12
+}
+
+fn strip_read_line_numbers(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with('['))
+        .map(|line| {
+            line.split_once('→')
+                .and_then(|(prefix, suffix)| prefix.trim().parse::<usize>().ok().map(|_| suffix))
+                .unwrap_or(line)
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_read_line_span(text: &str) -> Option<(usize, usize)> {
+    let mut numbers = text.lines().filter_map(|line| {
+        line.split_once('→')
+            .and_then(|(prefix, _)| prefix.trim().parse::<usize>().ok())
+    });
+    let first = numbers.next()?;
+    let last = numbers.last().unwrap_or(first);
+    Some((first, last))
+}
+
+fn grep_match_refs(text: &str) -> Vec<(String, usize)> {
+    text.lines()
+        .filter_map(|line| {
+            let (path, rest) = line.split_once(':')?;
+            let (line_number, _) = rest.split_once(':')?;
+            let line_number = line_number.trim().parse::<usize>().ok()?;
+            Some((normalize_compact_value(path, 96), line_number))
+        })
+        .collect()
+}
+
+fn compact_listing_entries(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('['))
+        .map(|line| normalize_compact_value(line, 96))
+        .collect()
+}
+
+const fn bash_output_family_label(family: BashOutputFamily) -> &'static str {
+    match family {
+        BashOutputFamily::Verification => "verification",
+        BashOutputFamily::GitStatus => "git_status",
+        BashOutputFamily::GitDiff => "git_diff",
+        BashOutputFamily::Other => "other",
+    }
+}
+
 fn text_output_from_tool_blocks(blocks: &[ContentBlock]) -> Option<String> {
     let mut out = String::new();
     let mut saw_text = false;
@@ -485,23 +855,22 @@ fn ensure_output_artifact_path(
 
 fn annotate_tool_output_compaction(
     details: &mut Option<Value>,
-    family: BashOutputFamily,
+    family: &str,
+    strategy: &str,
     artifact_path: Option<&str>,
+    replay_summary: Option<String>,
 ) {
-    let family = match family {
-        BashOutputFamily::Verification => "verification",
-        BashOutputFamily::GitStatus => "git_status",
-        BashOutputFamily::GitDiff => "git_diff",
-        BashOutputFamily::Other => "other",
-    };
-    ensure_tool_output_details_object(details).insert(
-        "outputCompaction".to_string(),
-        json!({
-            "family": family,
-            "strategy": "semantic_summary",
-            "artifactBacked": artifact_path.is_some(),
-        }),
-    );
+    let mut value = json!({
+        "family": family,
+        "strategy": strategy,
+        "artifactBacked": artifact_path.is_some(),
+    });
+    if let Some(summary) = replay_summary
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("replaySummary".to_string(), Value::String(summary));
+    }
+    ensure_tool_output_details_object(details).insert("outputCompaction".to_string(), value);
 }
 
 fn ensure_tool_output_details_object(
@@ -7780,6 +8149,81 @@ mod tests {
                 .and_then(|details| details.get("outputCompaction"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn annotate_read_output_adds_replay_summary_without_rewriting_fresh_content() {
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+            thought_signature: None,
+        };
+        let original = "    1→pub struct Demo;\n    2→\n    3→pub fn run() {}\n".repeat(12);
+        let mut output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(original.clone()))],
+            details: None,
+            is_error: false,
+        };
+
+        maybe_compact_tool_output(&tool_call, &mut output, false);
+
+        let text = text_output_from_tool_blocks(&output.content).expect("text output");
+        let replay_summary = output
+            .details
+            .as_ref()
+            .and_then(|details| details.get("outputCompaction"))
+            .and_then(|value| value.get("replaySummary"))
+            .and_then(Value::as_str)
+            .expect("replay summary");
+
+        assert_eq!(text, original);
+        assert!(replay_summary.contains("Consumed read output folded into retrieval manifest"));
+        assert!(replay_summary.contains("src/lib.rs"));
+        assert!(replay_summary.contains("pub struct Demo"));
+    }
+
+    #[test]
+    fn annotate_grep_output_adds_replay_summary_and_preserves_fresh_matches() {
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "PromptAssemblyPlan", "path": "src"}),
+            thought_signature: None,
+        };
+        let original = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            "src/session.rs:2540: pub(crate) fn prompt_assembly_for_current_path(...)",
+            "src/session.rs:3722: pub(crate) struct PromptAssemblyPlan {",
+            "src/session.rs:3760: pub(crate) fn prompt_assembly_plan_from_entries(...)",
+            "src/compaction.rs:1350: prompt_assembly_plan_from_entries(...)",
+            "src/agent.rs:192: fn maybe_compact_tool_output(...)",
+            "src/rpc.rs:3108: let rows = collect_retrieval_summary_rows(...)",
+        );
+        let mut output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(original.clone()))],
+            details: Some(json!({
+                "fullOutputPath": "/tmp/pi-grep-replay.log",
+            })),
+            is_error: false,
+        };
+
+        maybe_compact_tool_output(&tool_call, &mut output, false);
+
+        let text = text_output_from_tool_blocks(&output.content).expect("text output");
+        let replay_summary = output
+            .details
+            .as_ref()
+            .and_then(|details| details.get("outputCompaction"))
+            .and_then(|value| value.get("replaySummary"))
+            .and_then(Value::as_str)
+            .expect("replay summary");
+
+        assert_eq!(text, original);
+        assert!(replay_summary.contains("Consumed grep output folded into retrieval manifest"));
+        assert!(replay_summary.contains("PromptAssemblyPlan"));
+        assert!(replay_summary.contains("src"));
+        assert!(replay_summary.contains("/tmp/pi-grep-replay.log"));
     }
 
     #[test]
