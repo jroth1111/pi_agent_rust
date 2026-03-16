@@ -16,7 +16,7 @@ use crate::auth::AuthStorage;
 use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
-use crate::config::{Config, ReliabilityEnforcementMode};
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
@@ -36,24 +36,34 @@ use crate::provider_metadata::{
 };
 use crate::providers;
 use crate::reliability;
-use crate::reliability::ArtifactStore;
 use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
-use crate::runtime::controller::{
-    ControllerOutput as RuntimeControllerOutput, RuntimeCommand, RuntimeController,
+use crate::runtime::controller::ControllerOutput as RuntimeControllerOutput;
+use crate::runtime::dispatch::{
+    DispatchRunHost, ORCHESTRATION_ROLLBACK_RETRY_DELAY, build_runtime_task_report,
+    cancel_live_run_tasks, dispatch_run_until_quiescent, refresh_live_run_from_reliability,
+    refresh_run_from_reliability, run_has_live_tasks, run_requires_plan_acceptance,
 };
-use crate::runtime::model_routing::{ModelRoute, PhaseModelRouter};
-use crate::runtime::policy::PolicySet;
-use crate::runtime::scheduler;
+use crate::runtime::execution::{
+    AppendEvidenceRequest, DispatchGrant, RuntimeExecutionState, SubmitTaskRequest,
+    SubmitTaskResponse, TaskContract,
+};
+use crate::runtime::role_prompt::{SessionRole, build_role_system_prompt};
+use crate::runtime::service::{
+    RuntimeStartRunRequest, accept_plan as runtime_accept_plan,
+    bootstrap_run as runtime_bootstrap_run,
+    build_runtime_plan_artifact as service_build_runtime_plan_artifact,
+    build_runtime_task_nodes as service_build_runtime_task_nodes,
+    ensure_run_id_available as runtime_ensure_run_id_available,
+    select_execution_tier as runtime_select_execution_tier,
+};
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
-    AutonomyLevel, LeaseRecord, ModelProfile, ModelSelector, PlanArtifact, RunBudgets,
-    RunConstraints, RunPhase, RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState,
-    VerifySpec,
+    ModelProfile, ModelSelector, PlanArtifact, RunPhase, RunSnapshot, TaskNode,
 };
 use crate::runtime::verification::{
-    CompletedRunVerifyScope, apply_run_verify_lifecycle, completed_run_verify_scope,
-    completed_scope_from_run_verify, execute_run_verification, should_skip_run_verify,
+    CompletedRunVerifyScope, completed_run_verify_scope, completed_scope_from_run_verify,
+    execute_run_verification, should_skip_run_verify,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -62,13 +72,14 @@ use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
+#[cfg(test)]
 use chrono::Utc;
 use memchr::memchr_iter;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -76,6 +87,17 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use crate::config::ReliabilityEnforcementMode;
+#[cfg(test)]
+use crate::runtime::dispatch::dispatch_run_wave;
+#[cfg(test)]
+use crate::runtime::execution::{BlockerReport, TaskPrerequisite};
+#[cfg(test)]
+use crate::runtime::types::{
+    AutonomyLevel, RunBudgets, RunConstraints, RunSpec, TaskConstraints, TaskSpec, VerifySpec,
+};
 
 fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
@@ -106,121 +128,6 @@ pub struct RpcOptions {
 pub struct RpcScopedModel {
     pub model: ModelEntry,
     pub thinking_level: Option<crate::model::ThinkingLevel>,
-}
-
-const fn default_prerequisite_trigger() -> reliability::EdgeTrigger {
-    reliability::EdgeTrigger::OnSuccess
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskPrerequisite {
-    pub task_id: String,
-    #[serde(default = "default_prerequisite_trigger")]
-    pub trigger: reliability::EdgeTrigger,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskContract {
-    pub task_id: String,
-    pub objective: String,
-    #[serde(default)]
-    pub parent_goal_trace_id: Option<String>,
-    #[serde(default)]
-    pub invariants: Vec<String>,
-    #[serde(default)]
-    pub max_touched_files: Option<u16>,
-    #[serde(default)]
-    pub forbid_paths: Vec<String>,
-    #[serde(default)]
-    pub verify_command: String,
-    #[serde(default)]
-    pub verify_timeout_sec: Option<u32>,
-    #[serde(default)]
-    pub max_attempts: Option<u8>,
-    #[serde(default)]
-    pub input_snapshot: Option<String>,
-    #[serde(default)]
-    pub acceptance_ids: Vec<String>,
-    #[serde(default)]
-    pub planned_touches: Vec<String>,
-    #[serde(default)]
-    pub prerequisites: Vec<TaskPrerequisite>,
-    #[serde(default)]
-    pub enforce_symbol_drift_check: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DispatchGrant {
-    pub task_id: String,
-    pub agent_id: String,
-    pub lease_id: String,
-    pub fence_token: u64,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
-    pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BlockerReport {
-    pub task_id: String,
-    pub lease_id: String,
-    pub fence_token: u64,
-    pub reason: String,
-    pub context: String,
-    #[serde(default)]
-    pub defer_trigger: Option<reliability::DeferTrigger>,
-    #[serde(default)]
-    pub resolved: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AppendEvidenceRequest {
-    pub task_id: String,
-    pub command: String,
-    pub exit_code: i32,
-    #[serde(default)]
-    pub stdout: String,
-    #[serde(default)]
-    pub stderr: String,
-    #[serde(default)]
-    pub artifact_ids: Vec<String>,
-    #[serde(default)]
-    pub env_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SubmitTaskRequest {
-    pub task_id: String,
-    pub lease_id: String,
-    pub fence_token: u64,
-    pub patch_digest: String,
-    pub verify_run_id: String,
-    #[serde(default)]
-    pub verify_passed: Option<bool>,
-    #[serde(default)]
-    pub verify_timed_out: bool,
-    #[serde(default)]
-    pub failure_class: Option<reliability::FailureClass>,
-    #[serde(default)]
-    pub changed_files: Vec<String>,
-    #[serde(default)]
-    pub symbol_drift_violations: Vec<String>,
-    #[serde(default)]
-    pub close: Option<reliability::ClosePayload>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SubmitTaskResponse {
-    task_id: String,
-    state: String,
-    close_payload: reliability::ClosePayload,
-    close: reliability::CloseResult,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,917 +166,6 @@ struct DispatchRunRequest {
     agent_id_prefix: Option<String>,
     #[serde(default)]
     lease_ttl_sec: Option<i64>,
-}
-
-#[derive(Debug)]
-struct RpcReliabilityState {
-    enabled: bool,
-    enforcement_mode: ReliabilityEnforcementMode,
-    require_evidence_for_close: bool,
-    default_max_attempts: u8,
-    verify_timeout_sec_default: u32,
-    max_touched_files: u16,
-    allow_open_ended_defer: bool,
-    tasks: HashMap<String, reliability::TaskNode>,
-    evidence_by_task: HashMap<String, Vec<reliability::EvidenceRecord>>,
-    latest_digest_by_task: HashMap<String, reliability::StateDigest>,
-    edges: Vec<reliability::ReliabilityEdge>,
-    symbol_drift_required_by_task: HashMap<String, bool>,
-    parent_goal_trace_by_task: HashMap<String, String>,
-    leases: reliability::LeaseManager,
-    artifacts: reliability::FsArtifactStore,
-}
-
-impl RpcReliabilityState {
-    fn new(config: &Config) -> Result<Self> {
-        Self::new_with_lease_provider(config, None)
-    }
-
-    fn new_with_lease_provider(
-        config: &Config,
-        external_provider: Option<Arc<dyn reliability::LeaseProvider>>,
-    ) -> Result<Self> {
-        let artifacts_root = Config::global_dir().join("reliability").join("artifacts");
-        let artifacts = reliability::FsArtifactStore::new(artifacts_root)
-            .map_err(|err| Error::session(format!("artifact store init failed: {err}")))?;
-        let mut leases = reliability::LeaseManager::default();
-        match config.reliability_lease_provider().unwrap_or("local") {
-            "local" => {}
-            "external" => {
-                leases.set_external_provider(Arc::new(
-                    reliability::InMemoryExternalLeaseProvider::default(),
-                ));
-            }
-            other => {
-                return Err(Error::validation(format!(
-                    "unsupported reliability lease provider `{other}` (supported: local, external)"
-                )));
-            }
-        }
-        if let Some(provider) = external_provider {
-            leases.set_external_provider(provider);
-        }
-
-        Ok(Self {
-            enabled: config.reliability_enabled(),
-            enforcement_mode: config.reliability_enforcement_mode(),
-            require_evidence_for_close: config.reliability_require_evidence_for_close(),
-            default_max_attempts: config.reliability_default_max_attempts(),
-            verify_timeout_sec_default: config.reliability_verify_timeout_sec_default(),
-            max_touched_files: config.reliability_max_touched_files(),
-            allow_open_ended_defer: config.reliability_allow_open_ended_defer(),
-            tasks: HashMap::new(),
-            evidence_by_task: HashMap::new(),
-            latest_digest_by_task: HashMap::new(),
-            edges: Vec::new(),
-            symbol_drift_required_by_task: HashMap::new(),
-            parent_goal_trace_by_task: HashMap::new(),
-            leases,
-            artifacts,
-        })
-    }
-
-    #[cfg(test)]
-    fn set_external_lease_provider(&mut self, provider: Arc<dyn reliability::LeaseProvider>) {
-        self.leases.set_external_provider(provider);
-    }
-
-    const fn mode_blocks(&self) -> bool {
-        matches!(self.enforcement_mode, ReliabilityEnforcementMode::Hard)
-    }
-
-    fn is_synthetic_trace_parent(trace_parent: &str) -> bool {
-        let normalized = trace_parent.trim().to_ascii_lowercase();
-        matches!(
-            normalized.as_str(),
-            "" | "rpc:auto"
-                | "auto"
-                | "default"
-                | "unknown"
-                | "none"
-                | "n/a"
-                | "na"
-                | "todo"
-                | "tbd"
-        )
-    }
-
-    fn validate_close_trace_chain(
-        &self,
-        task_id: &str,
-        close_payload: &reliability::ClosePayload,
-    ) -> Result<()> {
-        let trace_parent = close_payload
-            .trace_parent
-            .as_ref()
-            .map(|trace| trace.trim())
-            .filter(|trace| !trace.is_empty())
-            .ok_or_else(|| {
-                Error::validation("close payload missing parent-goal trace reference")
-            })?;
-
-        if Self::is_synthetic_trace_parent(trace_parent) {
-            return Err(Error::validation(format!(
-                "close trace_parent `{trace_parent}` is synthetic; provide real parent-goal trace ID"
-            )));
-        }
-
-        let expected = self
-            .parent_goal_trace_by_task
-            .get(task_id)
-            .map(|trace| trace.trim())
-            .filter(|trace| !trace.is_empty())
-            .ok_or_else(|| {
-                Error::validation(format!(
-                    "task `{task_id}` missing parent_goal_trace_id in dispatch contract"
-                ))
-            })?;
-
-        if expected != trace_parent {
-            return Err(Error::validation(format!(
-                "trace chain mismatch: task `{task_id}` expects parent-goal trace `{expected}`, got `{trace_parent}`"
-            )));
-        }
-
-        Ok(())
-    }
-
-    fn ensure_enabled(&self) -> Result<()> {
-        if self.enabled {
-            Ok(())
-        } else {
-            Err(Error::validation("Reliability is disabled in config"))
-        }
-    }
-
-    const fn state_label(state: &reliability::RuntimeState) -> &'static str {
-        match state {
-            reliability::RuntimeState::Blocked { .. } => "blocked",
-            reliability::RuntimeState::Ready => "ready",
-            reliability::RuntimeState::Leased { .. } => "leased",
-            reliability::RuntimeState::Verifying { .. } => "verifying",
-            reliability::RuntimeState::Recoverable { .. } => "recoverable",
-            reliability::RuntimeState::AwaitingHuman { .. } => "awaiting_human",
-            reliability::RuntimeState::Terminal(_) => "terminal",
-        }
-    }
-
-    fn get_or_create_task(
-        &mut self,
-        contract: &TaskContract,
-    ) -> Result<&mut reliability::TaskNode> {
-        let verify_command = if contract.verify_command.trim().is_empty() {
-            "cargo test".to_string()
-        } else {
-            contract.verify_command.clone()
-        };
-        let spec = reliability::TaskSpec {
-            objective: contract.objective.clone(),
-            constraints: reliability::TaskConstraintSet {
-                invariants: contract.invariants.clone(),
-                max_touched_files: contract.max_touched_files.or(Some(self.max_touched_files)),
-                forbid_paths: contract.forbid_paths.clone(),
-                network_access: reliability::NetworkPolicy::Offline,
-            },
-            verify: reliability::VerifyPlan::Standard {
-                audit_diff: true,
-                command: verify_command,
-                timeout_sec: contract
-                    .verify_timeout_sec
-                    .unwrap_or(self.verify_timeout_sec_default),
-            },
-            max_attempts: contract.max_attempts.unwrap_or(self.default_max_attempts),
-            input_snapshot: contract
-                .input_snapshot
-                .clone()
-                .unwrap_or_else(|| "rpc-dispatch".to_string()),
-            acceptance_ids: contract.acceptance_ids.clone(),
-            planned_touches: contract.planned_touches.clone(),
-        };
-        spec.validate()
-            .map_err(|err| Error::validation(err.to_string()))?;
-
-        let entry = self
-            .tasks
-            .entry(contract.task_id.clone())
-            .or_insert_with(|| reliability::TaskNode::new(contract.task_id.clone(), spec.clone()));
-        entry.spec = spec;
-        self.symbol_drift_required_by_task.insert(
-            contract.task_id.clone(),
-            contract.enforce_symbol_drift_check,
-        );
-        if let Some(parent_trace) = contract
-            .parent_goal_trace_id
-            .as_ref()
-            .map(|trace| trace.trim())
-            .filter(|trace| !trace.is_empty())
-        {
-            self.parent_goal_trace_by_task
-                .insert(contract.task_id.clone(), parent_trace.to_string());
-        } else {
-            self.parent_goal_trace_by_task.remove(&contract.task_id);
-        }
-        Ok(entry)
-    }
-
-    fn trigger_satisfied(
-        trigger: &reliability::EdgeTrigger,
-        terminal: &reliability::TerminalState,
-    ) -> bool {
-        match trigger {
-            reliability::EdgeTrigger::Always => true,
-            reliability::EdgeTrigger::OnSuccess => {
-                matches!(terminal, reliability::TerminalState::Succeeded { .. })
-            }
-            reliability::EdgeTrigger::OnFailure(mask) => match terminal {
-                reliability::TerminalState::Failed { class, .. } => mask.matches(*class),
-                _ => false,
-            },
-        }
-    }
-
-    fn trigger_key(trigger: &reliability::EdgeTrigger) -> String {
-        match trigger {
-            reliability::EdgeTrigger::OnSuccess => "on_success".to_string(),
-            reliability::EdgeTrigger::Always => "always".to_string(),
-            reliability::EdgeTrigger::OnFailure(mask) => {
-                let mut classes: Vec<String> = mask
-                    .classes
-                    .iter()
-                    .map(|class| format!("{class:?}"))
-                    .collect();
-                classes.sort();
-                format!("on_failure:{}", classes.join("|"))
-            }
-        }
-    }
-
-    fn reconcile_prerequisites(&mut self, contract: &TaskContract) -> Result<()> {
-        let previous_edges = self.edges.clone();
-        self.edges.retain(|edge| {
-            !(edge.to == contract.task_id
-                && matches!(edge.kind, reliability::EdgeKind::Prerequisite { .. }))
-        });
-
-        let mut dedupe = HashSet::new();
-        for prerequisite in &contract.prerequisites {
-            let from = prerequisite.task_id.trim();
-            if from.is_empty() {
-                continue;
-            }
-            let key = format!(
-                "{}->{}:{}",
-                from,
-                contract.task_id,
-                Self::trigger_key(&prerequisite.trigger)
-            );
-            if !dedupe.insert(key.clone()) {
-                continue;
-            }
-            self.edges.push(reliability::ReliabilityEdge {
-                id: format!("rpc_edge:{key}"),
-                from: from.to_string(),
-                to: contract.task_id.clone(),
-                kind: reliability::EdgeKind::Prerequisite {
-                    trigger: prerequisite.trigger.clone(),
-                },
-            });
-        }
-        self.edges.sort_by(|left, right| left.id.cmp(&right.id));
-
-        if reliability::DagEvaluator::detect_cycle(&self.edges) {
-            self.edges = previous_edges;
-            return Err(Error::validation(format!(
-                "reliability DAG cycle detected while integrating prerequisites for {}",
-                contract.task_id
-            )));
-        }
-
-        Ok(())
-    }
-
-    fn waiting_on_for_task(&self, task_id: &str) -> Vec<String> {
-        let terminal_states: HashMap<String, reliability::TerminalState> = self
-            .tasks
-            .iter()
-            .filter_map(|(id, task)| match &task.runtime.state {
-                reliability::RuntimeState::Terminal(terminal) => {
-                    Some((id.clone(), terminal.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let mut waiting_on = Vec::new();
-        for edge in &self.edges {
-            if edge.to != task_id {
-                continue;
-            }
-            let reliability::EdgeKind::Prerequisite { trigger } = &edge.kind else {
-                continue;
-            };
-            match terminal_states.get(&edge.from) {
-                Some(terminal) if Self::trigger_satisfied(trigger, terminal) => {}
-                _ => waiting_on.push(edge.from.clone()),
-            }
-        }
-        waiting_on.sort();
-        waiting_on.dedup();
-        waiting_on
-    }
-
-    fn project_waiting_on_for_task(&mut self, task_id: &str) -> Vec<String> {
-        let waiting_on = self.waiting_on_for_task(task_id);
-        let Some(task) = self.tasks.get_mut(task_id) else {
-            return waiting_on;
-        };
-
-        match (&task.runtime.state, waiting_on.is_empty()) {
-            (
-                reliability::RuntimeState::Ready | reliability::RuntimeState::Blocked { .. },
-                false,
-            ) => {
-                task.runtime.state = reliability::RuntimeState::Blocked {
-                    waiting_on: waiting_on.clone(),
-                };
-            }
-            (reliability::RuntimeState::Blocked { .. }, true) => {
-                if reliability::apply_transition(
-                    &mut task.runtime,
-                    &reliability::TransitionEvent::DependenciesMet,
-                    task.spec.max_attempts,
-                )
-                .is_err()
-                {
-                    task.runtime.state = reliability::RuntimeState::Ready;
-                }
-            }
-            _ => {}
-        }
-
-        waiting_on
-    }
-
-    fn evaluate_dag_unblock(&mut self) -> reliability::DagEvaluation {
-        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
-        ordered_ids.sort();
-        let mut task_snapshot = ordered_ids
-            .iter()
-            .filter_map(|task_id| self.tasks.get(task_id).cloned())
-            .collect::<Vec<_>>();
-
-        let evaluation =
-            reliability::DagEvaluator::evaluate_and_unblock(&mut task_snapshot, &self.edges);
-        for node in task_snapshot {
-            if let Some(task) = self.tasks.get_mut(&node.id) {
-                task.runtime = node.runtime;
-            }
-        }
-        evaluation
-    }
-
-    fn promote_recoverable_due(&mut self) -> Vec<reliability::RecoveryAction> {
-        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
-        ordered_ids.sort();
-        let mut task_snapshot = ordered_ids
-            .iter()
-            .filter_map(|task_id| self.tasks.get(task_id).cloned())
-            .collect::<Vec<_>>();
-
-        let promoted = reliability::RecoveryManager::promote_recoverable(&mut task_snapshot);
-        for node in task_snapshot {
-            if let Some(task) = self.tasks.get_mut(&node.id) {
-                task.runtime = node.runtime;
-            }
-        }
-        promoted
-    }
-
-    fn refresh_dependency_states(&mut self) {
-        self.promote_recoverable_due();
-        self.evaluate_dag_unblock();
-
-        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
-        ordered_ids.sort();
-        for task_id in ordered_ids {
-            self.project_waiting_on_for_task(&task_id);
-        }
-    }
-
-    fn request_dispatch(
-        &mut self,
-        contract: &TaskContract,
-        agent_id: &str,
-        ttl_seconds: i64,
-    ) -> Result<DispatchGrant> {
-        self.ensure_enabled()?;
-        let task_id = contract.task_id.clone();
-        self.get_or_create_task(contract)?;
-        self.reconcile_prerequisites(contract)?;
-        self.refresh_dependency_states();
-        self.request_dispatch_existing(&task_id, agent_id, ttl_seconds)
-    }
-
-    fn request_dispatch_existing(
-        &mut self,
-        task_id: &str,
-        agent_id: &str,
-        ttl_seconds: i64,
-    ) -> Result<DispatchGrant> {
-        self.ensure_enabled()?;
-        let waiting_on = self.project_waiting_on_for_task(task_id);
-        if !waiting_on.is_empty() {
-            return Err(Error::validation(format!(
-                "task {task_id} is blocked by prerequisites: {}",
-                waiting_on.join(", ")
-            )));
-        }
-        if let Some(task) = self.tasks.get(task_id) {
-            if let reliability::RuntimeState::Recoverable { retry_after, .. } = &task.runtime.state
-            {
-                let retry_note = retry_after
-                    .map(|ts| format!("retry after {}", ts.to_rfc3339()))
-                    .unwrap_or_else(|| "retry window not yet promoted".to_string());
-                return Err(Error::validation(format!(
-                    "task {task_id} is recoverable and not ready to dispatch ({retry_note})"
-                )));
-            }
-        }
-
-        let grant = self
-            .leases
-            .issue_lease(task_id, agent_id, ttl_seconds)
-            .map_err(|err| Error::validation(err.to_string()))?;
-
-        let event = reliability::TransitionEvent::Dispatch {
-            lease_id: grant.lease_id.clone(),
-            agent_id: grant.agent_id.clone(),
-            fence_token: grant.fence_token,
-            expires_at: grant.expires_at,
-        };
-
-        let mode_blocks = self.mode_blocks();
-        let (task_id, state) = {
-            let Some(task) = self.tasks.get_mut(task_id) else {
-                return Err(Error::validation("task disappeared during dispatch"));
-            };
-
-            if let Err(err) =
-                reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
-            {
-                let _ = self.leases.expire_lease(&grant.lease_id);
-                if mode_blocks {
-                    return Err(Error::validation(format!(
-                        "dispatch transition rejected: {err}"
-                    )));
-                }
-                task.runtime.state = reliability::RuntimeState::Ready;
-                reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
-                    .map_err(|inner| {
-                        Error::validation(format!("dispatch transition recovery failed: {inner}"))
-                    })?;
-            }
-            (
-                task.id.clone(),
-                Self::state_label(&task.runtime.state).to_string(),
-            )
-        };
-
-        Ok(DispatchGrant {
-            task_id,
-            agent_id: grant.agent_id,
-            lease_id: grant.lease_id,
-            fence_token: grant.fence_token,
-            expires_at: grant.expires_at,
-            state,
-        })
-    }
-
-    fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
-        self.ensure_enabled()?;
-        let _ = self.leases.expire_lease(&grant.lease_id);
-        let Some(task) = self.tasks.get_mut(&grant.task_id) else {
-            return Ok(());
-        };
-
-        if matches!(task.runtime.state, reliability::RuntimeState::Leased { .. }) {
-            reliability::apply_transition(
-                &mut task.runtime,
-                &reliability::TransitionEvent::ExpireLease,
-                task.spec.max_attempts,
-            )
-            .map_err(|err| Error::validation(format!("dispatch rollback failed: {err}")))?;
-        }
-        Ok(())
-    }
-
-    fn append_evidence(
-        &mut self,
-        req: AppendEvidenceRequest,
-    ) -> Result<reliability::EvidenceRecord> {
-        self.ensure_enabled()?;
-
-        let mut artifact_ids = req.artifact_ids;
-        if !req.stdout.is_empty() {
-            let id = self
-                .artifacts
-                .put_text(&req.task_id, "stdout", &req.stdout)
-                .map_err(|err| Error::session(format!("store stdout artifact failed: {err}")))?;
-            artifact_ids.push(id);
-        }
-        if !req.stderr.is_empty() {
-            let id = self
-                .artifacts
-                .put_text(&req.task_id, "stderr", &req.stderr)
-                .map_err(|err| Error::session(format!("store stderr artifact failed: {err}")))?;
-            artifact_ids.push(id);
-        }
-
-        let evidence = reliability::EvidenceRecord::from_command_output_with_env(
-            req.task_id.clone(),
-            req.command,
-            req.exit_code,
-            &req.stdout,
-            &req.stderr,
-            artifact_ids,
-            req.env_id,
-        );
-        self.evidence_by_task
-            .entry(req.task_id)
-            .or_default()
-            .push(evidence.clone());
-        Ok(evidence)
-    }
-
-    fn submit_task(&mut self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse> {
-        self.ensure_enabled()?;
-        let SubmitTaskRequest {
-            task_id,
-            lease_id,
-            fence_token,
-            patch_digest,
-            verify_run_id,
-            verify_passed,
-            verify_timed_out,
-            failure_class,
-            changed_files,
-            symbol_drift_violations,
-            close,
-        } = req;
-
-        let evidence = self
-            .evidence_by_task
-            .get(&task_id)
-            .cloned()
-            .unwrap_or_default();
-        let has_pass = evidence.iter().any(reliability::EvidenceRecord::is_success);
-        let verify_passed = verify_passed.unwrap_or(has_pass);
-        let mode_blocks = self.mode_blocks();
-        let lease_id_for_release = lease_id.clone();
-
-        if verify_passed && self.require_evidence_for_close {
-            let verify_evidence = reliability::Verifier::ensure_evidence(&evidence, 1)
-                .map_err(|err| Error::validation(err.to_string()))?;
-            if mode_blocks && !verify_evidence.ok {
-                return Err(Error::validation(verify_evidence.violations.join("; ")));
-            }
-        }
-
-        let mut verifier_policy_violations = Vec::new();
-        {
-            let Some(task) = self.tasks.get(&task_id) else {
-                return Err(Error::validation(format!(
-                    "Unknown reliability task: {task_id}"
-                )));
-            };
-
-            let scope_result = reliability::Verifier::audit_scope_with_constraints(
-                &changed_files,
-                &task.spec.constraints,
-            )
-            .map_err(|err| Error::validation(err.to_string()))?;
-            if !scope_result.ok {
-                verifier_policy_violations.extend(scope_result.violations);
-            }
-
-            if verify_timed_out {
-                verifier_policy_violations.push(format!(
-                    "verification timed out (configured timeout={}s)",
-                    match &task.spec.verify {
-                        reliability::VerifyPlan::Standard { timeout_sec, .. } => timeout_sec,
-                    }
-                ));
-            }
-
-            if self
-                .symbol_drift_required_by_task
-                .get(&task_id)
-                .copied()
-                .unwrap_or(false)
-                && !symbol_drift_violations.is_empty()
-            {
-                verifier_policy_violations.push(format!(
-                    "symbol/API drift detected: {}",
-                    symbol_drift_violations.join("; ")
-                ));
-            }
-        }
-        if mode_blocks && !verifier_policy_violations.is_empty() {
-            return Err(Error::validation(verifier_policy_violations.join("; ")));
-        }
-
-        let mut state = {
-            let Some(task) = self.tasks.get_mut(&task_id) else {
-                return Err(Error::validation(format!(
-                    "Unknown reliability task: {task_id}"
-                )));
-            };
-            reliability::apply_transition(
-                &mut task.runtime,
-                &reliability::TransitionEvent::Submit {
-                    lease_id,
-                    fence_token,
-                    patch_digest: patch_digest.clone(),
-                    verify_run_id: verify_run_id.clone(),
-                },
-                task.spec.max_attempts,
-            )
-            .map_err(|err| Error::validation(format!("submit transition rejected: {err}")))?;
-
-            if verify_passed {
-                reliability::apply_transition(
-                    &mut task.runtime,
-                    &reliability::TransitionEvent::VerifySuccess {
-                        verify_run_id,
-                        patch_digest,
-                    },
-                    task.spec.max_attempts,
-                )
-                .map_err(|err| {
-                    Error::validation(format!("verify success transition rejected: {err}"))
-                })?;
-            } else {
-                reliability::apply_transition(
-                    &mut task.runtime,
-                    &reliability::TransitionEvent::VerifyFail {
-                        class: failure_class
-                            .unwrap_or(reliability::FailureClass::VerificationFailed),
-                        verify_run_id: Some(verify_run_id),
-                        failure_artifact: None,
-                        handoff_summary: "Verification failed during RPC submit_task".to_string(),
-                    },
-                    task.spec.max_attempts,
-                )
-                .map_err(|err| {
-                    Error::validation(format!("verify fail transition rejected: {err}"))
-                })?;
-            }
-
-            if !self.allow_open_ended_defer
-                && matches!(
-                    task.runtime.state,
-                    reliability::RuntimeState::Recoverable { .. }
-                )
-            {
-                reliability::RecoveryManager::set_retry_after(task, 60);
-            }
-
-            Self::state_label(&task.runtime.state).to_string()
-        };
-        let _ = self.leases.expire_lease(&lease_id_for_release);
-        self.refresh_dependency_states();
-        if let Some(task) = self.tasks.get(&task_id) {
-            state = Self::state_label(&task.runtime.state).to_string();
-        }
-
-        let strict_close_trace_chain = mode_blocks && (verify_passed || close.is_some());
-        let mut close_payload = close.unwrap_or_else(|| reliability::ClosePayload {
-            task_id: task_id.clone(),
-            outcome: "submitted via rpc".to_string(),
-            outcome_kind: Some(reliability::CloseOutcomeKind::Success),
-            acceptance_ids: if strict_close_trace_chain {
-                Vec::new()
-            } else {
-                vec!["rpc:auto".to_string()]
-            },
-            evidence_ids: Vec::new(),
-            trace_parent: if strict_close_trace_chain {
-                None
-            } else {
-                Some("rpc:auto".to_string())
-            },
-        });
-        if close_payload.task_id.trim().is_empty() {
-            close_payload.task_id.clone_from(&task_id);
-        }
-        if close_payload
-            .trace_parent
-            .as_ref()
-            .is_none_or(|trace| trace.trim().is_empty())
-            && !strict_close_trace_chain
-        {
-            close_payload.trace_parent = Some("rpc:auto".to_string());
-        }
-        if close_payload.acceptance_ids.is_empty() && !strict_close_trace_chain {
-            close_payload.acceptance_ids = vec!["rpc:auto".to_string()];
-        }
-        if close_payload.evidence_ids.is_empty() {
-            close_payload.evidence_ids =
-                evidence.iter().map(|rec| rec.evidence_id.clone()).collect();
-        }
-        if strict_close_trace_chain {
-            self.validate_close_trace_chain(&task_id, &close_payload)?;
-        }
-
-        let mapping = reliability::Verifier::ensure_acceptance_mapped(
-            &close_payload.acceptance_ids,
-            &close_payload.evidence_ids,
-        );
-        if mode_blocks && !mapping.ok {
-            return Err(Error::validation(mapping.violations.join("; ")));
-        }
-
-        let mut close = reliability::CloseResult::evaluate(
-            &close_payload,
-            &evidence,
-            self.require_evidence_for_close,
-        )
-        .map_err(|err| Error::validation(err.to_string()))?;
-        if !mapping.ok {
-            close.approved = false;
-            close.violations.extend(mapping.violations);
-        }
-        if !verifier_policy_violations.is_empty() {
-            close.approved = false;
-            close.violations.extend(verifier_policy_violations);
-        }
-
-        if mode_blocks {
-            close
-                .ensure_approved()
-                .map_err(|err| Error::validation(err.to_string()))?;
-        }
-
-        Ok(SubmitTaskResponse {
-            task_id,
-            state,
-            close_payload,
-            close,
-        })
-    }
-
-    fn resolve_blocker(&mut self, report: BlockerReport) -> Result<String> {
-        self.ensure_enabled()?;
-        let is_defer = report.reason.trim().eq_ignore_ascii_case("defer");
-        let report_reason = report.reason.clone();
-        let report_context = report.context.clone();
-        let lease_id_for_release = report.lease_id.clone();
-        if !report.resolved
-            && is_defer
-            && !self.allow_open_ended_defer
-            && report.defer_trigger.is_none()
-        {
-            return Err(Error::validation(
-                "Open-ended defer blocker is disabled by reliability policy; provide defer_trigger Until or DependsOn",
-            ));
-        }
-
-        {
-            let Some(task) = self.tasks.get_mut(&report.task_id) else {
-                return Err(Error::validation(format!(
-                    "Unknown reliability task: {}",
-                    report.task_id
-                )));
-            };
-
-            let event = if report.resolved {
-                reliability::TransitionEvent::HumanResolve
-            } else {
-                reliability::TransitionEvent::ReportBlocker {
-                    lease_id: report.lease_id,
-                    fence_token: report.fence_token,
-                    reason: report_reason,
-                    context: report_context.clone(),
-                }
-            };
-            reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
-                .map_err(|err| {
-                    Error::validation(format!("resolve blocker transition rejected: {err}"))
-                })?;
-
-            if !report.resolved && is_defer {
-                if let Some(trigger) = &report.defer_trigger {
-                    match trigger {
-                        reliability::DeferTrigger::Until { until } => {
-                            task.runtime.state = reliability::RuntimeState::Recoverable {
-                                reason: reliability::FailureClass::HumanBlocker,
-                                failure_artifact: None,
-                                handoff_summary: report_context,
-                                retry_after: Some(*until),
-                            };
-                        }
-                        reliability::DeferTrigger::DependsOn { task_id } => {
-                            task.runtime.state = reliability::RuntimeState::Blocked {
-                                waiting_on: vec![task_id.clone()],
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
-        if !report.resolved {
-            let _ = self.leases.expire_lease(&lease_id_for_release);
-        }
-
-        self.refresh_dependency_states();
-        let Some(task) = self.tasks.get(&report.task_id) else {
-            return Err(Error::validation(format!(
-                "Unknown reliability task: {}",
-                report.task_id
-            )));
-        };
-        Ok(Self::state_label(&task.runtime.state).to_string())
-    }
-
-    fn query_artifact(&self, query: reliability::ArtifactQuery) -> Result<Vec<String>> {
-        self.ensure_enabled()?;
-        self.artifacts
-            .list(&query)
-            .map_err(|err| Error::session(format!("artifact query failed: {err}")))
-    }
-
-    fn load_artifact_text(&self, artifact_id: &str) -> Result<String> {
-        self.ensure_enabled()?;
-        let bytes = self
-            .artifacts
-            .load(artifact_id)
-            .map_err(|err| Error::session(format!("artifact load failed: {err}")))?;
-        Ok(String::from_utf8_lossy(&bytes).to_string())
-    }
-
-    fn first_task_id(&self) -> Option<String> {
-        self.tasks.keys().next().cloned()
-    }
-
-    fn get_state_digest(&mut self, task_id: &str) -> Result<reliability::StateDigest> {
-        self.ensure_enabled()?;
-        self.refresh_dependency_states();
-        let Some(task) = self.tasks.get(task_id) else {
-            return Err(Error::validation(format!(
-                "Unknown reliability task: {task_id}"
-            )));
-        };
-
-        let mut digest = reliability::StateDigest::new(
-            task.spec.objective.clone(),
-            Self::state_label(&task.runtime.state),
-        );
-        digest
-            .recent_actions
-            .push(format!("attempt={}", task.runtime.attempt));
-        digest
-            .recent_actions
-            .push(format!("max_attempts={}", task.spec.max_attempts));
-
-        match &task.runtime.state {
-            reliability::RuntimeState::Blocked { waiting_on } => {
-                digest.blockers.clone_from(waiting_on);
-                digest.next_action = Some("Resolve blockers".to_string());
-            }
-            reliability::RuntimeState::AwaitingHuman { question, .. } => {
-                digest.blockers.push(question.clone());
-                digest.next_action = Some("Resolve human blocker".to_string());
-            }
-            reliability::RuntimeState::Recoverable { retry_after, .. } => {
-                digest.next_action = Some(retry_after.as_ref().map_or_else(
-                    || "Promote recoverable task".to_string(),
-                    |ts| format!("Retry after {}", ts.to_rfc3339()),
-                ));
-            }
-            reliability::RuntimeState::Ready => {
-                digest.next_action = Some("Request dispatch".to_string());
-            }
-            reliability::RuntimeState::Leased { .. } => {
-                digest.next_action = Some("Submit task for verification".to_string());
-            }
-            reliability::RuntimeState::Verifying { .. } => {
-                digest.next_action = Some("Finalize verify result".to_string());
-            }
-            reliability::RuntimeState::Terminal(term) => {
-                let terminal = match term {
-                    reliability::TerminalState::Succeeded { .. } => "succeeded",
-                    reliability::TerminalState::Failed { .. } => "failed",
-                    reliability::TerminalState::Superseded { .. } => "superseded",
-                    reliability::TerminalState::Canceled { .. } => "canceled",
-                };
-                digest.next_action = Some(format!("Terminal: {terminal}"));
-            }
-        }
-
-        self.latest_digest_by_task
-            .insert(task_id.to_string(), digest.clone());
-        Ok(digest)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1294,227 +290,6 @@ async fn persist_runtime_output(
 ) -> Result<()> {
     runtime_store.append_events(&output.events)?;
     persist_runtime_snapshot(cx, session, runtime_store, &output.snapshot).await
-}
-
-const fn runtime_task_state_label(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Draft | TaskState::Blocked => "blocked",
-        TaskState::Ready => "ready",
-        TaskState::Leased | TaskState::Executing => "leased",
-        TaskState::Verifying => "verifying",
-        TaskState::AwaitingHuman => "awaiting_human",
-        TaskState::Recoverable => "recoverable",
-        TaskState::Succeeded | TaskState::Failed | TaskState::Canceled | TaskState::Superseded => {
-            "terminal"
-        }
-    }
-}
-
-fn sync_runtime_task_from_reliability(
-    runtime_task: &mut TaskNode,
-    reliability_task: &reliability::TaskNode,
-) {
-    runtime_task
-        .spec
-        .objective
-        .clone_from(&reliability_task.spec.objective);
-    runtime_task.spec.planned_touches = reliability_task
-        .spec
-        .planned_touches
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    runtime_task.spec.input_snapshot = Some(reliability_task.spec.input_snapshot.clone());
-    runtime_task.spec.max_attempts = reliability_task.spec.max_attempts;
-    runtime_task
-        .spec
-        .constraints
-        .invariants
-        .clone_from(&reliability_task.spec.constraints.invariants);
-    runtime_task.spec.constraints.max_touched_files =
-        reliability_task.spec.constraints.max_touched_files;
-    runtime_task
-        .spec
-        .constraints
-        .forbid_paths
-        .clone_from(&reliability_task.spec.constraints.forbid_paths);
-    let reliability::VerifyPlan::Standard {
-        command,
-        timeout_sec,
-        ..
-    } = &reliability_task.spec.verify;
-    runtime_task.spec.verify.command.clone_from(command);
-    runtime_task.spec.verify.timeout_sec = *timeout_sec;
-    runtime_task
-        .spec
-        .verify
-        .acceptance_ids
-        .clone_from(&reliability_task.spec.acceptance_ids);
-    runtime_task.runtime.attempt = reliability_task.runtime.attempt;
-    runtime_task.runtime.continuation_reason = None;
-    runtime_task.runtime.last_error = None;
-
-    match &reliability_task.runtime.state {
-        reliability::RuntimeState::Blocked { .. } => {
-            runtime_task.runtime.state = TaskState::Blocked;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-        }
-        reliability::RuntimeState::Ready => {
-            runtime_task.runtime.state = TaskState::Ready;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-        }
-        reliability::RuntimeState::Leased {
-            lease_id,
-            agent_id,
-            fence_token,
-            expires_at,
-        } => {
-            runtime_task.runtime.state = TaskState::Leased;
-            runtime_task.runtime.lease = Some(LeaseRecord {
-                lease_id: lease_id.clone(),
-                owner: agent_id.clone(),
-                fence_token: *fence_token,
-                expires_at: *expires_at,
-            });
-            runtime_task.runtime.retry_at = None;
-        }
-        reliability::RuntimeState::Verifying { .. } => {
-            runtime_task.runtime.state = TaskState::Verifying;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-        }
-        reliability::RuntimeState::Recoverable {
-            reason,
-            handoff_summary,
-            retry_after,
-            ..
-        } => {
-            runtime_task.runtime.state = TaskState::Recoverable;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = *retry_after;
-            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
-                code: failure_class_label(*reason).to_string(),
-                message: handoff_summary.clone(),
-                retry_at: *retry_after,
-            });
-        }
-        reliability::RuntimeState::AwaitingHuman {
-            question, context, ..
-        } => {
-            runtime_task.runtime.state = TaskState::AwaitingHuman;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
-                code: failure_class_label(reliability::FailureClass::HumanBlocker).to_string(),
-                message: format!("{question}: {context}"),
-                retry_at: None,
-            });
-        }
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded { .. }) => {
-            runtime_task.runtime.state = TaskState::Succeeded;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-        }
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Failed {
-            class,
-            failed_at,
-            ..
-        }) => {
-            runtime_task.runtime.state = TaskState::Failed;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
-                code: failure_class_label(*class).to_string(),
-                message: format!("task failed at {}", failed_at.to_rfc3339()),
-                retry_at: None,
-            });
-        }
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Superseded { .. }) => {
-            runtime_task.runtime.state = TaskState::Superseded;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-        }
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Canceled {
-            reason,
-            ..
-        }) => {
-            runtime_task.runtime.state = TaskState::Canceled;
-            runtime_task.runtime.lease = None;
-            runtime_task.runtime.retry_at = None;
-            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
-                code: "canceled".to_string(),
-                message: reason.clone(),
-                retry_at: None,
-            });
-        }
-    }
-}
-
-fn sync_runtime_snapshot_from_reliability(
-    reliability: &RpcReliabilityState,
-    snapshot: &mut RunSnapshot,
-) {
-    for (task_id, runtime_task) in &mut snapshot.tasks {
-        let Some(reliability_task) = reliability.tasks.get(task_id) else {
-            continue;
-        };
-        sync_runtime_task_from_reliability(runtime_task, reliability_task);
-    }
-    recompute_runtime_task_counts(snapshot);
-    scheduler::rebuild_ready_queue(snapshot);
-}
-
-fn apply_runtime_scheduler_lifecycle(snapshot: &mut RunSnapshot) {
-    let mut next_action = None;
-    snapshot.wake_at = None;
-
-    for event in scheduler::phase_and_wake_events(snapshot, Utc::now()) {
-        match event {
-            crate::runtime::events::RuntimeEventKind::PhaseChanged { phase, summary } => {
-                snapshot.phase = phase;
-                if next_action.is_none() {
-                    next_action = summary;
-                }
-            }
-            crate::runtime::events::RuntimeEventKind::WakeScheduled { wake_at, reason } => {
-                snapshot.wake_at = Some(wake_at);
-                if next_action.is_none() {
-                    next_action = Some(reason);
-                }
-            }
-            crate::runtime::events::RuntimeEventKind::RunCompleted => {
-                snapshot.phase = RunPhase::Completed;
-                next_action = Some("run completed".to_string());
-            }
-            crate::runtime::events::RuntimeEventKind::RunFailed { reason } => {
-                snapshot.phase = RunPhase::Failed;
-                next_action = Some(reason);
-            }
-            crate::runtime::events::RuntimeEventKind::RunCanceled { reason } => {
-                snapshot.phase = RunPhase::Canceled;
-                next_action = Some(reason);
-            }
-            _ => {}
-        }
-    }
-
-    snapshot.summary.next_action = next_action;
-}
-
-const fn run_requires_plan_acceptance(snapshot: &RunSnapshot) -> bool {
-    snapshot.plan_required && !snapshot.plan_accepted
-}
-
-fn recompute_runtime_task_counts(snapshot: &mut RunSnapshot) {
-    let mut task_counts = BTreeMap::new();
-    for task in snapshot.tasks.values() {
-        *task_counts
-            .entry(runtime_task_state_label(task.runtime.state).to_string())
-            .or_insert(0) += 1;
-    }
-    snapshot.summary.task_counts = task_counts;
 }
 
 fn runtime_model_selector(
@@ -1680,94 +455,25 @@ fn runtime_provider_model_entry(provider: &str, model_id: &str) -> Option<ModelE
     })
 }
 
-fn runtime_plan_digest(req: &StartRunRequest) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(req.objective.as_bytes());
-    hasher.update(req.run_verify_command.as_bytes());
-    for task in &req.tasks {
-        hasher.update(task.task_id.as_bytes());
-        hasher.update(task.objective.as_bytes());
-        hasher.update(task.verify_command.as_bytes());
-        for prereq in &task.prerequisites {
-            hasher.update(prereq.task_id.as_bytes());
-        }
+fn runtime_start_run_request(req: &StartRunRequest) -> RuntimeStartRunRequest {
+    RuntimeStartRunRequest {
+        objective: req.objective.clone(),
+        tasks: req.tasks.clone(),
+        run_verify_command: req.run_verify_command.clone(),
+        run_verify_timeout_sec: req.run_verify_timeout_sec,
+        max_parallelism: req.max_parallelism,
     }
-    format!("{:x}", hasher.finalize())
 }
 
 fn build_runtime_plan_artifact(run_id: &str, req: &StartRunRequest) -> PlanArtifact {
-    let mut test_strategy = BTreeSet::new();
-    test_strategy.insert(req.run_verify_command.clone());
-    for task in &req.tasks {
-        if !task.verify_command.trim().is_empty() {
-            test_strategy.insert(task.verify_command.clone());
-        }
-    }
-
-    PlanArtifact {
-        plan_id: format!("{run_id}-plan"),
-        digest: runtime_plan_digest(req),
-        objective: req.objective.clone(),
-        task_drafts: req
-            .tasks
-            .iter()
-            .map(|task| format!("{}: {}", task.task_id, task.objective))
-            .collect(),
-        touched_paths: req
-            .tasks
-            .iter()
-            .flat_map(|task| task.planned_touches.iter().map(PathBuf::from))
-            .collect(),
-        test_strategy: test_strategy.into_iter().collect(),
-        evidence_refs: Vec::new(),
-        produced_at: Utc::now(),
-    }
+    service_build_runtime_plan_artifact(run_id, &runtime_start_run_request(req))
 }
 
 fn build_runtime_task_nodes(
     req: &StartRunRequest,
     default_verify_timeout_sec: u32,
 ) -> Vec<TaskNode> {
-    req.tasks
-        .iter()
-        .map(|task| {
-            let verify_command = if task.verify_command.trim().is_empty() {
-                req.run_verify_command.clone()
-            } else {
-                task.verify_command.clone()
-            };
-            let verify_timeout_sec = task
-                .verify_timeout_sec
-                .unwrap_or(default_verify_timeout_sec);
-            let mut node = TaskNode::new(TaskSpec {
-                task_id: task.task_id.clone(),
-                title: task.task_id.clone(),
-                objective: task.objective.clone(),
-                parent_goal_trace_id: task.parent_goal_trace_id.clone(),
-                planned_touches: task.planned_touches.iter().map(PathBuf::from).collect(),
-                input_snapshot: task.input_snapshot.clone(),
-                max_attempts: task.max_attempts.unwrap_or(1),
-                enforce_symbol_drift_check: task.enforce_symbol_drift_check,
-                verify: VerifySpec {
-                    command: verify_command,
-                    timeout_sec: verify_timeout_sec,
-                    acceptance_ids: task.acceptance_ids.clone(),
-                },
-                autonomy: AutonomyLevel::Guarded,
-                constraints: TaskConstraints {
-                    invariants: task.invariants.clone(),
-                    max_touched_files: task.max_touched_files,
-                    forbid_paths: task.forbid_paths.clone(),
-                },
-            });
-            node.deps = task
-                .prerequisites
-                .iter()
-                .map(|prereq| prereq.task_id.clone())
-                .collect();
-            node
-        })
-        .collect()
+    service_build_runtime_task_nodes(&runtime_start_run_request(req), default_verify_timeout_sec)
 }
 
 async fn bootstrap_runtime_run(
@@ -1778,37 +484,13 @@ async fn bootstrap_runtime_run(
     req: &StartRunRequest,
 ) -> Result<RuntimeControllerOutput> {
     let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
-    let selected_tier = select_execution_tier(&req.tasks);
-    let run_verify_timeout_sec = req
-        .run_verify_timeout_sec
-        .unwrap_or(options.config.reliability_verify_timeout_sec_default());
-    let spec = RunSpec {
-        run_id: run_id.to_string(),
-        objective: req.objective.clone(),
-        root_workspace: std::env::current_dir().map_err(|err| Error::Io(Box::new(err)))?,
-        policy_profile: "default".to_string(),
-        model_profile: "current_session".to_string(),
-        run_verify_command: Some(req.run_verify_command.clone()),
-        run_verify_timeout_sec: Some(run_verify_timeout_sec),
-        budgets: RunBudgets {
-            max_parallelism: req
-                .max_parallelism
-                .unwrap_or(RunBudgets::default().max_parallelism),
-            max_steps: None,
-            max_cost_microusd: None,
-        },
-        constraints: RunConstraints::default(),
-        created_at: Utc::now(),
-    };
-    let plan = build_runtime_plan_artifact(run_id, req);
-    let tasks = build_runtime_task_nodes(req, run_verify_timeout_sec);
-    let route = ModelRoute::from_profile(&model_profile);
-    let mut controller = RuntimeController::new(PhaseModelRouter::new(route), PolicySet::new());
-    let mut output = controller
-        .handle(RuntimeCommand::BootstrapRun { spec, plan, tasks })
-        .map_err(|err| Error::session(format!("runtime bootstrap failed: {err}")))?;
-    output.snapshot.dispatch.selected_tier = selected_tier;
-    Ok(output)
+    runtime_bootstrap_run(
+        run_id,
+        &runtime_start_run_request(req),
+        model_profile,
+        std::env::current_dir().map_err(|err| Error::Io(Box::new(err)))?,
+        options.config.reliability_verify_timeout_sec_default(),
+    )
 }
 
 async fn accept_runtime_plan(
@@ -1818,18 +500,13 @@ async fn accept_runtime_plan(
     snapshot: RunSnapshot,
 ) -> Result<RuntimeControllerOutput> {
     let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
-    let route = ModelRoute::from_profile(&model_profile);
-    let mut controller =
-        RuntimeController::from_snapshot(snapshot, PhaseModelRouter::new(route), PolicySet::new());
-    controller
-        .handle(RuntimeCommand::AcceptPlan)
-        .map_err(|err| Error::session(format!("plan acceptance failed: {err}")))
+    runtime_accept_plan(snapshot, model_profile)
 }
 
 async fn append_dispatch_grants_session_entries(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     grants: &[DispatchGrant],
 ) -> Result<()> {
     if grants.is_empty() {
@@ -1890,7 +567,7 @@ async fn append_dispatch_grants_session_entries(
 async fn append_canceled_dispatch_grants_session_entries(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     grants: &[DispatchGrant],
 ) -> Result<()> {
     if grants.is_empty() {
@@ -1909,7 +586,7 @@ async fn append_canceled_dispatch_grants_session_entries(
                     (
                         grant.task_id.clone(),
                         grant.state.clone(),
-                        RpcReliabilityState::state_label(&task.runtime.state).to_string(),
+                        RuntimeExecutionState::state_label(&task.runtime.state).to_string(),
                         grant.lease_id.clone(),
                         grant.fence_token,
                     )
@@ -1983,66 +660,11 @@ async fn append_dispatch_rollback_session_entry(
 }
 
 fn ensure_run_id_available(runtime_store: &RuntimeStore, run_id: &str) -> Result<()> {
-    if runtime_store.exists(run_id) {
-        return Err(Error::validation(format!(
-            "orchestration run already exists: {run_id}"
-        )));
-    }
-    Ok(())
-}
-
-fn orchestration_dag_depth(tasks: &[TaskContract]) -> usize {
-    fn visit(
-        task_id: &str,
-        prereqs: &HashMap<String, Vec<String>>,
-        memo: &mut HashMap<String, usize>,
-        visiting: &mut HashSet<String>,
-    ) -> usize {
-        if let Some(depth) = memo.get(task_id) {
-            return *depth;
-        }
-        if !visiting.insert(task_id.to_string()) {
-            return 1;
-        }
-        let depth = prereqs
-            .get(task_id)
-            .into_iter()
-            .flatten()
-            .map(|dep| 1 + visit(dep, prereqs, memo, visiting))
-            .max()
-            .unwrap_or(1);
-        visiting.remove(task_id);
-        memo.insert(task_id.to_string(), depth);
-        depth
-    }
-
-    let prereqs = tasks
-        .iter()
-        .map(|task| {
-            (
-                task.task_id.clone(),
-                task.prerequisites
-                    .iter()
-                    .map(|dep| dep.task_id.clone())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let mut memo = HashMap::new();
-    let mut visiting = HashSet::new();
-    tasks
-        .iter()
-        .map(|task| visit(&task.task_id, &prereqs, &mut memo, &mut visiting))
-        .max()
-        .unwrap_or(0)
+    runtime_ensure_run_id_available(runtime_store, run_id)
 }
 
 fn select_execution_tier(tasks: &[TaskContract]) -> ExecutionTier {
-    match tasks.len() {
-        0 | 1 => ExecutionTier::Inline,
-        2..=24 if orchestration_dag_depth(tasks) <= 4 => ExecutionTier::Wave,
-        _ => ExecutionTier::Hierarchical,
-    }
+    runtime_select_execution_tier(tasks)
 }
 
 const fn failure_class_label(class: reliability::FailureClass) -> &'static str {
@@ -2102,189 +724,13 @@ fn task_report_blockers(state: &reliability::RuntimeState) -> Vec<String> {
     }
 }
 
-fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunSnapshot) -> bool {
-    let task_ids = run.task_ids();
-    !task_ids.is_empty()
-        && task_ids
-            .iter()
-            .all(|task_id| reliability.tasks.contains_key(task_id))
-}
-
-fn refresh_live_run_from_reliability(
-    reliability: &mut RpcReliabilityState,
-    run: &mut RunSnapshot,
-) -> bool {
-    let has_live_tasks = run_has_live_tasks(reliability, run);
-    if has_live_tasks {
-        reliability.refresh_dependency_states();
-        refresh_run_from_reliability(reliability, run);
-    }
-    has_live_tasks
-}
-
-fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunSnapshot) {
-    let preserve_canceled = matches!(run.phase, RunPhase::Canceled);
-    let task_ids = run.task_ids();
-    sync_runtime_snapshot_from_reliability(reliability, run);
-    run.dispatch.selected_tier = scheduler::execution_tier(run);
-    run.dispatch.planned_subruns = scheduler::planned_subruns(run);
-
-    if preserve_canceled || run_requires_plan_acceptance(run) {
-        run.dispatch.active_subrun_id = None;
-        run.dispatch.active_wave = None;
-    } else {
-        let active_scope_task_ids = if scheduler::execution_tier(run) == ExecutionTier::Hierarchical
-        {
-            let active_subrun = run.dispatch.planned_subruns.iter().find(|subrun| {
-                subrun.task_ids.iter().any(|task_id| {
-                    run.tasks
-                        .get(task_id)
-                        .is_some_and(|task| !task.runtime.state.is_terminal())
-                })
-            });
-            run.dispatch.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
-            active_subrun
-                .map(|subrun| subrun.task_ids.clone())
-                .unwrap_or_default()
-        } else {
-            run.dispatch.active_subrun_id = None;
-            task_ids.clone()
-        };
-
-        let mut active_task_ids = active_scope_task_ids
-            .iter()
-            .filter_map(|task_id| {
-                let task = run.tasks.get(task_id)?;
-                matches!(task.runtime.state, TaskState::Leased | TaskState::Verifying)
-                    .then_some(task_id.clone())
-            })
-            .collect::<Vec<_>>();
-        if active_task_ids.is_empty() {
-            active_task_ids = scheduler::planned_wave_task_ids(run, &active_scope_task_ids);
-        }
-        run.dispatch.active_wave =
-            scheduler::next_active_wave(run.dispatch.active_wave.take(), active_task_ids);
-    }
-
-    if run_requires_plan_acceptance(run) {
-        run.phase = RunPhase::Planning;
-        run.summary.next_action = Some("accept plan before dispatch".to_string());
-        run.wake_at = None;
-    } else if !preserve_canceled {
-        apply_runtime_scheduler_lifecycle(run);
-    }
-    apply_run_verify_lifecycle(run);
-    run.touch();
-}
-
-fn dispatch_run_wave(
-    reliability: &mut RpcReliabilityState,
-    run: &mut RunSnapshot,
-    agent_id_prefix: &str,
-    lease_ttl_sec: i64,
-) -> Result<Vec<DispatchGrant>> {
-    refresh_live_run_from_reliability(reliability, run);
-    if matches!(
-        run.phase,
-        RunPhase::Canceled | RunPhase::Failed | RunPhase::Completed
-    ) {
-        return Err(Error::validation(format!(
-            "run {} is not dispatchable in phase {:?}",
-            run.spec.run_id, run.phase
-        )));
-    }
-
-    let dispatchable_task_ids = run
-        .dispatch
-        .active_wave
-        .as_ref()
-        .map(|wave| {
-            wave.task_ids
-                .iter()
-                .filter_map(|task_id| {
-                    let task = reliability.tasks.get(task_id)?;
-                    if matches!(task.runtime.state, reliability::RuntimeState::Ready) {
-                        Some(task_id.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    if dispatchable_task_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut grants = Vec::with_capacity(dispatchable_task_ids.len());
-    for task_id in dispatchable_task_ids {
-        let agent_id = format!("{agent_id_prefix}:{task_id}");
-        match reliability.request_dispatch_existing(&task_id, &agent_id, lease_ttl_sec) {
-            Ok(grant) => grants.push(grant),
-            Err(err) => {
-                for grant in &grants {
-                    let _ = reliability.expire_dispatch_grant(grant);
-                }
-                reliability.refresh_dependency_states();
-                refresh_run_from_reliability(reliability, run);
-                return Err(err);
-            }
-        }
-    }
-
-    refresh_run_from_reliability(reliability, run);
-    Ok(grants)
-}
-
-fn cancel_live_run_tasks(
-    reliability: &mut RpcReliabilityState,
-    run: &mut RunSnapshot,
-) -> Vec<DispatchGrant> {
-    let task_ids = run.task_ids();
-    let leased_grants = task_ids
-        .iter()
-        .filter_map(|task_id| {
-            let task = reliability.tasks.get(task_id)?;
-            match &task.runtime.state {
-                reliability::RuntimeState::Leased {
-                    lease_id,
-                    agent_id,
-                    fence_token,
-                    expires_at,
-                } => Some(DispatchGrant {
-                    task_id: task_id.clone(),
-                    agent_id: agent_id.clone(),
-                    lease_id: lease_id.clone(),
-                    fence_token: *fence_token,
-                    expires_at: *expires_at,
-                    state: "leased".to_string(),
-                }),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for grant in &leased_grants {
-        let _ = reliability.expire_dispatch_grant(grant);
-    }
-
-    reliability.refresh_dependency_states();
-    refresh_run_from_reliability(reliability, run);
-    run.phase = RunPhase::Canceled;
-    run.dispatch.active_wave = None;
-    run.dispatch.active_subrun_id = None;
-    run.touch();
-    leased_grants
-}
-
 fn build_cancel_run_task_report(
-    reliability: &RpcReliabilityState,
+    reliability: &RuntimeExecutionState,
     run_id: &str,
     task_id: &str,
 ) -> Option<TaskReport> {
     let task = reliability.tasks.get(task_id)?;
-    let state = RpcReliabilityState::state_label(&task.runtime.state);
+    let state = RuntimeExecutionState::state_label(&task.runtime.state);
     build_runtime_task_report(
         reliability,
         task_id,
@@ -2293,7 +739,7 @@ fn build_cancel_run_task_report(
 }
 
 fn build_dispatch_rollback_task_report(
-    reliability: &RpcReliabilityState,
+    reliability: &RuntimeExecutionState,
     task_id: &str,
     summary: &str,
     failure_class: &str,
@@ -2314,7 +760,7 @@ fn build_dispatch_rollback_task_report(
 async fn cancel_live_run_tasks_and_sync(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     run: &mut RunSnapshot,
 ) -> Result<()> {
@@ -2369,30 +815,9 @@ async fn cancel_live_run_tasks_and_sync(
 }
 
 const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-const MAX_AUTOMATED_RECOVERABLE_WAIT: Duration = Duration::from_secs(60);
-const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
-
-fn next_recoverable_retry_delay(
-    reliability: &RpcReliabilityState,
-    run: &RunSnapshot,
-) -> Option<Duration> {
-    let now = chrono::Utc::now();
-
-    run.task_ids()
-        .iter()
-        .filter_map(|task_id| reliability.tasks.get(task_id))
-        .filter_map(|task| match &task.runtime.state {
-            reliability::RuntimeState::Recoverable {
-                retry_after: Some(retry_after),
-                ..
-            } if *retry_after > now => (*retry_after - now).to_std().ok(),
-            _ => None,
-        })
-        .min()
-}
 
 fn apply_dispatch_rollback_recovery(
-    reliability: &mut RpcReliabilityState,
+    reliability: &mut RuntimeExecutionState,
     grant: &DispatchGrant,
     failure_summary: Option<&str>,
 ) -> String {
@@ -2427,14 +852,14 @@ fn apply_dispatch_rollback_recovery(
             }
         }
 
-        RpcReliabilityState::state_label(&task.runtime.state).to_string()
+        RuntimeExecutionState::state_label(&task.runtime.state).to_string()
     };
 
     reliability.refresh_dependency_states();
     reliability
         .tasks
         .get(&grant.task_id)
-        .map(|task| RpcReliabilityState::state_label(&task.runtime.state).to_string())
+        .map(|task| RuntimeExecutionState::state_label(&task.runtime.state).to_string())
         .unwrap_or(rollback_state)
 }
 
@@ -2475,7 +900,19 @@ impl OrchestrationInlineWorker for RpcSessionInlineWorker {
             workspace_path,
             Some(&self.config),
         );
-        let agent = Agent::new(Arc::clone(&self.provider), tools, AgentConfig::default());
+        let agent = Agent::new(
+            Arc::clone(&self.provider),
+            tools,
+            AgentConfig {
+                system_prompt: Some(build_role_system_prompt(
+                    SessionRole::Worker,
+                    workspace_path,
+                    &INLINE_WORKER_TOOLS,
+                )),
+                max_tool_iterations: 32,
+                ..AgentConfig::default()
+            },
+        );
         let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
             workspace_path.to_path_buf(),
         ))));
@@ -2673,7 +1110,7 @@ fn repo_worktree_diff_against_snapshot(repo_root: &Path, snapshot: &str) -> Resu
 
 #[allow(dead_code)]
 fn task_contract_for_runtime_task(
-    reliability: &RpcReliabilityState,
+    reliability: &RuntimeExecutionState,
     task_id: &str,
 ) -> Result<TaskContract> {
     let task = reliability
@@ -2742,7 +1179,7 @@ async fn execute_task_verification(
 async fn append_evidence_record(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     req: AppendEvidenceRequest,
 ) -> Result<reliability::EvidenceRecord> {
     let evidence = {
@@ -2773,7 +1210,7 @@ async fn append_evidence_record(
 async fn submit_task_and_sync(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     req: SubmitTaskRequest,
 ) -> Result<SubmitTaskResponse> {
@@ -2832,7 +1269,7 @@ async fn submit_task_and_sync(
 async fn rollback_dispatch_grant(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     run_id: &str,
     grant: &DispatchGrant,
@@ -2895,7 +1332,7 @@ fn dispatch_workspace_segment_id(grant: &DispatchGrant) -> usize {
 
 async fn capture_dispatch_grant_execution(
     cx: &AgentCx,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     repo_root: &Path,
     grant: &DispatchGrant,
     worker: &dyn OrchestrationInlineWorker,
@@ -2913,7 +1350,7 @@ async fn capture_dispatch_grant_execution(
 
 async fn capture_dispatch_grant_execution_with_base_patches(
     cx: &AgentCx,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     repo_root: &Path,
     grant: &DispatchGrant,
     worker: &dyn OrchestrationInlineWorker,
@@ -2999,7 +1436,7 @@ fn captured_dispatches_overlap(captures: &[CapturedDispatchExecution]) -> bool {
 async fn finalize_captured_dispatch_execution(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
     run_id: &str,
@@ -3114,7 +1551,7 @@ async fn finalize_captured_dispatch_execution(
 async fn execute_inline_dispatch_grant_with_worker(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
     run_id: &str,
@@ -3157,7 +1594,7 @@ async fn execute_inline_dispatch_grant_with_worker(
 async fn execute_dispatch_grants_sequentially_with_replay_base(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
     run: RunSnapshot,
@@ -3221,7 +1658,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
 async fn finalize_captured_dispatches(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
     run: RunSnapshot,
@@ -3246,7 +1683,7 @@ async fn finalize_captured_dispatches(
 async fn execute_dispatch_grants_with_worker(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     repo_root: &Path,
     run: RunSnapshot,
@@ -3373,7 +1810,7 @@ async fn execute_dispatch_grants_with_worker(
 async fn execute_inline_run_dispatch(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     config: &Config,
     run: RunSnapshot,
@@ -3401,6 +1838,44 @@ async fn execute_inline_run_dispatch(
     .await
 }
 
+struct RpcDispatchHost {
+    cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    reliability_state: Arc<Mutex<RuntimeExecutionState>>,
+    runtime_store: RuntimeStore,
+    config: Config,
+}
+
+#[async_trait]
+impl DispatchRunHost for RpcDispatchHost {
+    async fn record_dispatch_grants(&self, grants: &[DispatchGrant]) -> Result<()> {
+        append_dispatch_grants_session_entries(
+            &self.cx,
+            &self.session,
+            &self.reliability_state,
+            grants,
+        )
+        .await
+    }
+
+    async fn execute_dispatch_grants(
+        &self,
+        run: RunSnapshot,
+        grants: &[DispatchGrant],
+    ) -> Result<RunSnapshot> {
+        execute_inline_run_dispatch(
+            &self.cx,
+            &self.session,
+            &self.reliability_state,
+            &self.runtime_store,
+            &self.config,
+            run,
+            grants,
+        )
+        .await
+    }
+}
+
 async fn session_workspace_root(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -3422,102 +1897,8 @@ async fn session_workspace_root(
     })
 }
 
-async fn dispatch_run_until_quiescent(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    runtime_store: &RuntimeStore,
-    config: &Config,
-    mut run: RunSnapshot,
-    agent_id_prefix: &str,
-    lease_ttl_sec: i64,
-) -> Result<(RunSnapshot, Vec<DispatchGrant>)> {
-    loop {
-        let mut grants = {
-            let mut rel = reliability_state
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-            let task_ids = run.task_ids();
-            let has_live_tasks = !task_ids.is_empty()
-                && task_ids
-                    .iter()
-                    .all(|task_id| rel.tasks.contains_key(task_id));
-            if has_live_tasks {
-                dispatch_run_wave(&mut rel, &mut run, agent_id_prefix, lease_ttl_sec)
-            } else {
-                Err(Error::session(format!(
-                    "orchestration run {} is not live in this process",
-                    run.spec.run_id
-                )))
-            }
-        }?;
-
-        if grants.is_empty() {
-            let recoverable_wait = {
-                let rel = reliability_state
-                    .lock(cx)
-                    .await
-                    .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                if run_has_live_tasks(&rel, &run)
-                    && matches!(run.phase, RunPhase::Dispatching | RunPhase::Running)
-                {
-                    next_recoverable_retry_delay(&rel, &run)
-                } else {
-                    None
-                }
-            };
-            if let Some(wait_for) =
-                recoverable_wait.filter(|wait_for| *wait_for <= MAX_AUTOMATED_RECOVERABLE_WAIT)
-            {
-                cx.time().sleep(wait_for).await;
-                continue;
-            }
-            return Ok((run, grants));
-        }
-
-        append_dispatch_grants_session_entries(cx, session, reliability_state, &grants).await?;
-        let run_id = run.spec.run_id.clone();
-        run = match execute_inline_run_dispatch(
-            cx,
-            session,
-            reliability_state,
-            runtime_store,
-            config,
-            run,
-            &grants,
-        )
-        .await
-        {
-            Ok(updated_run) => updated_run,
-            Err(err) if grants.len() == 1 => {
-                let recovered_run = runtime_store.load_snapshot(&run_id)?;
-                if matches!(
-                    recovered_run.phase,
-                    RunPhase::Dispatching | RunPhase::Running
-                ) {
-                    grants.clear();
-                    run = recovered_run;
-                    continue;
-                }
-                drop(err);
-                recovered_run
-            }
-            Err(err) => return Err(err),
-        };
-        grants.clear();
-
-        if matches!(
-            run.phase,
-            RunPhase::Canceled | RunPhase::Failed | RunPhase::Completed | RunPhase::AwaitingHuman
-        ) {
-            return Ok((run, grants));
-        }
-    }
-}
-
 fn build_submit_task_report(
-    reliability: &RpcReliabilityState,
+    reliability: &RuntimeExecutionState,
     req: &SubmitTaskRequest,
     result: &SubmitTaskResponse,
 ) -> Result<TaskReport> {
@@ -3583,42 +1964,8 @@ fn build_submit_task_report(
     })
 }
 
-fn build_runtime_task_report(
-    reliability: &RpcReliabilityState,
-    task_id: &str,
-    summary: String,
-) -> Option<TaskReport> {
-    let task = reliability.tasks.get(task_id)?;
-    let evidence = reliability
-        .evidence_by_task
-        .get(task_id)
-        .cloned()
-        .unwrap_or_default();
-    let verify_command = match &task.spec.verify {
-        reliability::VerifyPlan::Standard { command, .. } => command.clone(),
-    };
-    Some(TaskReport {
-        task_id: task_id.to_string(),
-        attempt: task.runtime.attempt.max(1),
-        summary,
-        changed_files: Vec::new(),
-        patch_digest: String::new(),
-        evidence_ids: evidence
-            .iter()
-            .map(|record| record.evidence_id.clone())
-            .collect(),
-        acceptance_ids: task.spec.acceptance_ids.clone(),
-        verify_command,
-        verify_exit_code: evidence.last().map(|record| record.exit_code).unwrap_or(0),
-        failure_class: runtime_failure_class_label(&task.runtime.state),
-        blockers: task_report_blockers(&task.runtime.state),
-        workspace_snapshot: task.spec.input_snapshot.clone(),
-        generated_at: chrono::Utc::now(),
-    })
-}
-
 fn refresh_task_runs_with_verify_scopes(
-    reliability: &RpcReliabilityState,
+    reliability: &RuntimeExecutionState,
     runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<&TaskReport>,
@@ -3645,7 +1992,7 @@ fn refresh_task_runs_with_verify_scopes(
 }
 
 fn refresh_task_runs(
-    reliability: &RpcReliabilityState,
+    reliability: &RuntimeExecutionState,
     runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<TaskReport>,
@@ -3659,7 +2006,7 @@ fn refresh_task_runs(
 async fn sync_task_runs(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
     task_id: &str,
     report: Option<TaskReport>,
@@ -3885,7 +2232,7 @@ pub async fn run(
     let abort_handle: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
     let bash_state: Arc<Mutex<Option<RunningBash>>> = Arc::new(Mutex::new(None));
     let retry_abort = Arc::new(AtomicBool::new(false));
-    let reliability_state = Arc::new(Mutex::new(RpcReliabilityState::new(&options.config)?));
+    let reliability_state = Arc::new(Mutex::new(RuntimeExecutionState::new(&options.config)?));
     let runtime_store = RuntimeStore::from_global_dir();
 
     {
@@ -4599,12 +2946,18 @@ pub async fn run(
                     continue;
                 }
 
+                let dispatch_host = RpcDispatchHost {
+                    cx: cx.clone(),
+                    session: Arc::clone(&session),
+                    reliability_state: Arc::clone(&reliability_state),
+                    runtime_store: runtime_store.clone(),
+                    config: options.config.clone(),
+                };
                 let (run, grants) = match Box::pin(dispatch_run_until_quiescent(
                     &cx,
-                    &session,
                     &reliability_state,
                     &runtime_store,
-                    &options.config,
+                    &dispatch_host,
                     run,
                     agent_id_prefix,
                     lease_ttl_sec,
@@ -4769,12 +3122,18 @@ pub async fn run(
                             | RunPhase::AwaitingHuman
                     )
                 {
+                    let dispatch_host = RpcDispatchHost {
+                        cx: cx.clone(),
+                        session: Arc::clone(&session),
+                        reliability_state: Arc::clone(&reliability_state),
+                        runtime_store: runtime_store.clone(),
+                        config: options.config.clone(),
+                    };
                     let (updated_run, _) = match Box::pin(dispatch_run_until_quiescent(
                         &cx,
-                        &session,
                         &reliability_state,
                         &runtime_store,
-                        &options.config,
+                        &dispatch_host,
                         run,
                         "resume",
                         3600,
@@ -8039,7 +6398,7 @@ mod tests {
         mode: ReliabilityEnforcementMode,
         require_evidence_for_close: bool,
         allow_open_ended_defer: bool,
-    ) -> RpcReliabilityState {
+    ) -> RuntimeExecutionState {
         let config = Config {
             reliability: Some(ReliabilityConfig {
                 enabled: Some(true),
@@ -8053,7 +6412,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        RpcReliabilityState::new(&config).expect("reliability state")
+        RuntimeExecutionState::new(&config).expect("reliability state")
     }
 
     fn reliability_contract(task_id: &str, prerequisites: Vec<TaskPrerequisite>) -> TaskContract {
