@@ -1,7 +1,7 @@
 use super::loader::{LoadSkillsOptions, load_skills};
 use super::schema::{
     ExplicitSkillInvocation, Skill, SkillLineage, SkillSections, legacy_skill_id,
-    parse_frontmatter, parse_skill_sections, strip_frontmatter,
+    parse_frontmatter, parse_skill_lineage, parse_skill_sections, strip_frontmatter,
 };
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -143,6 +143,8 @@ pub struct SkillAmendment {
     pub previous_routing_hints: SkillRoutingHints,
     #[serde(default, skip_serializing_if = "SkillRoutingHints::is_empty")]
     pub routing_hints: SkillRoutingHints,
+    #[serde(default, skip_serializing_if = "SkillLineage::is_empty")]
+    pub lineage: SkillLineage,
     pub evidence: Vec<String>,
 }
 
@@ -252,6 +254,7 @@ pub struct SkillProducerReport {
     pub descendant_skill_count: usize,
     pub observed_descendant_skill_count: usize,
     pub unobserved_descendant_skill_count: usize,
+    pub orphaned_descendant_skill_count: usize,
     pub effective_descendant_skill_count: usize,
     pub pending_descendant_skill_count: usize,
     pub needs_amendment_descendant_skill_count: usize,
@@ -335,6 +338,21 @@ struct SkillProducerKey {
     role: SkillProducerRole,
     name: String,
     revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillEvidenceSnapshot {
+    recorded_at_utc: String,
+    skill_name: String,
+    lineage: SkillLineage,
+}
+
+#[derive(Debug, Clone)]
+struct ProducerDescendant {
+    skill_id: String,
+    skill_name: String,
+    report: Option<SkillHealthReport>,
+    orphaned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -675,8 +693,13 @@ pub fn handle_skill_doctor(
         skill_paths: Vec::new(),
         include_defaults: true,
     });
-    let producers =
-        build_skill_producer_reports(&loaded_skills.skills, &skills, &observations, &feedback);
+    let producers = build_skill_producer_reports(
+        &loaded_skills.skills,
+        &skills,
+        &observations,
+        &feedback,
+        &amendments,
+    );
     let report = SkillDoctorReport {
         criteria,
         observation_count: observations.len(),
@@ -837,113 +860,91 @@ fn build_skill_producer_reports(
     skill_reports: &[SkillHealthReport],
     observations: &[SkillObservation],
     feedback: &[SkillFeedback],
+    amendments: &[SkillAmendment],
 ) -> Vec<SkillProducerReport> {
-    let reports_by_path = skill_reports
+    let reports_by_id = skill_reports
         .iter()
-        .map(|report| (canonicalize_with_fallback(&report.skill_path), report))
+        .cloned()
+        .map(|report| (report.skill_id.clone(), report))
         .collect::<HashMap<_, _>>();
-    let mut grouped: BTreeMap<SkillProducerKey, Vec<Option<&SkillHealthReport>>> = BTreeMap::new();
+    let loaded_by_id = loaded_skills
+        .iter()
+        .map(|skill| (skill.skill_id.clone(), skill))
+        .collect::<HashMap<_, _>>();
+    let snapshots = build_latest_skill_snapshots(observations, feedback, amendments);
 
-    for skill in loaded_skills {
-        let report = reports_by_path
-            .get(&canonicalize_with_fallback(&skill.file_path))
-            .copied();
-        let lineage = report.map_or_else(
-            || skill.lineage.clone(),
-            |report| lineage_for_skill_report(report, skill, observations, feedback),
-        );
-        if let Some(key) = producer_key_from_lineage(&lineage) {
-            grouped.entry(key).or_default().push(report);
+    let mut skill_ids = BTreeSet::new();
+    skill_ids.extend(reports_by_id.keys().cloned());
+    skill_ids.extend(loaded_by_id.keys().cloned());
+    skill_ids.extend(snapshots.keys().cloned());
+
+    let mut grouped: BTreeMap<SkillProducerKey, BTreeMap<String, ProducerDescendant>> =
+        BTreeMap::new();
+    for skill_id in skill_ids {
+        let report = reports_by_id.get(&skill_id).cloned();
+        let loaded_skill = loaded_by_id.get(&skill_id).copied();
+        let snapshot = snapshots.get(&skill_id);
+        let lineage = snapshot
+            .map(|snapshot| snapshot.lineage.clone())
+            .or_else(|| loaded_skill.map(|skill| skill.lineage.clone()))
+            .unwrap_or_default();
+        if lineage.is_empty() {
+            continue;
+        }
+
+        let skill_name = report
+            .as_ref()
+            .map(|report| report.skill_name.clone())
+            .or_else(|| loaded_skill.map(|skill| skill.name.clone()))
+            .or_else(|| snapshot.map(|snapshot| snapshot.skill_name.clone()))
+            .unwrap_or_else(|| skill_id.clone());
+        let orphaned = report
+            .as_ref()
+            .is_some_and(|report| report.current_digest == "missing")
+            || loaded_skill.is_none() && snapshot.is_some();
+        let descendant = ProducerDescendant {
+            skill_id: skill_id.clone(),
+            skill_name,
+            report,
+            orphaned,
+        };
+
+        for key in producer_keys_from_lineage(&lineage) {
+            grouped
+                .entry(key)
+                .or_default()
+                .insert(skill_id.clone(), descendant.clone());
         }
     }
 
-    grouped
+    let mut reports = grouped
         .into_iter()
-        .map(|(key, descendants)| build_skill_producer_report(key, &descendants))
-        .collect()
-}
-
-fn lineage_for_skill_report(
-    report: &SkillHealthReport,
-    skill: &Skill,
-    observations: &[SkillObservation],
-    feedback: &[SkillFeedback],
-) -> SkillLineage {
-    if report.current_digest != report.latest_digest {
-        return skill.lineage.clone();
-    }
-
-    observations
-        .iter()
-        .rev()
-        .find(|entry| {
-            entry.skill_name == report.skill_name
-                && entry.skill_path == report.skill_path
-                && entry.skill_digest == report.latest_digest
-                && !entry.lineage.is_empty()
+        .map(|(key, descendants)| {
+            build_skill_producer_report(key, &descendants.into_values().collect::<Vec<_>>())
         })
-        .map(|entry| entry.lineage.clone())
-        .or_else(|| {
-            feedback
-                .iter()
-                .rev()
-                .find(|entry| {
-                    entry.skill_name == report.skill_name
-                        && entry.skill_path == report.skill_path
-                        && entry.skill_digest == report.latest_digest
-                        && !entry.lineage.is_empty()
-                })
-                .map(|entry| entry.lineage.clone())
-        })
-        .filter(|lineage| !lineage.is_empty())
-        .unwrap_or_else(|| skill.lineage.clone())
-}
-
-fn producer_key_from_lineage(lineage: &SkillLineage) -> Option<SkillProducerKey> {
-    if let Some(name) = lineage
-        .last_improved_by_skill
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(SkillProducerKey {
-            role: SkillProducerRole::Improver,
-            name: name.to_string(),
-            revision: lineage
-                .last_improved_by_revision
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string),
-        });
-    }
-
-    let name = lineage
-        .created_by_skill
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some(SkillProducerKey {
-        role: SkillProducerRole::Creator,
-        name: name.to_string(),
-        revision: lineage
-            .created_by_revision
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string),
-    })
+        .collect::<Vec<_>>();
+    reports.sort_by(|left, right| {
+        left.producer_skill_name
+            .cmp(&right.producer_skill_name)
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.producer_revision.cmp(&right.producer_revision))
+    });
+    reports
 }
 
 fn build_skill_producer_report(
     key: SkillProducerKey,
-    descendants: &[Option<&SkillHealthReport>],
+    descendants: &[ProducerDescendant],
 ) -> SkillProducerReport {
     let descendant_skill_count = descendants.len();
-    let observed_descendant_skill_count =
-        descendants.iter().filter(|report| report.is_some()).count();
+    let observed_descendant_skill_count = descendants
+        .iter()
+        .filter(|descendant| descendant.report.is_some())
+        .count();
     let unobserved_descendant_skill_count =
         descendant_skill_count - observed_descendant_skill_count;
+    let orphaned_descendant_skill_count =
+        descendants.iter().filter(|descendant| descendant.orphaned).count();
     let mut effective_descendant_skill_count = 0usize;
     let mut pending_descendant_skill_count = 0usize;
     let mut needs_amendment_descendant_skill_count = 0usize;
@@ -952,7 +953,10 @@ fn build_skill_producer_report(
     let mut feedback_scores = Vec::new();
     let mut evidence_counts: BTreeMap<String, usize> = BTreeMap::new();
 
-    for report in descendants.iter().flatten() {
+    for descendant in descendants {
+        let Some(report) = descendant.report.as_ref() else {
+            continue;
+        };
         if report.run_count > 0 {
             success_rates.push(report.success_rate);
         }
@@ -1004,6 +1008,17 @@ fn build_skill_producer_report(
             "{unobserved_descendant_skill_count} descendant skill(s) have no runtime evidence yet."
         ));
     }
+    if orphaned_descendant_skill_count > 0 {
+        let orphaned_names = descendants
+            .iter()
+            .filter(|descendant| descendant.orphaned)
+            .map(|descendant| format!("{} ({})", descendant.skill_name, descendant.skill_id))
+            .collect::<Vec<_>>();
+        evidence.push(format!(
+            "{orphaned_descendant_skill_count} descendant skill(s) are orphaned from the current filesystem state: {}.",
+            orphaned_names.join(", ")
+        ));
+    }
     if pending_descendant_skill_count > 0 {
         evidence.push(format!(
             "{pending_descendant_skill_count} descendant skill(s) are still pending post-amend evaluation."
@@ -1037,6 +1052,7 @@ fn build_skill_producer_report(
         descendant_skill_count,
         observed_descendant_skill_count,
         unobserved_descendant_skill_count,
+        orphaned_descendant_skill_count,
         effective_descendant_skill_count,
         pending_descendant_skill_count,
         needs_amendment_descendant_skill_count,
@@ -1046,6 +1062,107 @@ fn build_skill_producer_report(
         average_descendant_feedback_score,
         evidence,
     }
+}
+
+fn build_latest_skill_snapshots(
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
+    amendments: &[SkillAmendment],
+) -> HashMap<String, SkillEvidenceSnapshot> {
+    let mut snapshots = HashMap::new();
+    for observation in observations {
+        update_skill_snapshot(
+            &mut snapshots,
+            &observation.skill_id,
+            &observation.recorded_at_utc,
+            &observation.skill_name,
+            &observation.lineage,
+        );
+    }
+    for entry in feedback {
+        update_skill_snapshot(
+            &mut snapshots,
+            &entry.skill_id,
+            &entry.recorded_at_utc,
+            &entry.skill_name,
+            &entry.lineage,
+        );
+    }
+    for amendment in amendments {
+        update_skill_snapshot(
+            &mut snapshots,
+            &amendment.skill_id,
+            &amendment.applied_at_utc,
+            &amendment.skill_name,
+            &amendment.lineage,
+        );
+    }
+    snapshots
+}
+
+fn update_skill_snapshot(
+    snapshots: &mut HashMap<String, SkillEvidenceSnapshot>,
+    skill_id: &str,
+    recorded_at_utc: &str,
+    skill_name: &str,
+    lineage: &SkillLineage,
+) {
+    if skill_id.trim().is_empty() || lineage.is_empty() {
+        return;
+    }
+
+    let replace = snapshots
+        .get(skill_id)
+        .is_none_or(|snapshot| recorded_at_utc >= snapshot.recorded_at_utc.as_str());
+    if replace {
+        snapshots.insert(
+            skill_id.to_string(),
+            SkillEvidenceSnapshot {
+                recorded_at_utc: recorded_at_utc.to_string(),
+                skill_name: skill_name.to_string(),
+                lineage: lineage.clone(),
+            },
+        );
+    }
+}
+
+fn producer_keys_from_lineage(lineage: &SkillLineage) -> Vec<SkillProducerKey> {
+    let mut keys = Vec::new();
+    if let Some(name) = lineage
+        .created_by_skill
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        keys.push(SkillProducerKey {
+            role: SkillProducerRole::Creator,
+            name: name.to_string(),
+            revision: lineage
+                .created_by_revision
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+        });
+    }
+    if let Some(name) = lineage
+        .last_improved_by_skill
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        keys.push(SkillProducerKey {
+            role: SkillProducerRole::Improver,
+            name: name.to_string(),
+            revision: lineage
+                .last_improved_by_revision
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+        });
+    }
+    keys
 }
 
 fn pending_revision_evidence(criteria: &SkillSuccessCriteria) -> String {
@@ -1475,6 +1592,7 @@ fn apply_managed_skill_patch(
         ))
     })?;
     let new_digest = sha256_hex_standalone(&updated);
+    let lineage = parse_skill_lineage(&parse_frontmatter(&updated).frontmatter);
     let amendment = SkillAmendment {
         version: 2,
         applied_at_utc: timestamp_now(),
@@ -1487,6 +1605,7 @@ fn apply_managed_skill_patch(
         guardrails: guardrails.to_vec(),
         previous_routing_hints,
         routing_hints: extract_routing_hints_from_raw(&updated),
+        lineage,
         evidence: evidence.to_vec(),
     };
     append_jsonl_records(&skill_amendment_ledger_path(cwd), &[amendment.clone()])?;
@@ -1542,6 +1661,7 @@ fn rollback_managed_skill_patch(
         shorten_digest(current_digest)
     )];
     rollback_evidence.extend(evidence.iter().cloned());
+    let lineage = parse_skill_lineage(&parse_frontmatter(&updated).frontmatter);
     let amendment = SkillAmendment {
         version: 2,
         applied_at_utc: timestamp_now(),
@@ -1554,6 +1674,7 @@ fn rollback_managed_skill_patch(
         guardrails: source_amendment.previous_guardrails.clone(),
         previous_routing_hints: current_routing_hints,
         routing_hints: source_amendment.previous_routing_hints.clone(),
+        lineage,
         evidence: rollback_evidence,
     };
     append_jsonl_records(&skill_amendment_ledger_path(cwd), &[amendment.clone()])?;
@@ -1852,6 +1973,8 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
                 average_feedback_display(skill.average_feedback_score),
             )
             .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            writeln!(out, "  skill_id: {}", skill.skill_id)
+                .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             writeln!(out, "  path: {}", skill.skill_path.display())
                 .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             if skill.current_digest != skill.latest_digest {
@@ -1912,12 +2035,13 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
         for producer in &report.producers {
             writeln!(
                 out,
-                "  {} ({:?}): descendants={} effective={:.0}% observed={} pending={} needs_amendment={} regressed={}",
+                "  {} ({:?}): descendants={} effective={:.0}% observed={} orphaned={} pending={} needs_amendment={} regressed={}",
                 producer.producer_skill_name,
                 producer.role,
                 producer.descendant_skill_count,
                 producer.effective_descendant_rate * 100.0,
                 producer.observed_descendant_skill_count,
+                producer.orphaned_descendant_skill_count,
                 producer.pending_descendant_skill_count,
                 producer.needs_amendment_descendant_skill_count,
                 producer.regressed_descendant_skill_count,
@@ -3734,13 +3858,14 @@ mod tests {
         assert_eq!(producer.producer_revision.as_deref(), Some("rev-a"));
         assert_eq!(producer.descendant_skill_count, 2);
         assert_eq!(producer.observed_descendant_skill_count, 2);
+        assert_eq!(producer.orphaned_descendant_skill_count, 0);
         assert_eq!(producer.effective_descendant_skill_count, 1);
         assert_eq!(producer.needs_amendment_descendant_skill_count, 1);
         assert_eq!(producer.regressed_descendant_skill_count, 0);
     }
 
     #[test]
-    fn doctor_attributes_observed_child_to_latest_improver_only() {
+    fn doctor_attributes_observed_child_to_creator_and_improver() {
         let dir = tempdir().expect("tempdir");
         let skill_path = dir
             .path()
@@ -3817,10 +3942,121 @@ mod tests {
                 && producer.role == SkillProducerRole::Improver
                 && producer.descendant_skill_count == 1
         }));
-        assert!(!report.producers.iter().any(|producer| {
+        assert!(report.producers.iter().any(|producer| {
             producer.producer_skill_name == "skill-creator"
                 && producer.role == SkillProducerRole::Creator
+                && producer.descendant_skill_count == 1
         }));
+    }
+
+    #[test]
+    fn doctor_keeps_orphaned_descendant_in_producer_report() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("release-notes")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: release-notes\nskill-id: release-notes-id\ndescription: draft release notes\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n---\nDraft\n",
+        )
+        .expect("write skill");
+        let digest = file_digest(&skill_path);
+        let lineage = parse_skill_lineage(
+            &parse_frontmatter(&fs::read_to_string(&skill_path).expect("read skill")).frontmatter,
+        );
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("release-notes"),
+                    skill_name: "release-notes".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "draft notes".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: lineage.clone(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "write".to_string(),
+                        signature: "missing summary".to_string(),
+                        message: "missing summary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("release-notes"),
+                    skill_name: "release-notes".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "draft notes again".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: lineage.clone(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "write".to_string(),
+                        signature: "missing summary".to_string(),
+                        message: "missing summary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("release-notes"),
+                    skill_name: "release-notes".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "draft notes one more time".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "write".to_string(),
+                        signature: "missing summary".to_string(),
+                        message: "missing summary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write observations");
+        fs::rename(
+            &skill_path,
+            skill_path
+                .parent()
+                .expect("parent")
+                .join("SKILL.orphaned.md"),
+        )
+        .expect("rename orphaned skill");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let producer = report
+            .producers
+            .iter()
+            .find(|producer| {
+                producer.producer_skill_name == "skill-creator"
+                    && producer.role == SkillProducerRole::Creator
+            })
+            .expect("creator report");
+        assert_eq!(producer.descendant_skill_count, 1);
+        assert_eq!(producer.observed_descendant_skill_count, 1);
+        assert_eq!(producer.orphaned_descendant_skill_count, 1);
+        assert!(producer
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("release-notes (release-notes-id)")));
     }
 
     #[test]
