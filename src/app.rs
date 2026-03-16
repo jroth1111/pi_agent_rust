@@ -17,7 +17,9 @@ use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextConte
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::provider::{StreamOptions, ThinkingBudgets};
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
-use crate::repo_policy::{build_repo_policy_digest, load_project_context_files};
+use crate::repo_policy::{
+    build_repo_policy_digest, embed_repo_policy_digest, load_project_context_files,
+};
 use crate::session::Session;
 use crate::tools::process_file_arguments;
 
@@ -153,7 +155,7 @@ pub fn build_system_prompt(
 
     if let Some(repo_policy) = build_repo_policy_digest(&context_files) {
         prompt.push_str("\n\n");
-        prompt.push_str(&repo_policy.rendered);
+        prompt.push_str(&embed_repo_policy_digest(&repo_policy.rendered));
     }
 
     if let Some(skills_prompt) = skills_prompt {

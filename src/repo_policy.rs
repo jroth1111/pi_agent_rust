@@ -1,10 +1,13 @@
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const MAX_POLICY_FILES: usize = 8;
 const MAX_FILE_CHARS: usize = 2_000;
 const MAX_TOTAL_CHARS: usize = 6_000;
+pub const REPO_POLICY_DIGEST_HEADER: &str = "# Repo Policy Digest";
+const REPO_POLICY_START_MARKER: &str = "<pi_repo_policy_digest>";
+const REPO_POLICY_END_MARKER: &str = "</pi_repo_policy_digest>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -19,6 +22,13 @@ pub struct RepoPolicyDigest {
     pub rendered: String,
     pub total_source_chars: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitRepoPolicyPrompt {
+    pub full_prompt: String,
+    pub static_prompt: String,
+    pub repo_policy: Option<String>,
 }
 
 pub fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile> {
@@ -71,8 +81,8 @@ pub fn build_repo_policy_digest(files: &[ContextFile]) -> Option<RepoPolicyDiges
     }
     let digest_hex = format!("{:x}", hasher.finalize());
 
-    let mut rendered = String::from(
-        "# Repo Policy Digest\n\nUse these project-specific instructions as binding policy. The raw policy files are loaded from disk but compacted here to bound prompt size.\n\n",
+    let mut rendered = format!(
+        "{REPO_POLICY_DIGEST_HEADER}\n\nUse these project-specific instructions as binding policy. The raw policy files are loaded from disk but compacted here to bound prompt size.\n\n"
     );
     let mut remaining = MAX_TOTAL_CHARS;
     let mut truncated = files.len() > limited_files.len();
@@ -111,6 +121,42 @@ pub fn build_repo_policy_digest(files: &[ContextFile]) -> Option<RepoPolicyDiges
     })
 }
 
+pub fn embed_repo_policy_digest(rendered: &str) -> String {
+    format!("{REPO_POLICY_START_MARKER}\n{rendered}\n{REPO_POLICY_END_MARKER}")
+}
+
+pub fn split_embedded_repo_policy(prompt: &str) -> SplitRepoPolicyPrompt {
+    let Some(start_idx) = prompt.find(REPO_POLICY_START_MARKER) else {
+        return SplitRepoPolicyPrompt {
+            full_prompt: prompt.to_string(),
+            static_prompt: prompt.to_string(),
+            repo_policy: None,
+        };
+    };
+
+    let content_start = start_idx + REPO_POLICY_START_MARKER.len();
+    let Some(end_rel_idx) = prompt[content_start..].find(REPO_POLICY_END_MARKER) else {
+        return SplitRepoPolicyPrompt {
+            full_prompt: prompt.to_string(),
+            static_prompt: prompt.to_string(),
+            repo_policy: None,
+        };
+    };
+    let end_idx = content_start + end_rel_idx;
+
+    let before = &prompt[..start_idx];
+    let repo_policy = prompt[content_start..end_idx].trim().to_string();
+    let after = &prompt[end_idx + REPO_POLICY_END_MARKER.len()..];
+    let full_prompt = format!("{before}{repo_policy}{after}");
+    let static_prompt = format!("{before}{after}");
+
+    SplitRepoPolicyPrompt {
+        full_prompt,
+        static_prompt,
+        repo_policy: (!repo_policy.is_empty()).then_some(repo_policy),
+    }
+}
+
 fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
     let candidates = ["AGENTS.md", "CLAUDE.md"];
     for filename in candidates {
@@ -144,6 +190,7 @@ fn clip_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -155,9 +202,29 @@ mod tests {
         .expect("digest should exist");
 
         assert!(digest.truncated);
-        assert!(digest.rendered.contains("# Repo Policy Digest"));
+        assert!(digest.rendered.contains(REPO_POLICY_DIGEST_HEADER));
         assert!(digest.rendered.contains("[truncated]"));
         assert!(digest.rendered.len() < MAX_TOTAL_CHARS + 500);
+    }
+
+    #[test]
+    fn split_embedded_repo_policy_extracts_marked_section() {
+        let prompt = format!(
+            "Base instructions.\n\n{}\n\nCurrent date and time: <TIMESTAMP>",
+            embed_repo_policy_digest("# Repo Policy Digest\n\nAlways test.")
+        );
+
+        let split = split_embedded_repo_policy(&prompt);
+
+        assert!(split.full_prompt.contains(REPO_POLICY_DIGEST_HEADER));
+        assert!(!split.full_prompt.contains(REPO_POLICY_START_MARKER));
+        assert!(!split.full_prompt.contains(REPO_POLICY_END_MARKER));
+        assert_eq!(
+            split.repo_policy.as_deref(),
+            Some("# Repo Policy Digest\n\nAlways test.")
+        );
+        assert!(!split.static_prompt.contains(REPO_POLICY_DIGEST_HEADER));
+        assert!(split.static_prompt.contains("Current date and time"));
     }
 
     #[test]

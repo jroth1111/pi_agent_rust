@@ -4,7 +4,7 @@ use crate::prompt_plan::{
     estimate_tools_tokens,
 };
 use crate::provider::{Context, ToolDef};
-use std::borrow::Cow;
+use crate::repo_policy::split_embedded_repo_policy;
 
 #[derive(Debug, Clone, Default)]
 pub struct PromptAssemblyInputs {
@@ -34,17 +34,28 @@ impl PromptAssemblyInputs {
 }
 
 pub fn assemble_prompt_plan(inputs: PromptAssemblyInputs) -> PromptAssemblyPlan {
+    let mut explicit_repo_policy = inputs.repo_policy;
+    let system_prompt = inputs.system_prompt.map(|prompt| {
+        let mut split = split_embedded_repo_policy(&prompt);
+        if explicit_repo_policy.is_none() {
+            explicit_repo_policy = split.repo_policy.take();
+        }
+        split
+    });
+
     let mut plan = PromptAssemblyPlan {
-        system_prompt: inputs.system_prompt,
+        system_prompt: system_prompt
+            .as_ref()
+            .map(|split| split.full_prompt.clone()),
         tools: inputs.tools,
         ..PromptAssemblyPlan::default()
     };
 
-    if let Some(system_prompt) = &plan.system_prompt {
-        plan.add_section(
-            PromptSectionKind::StaticPrefix,
-            estimate_text_tokens(system_prompt),
-        );
+    if let Some(system_prompt) = &system_prompt {
+        let static_tokens = estimate_text_tokens(&system_prompt.static_prompt);
+        if static_tokens > 0 {
+            plan.add_section(PromptSectionKind::StaticPrefix, static_tokens);
+        }
     }
 
     let tool_tokens = estimate_tools_tokens(&plan.tools);
@@ -52,7 +63,7 @@ pub fn assemble_prompt_plan(inputs: PromptAssemblyInputs) -> PromptAssemblyPlan 
         plan.add_section(PromptSectionKind::StaticPrefix, tool_tokens);
     }
 
-    if let Some(repo_policy) = &inputs.repo_policy {
+    if let Some(repo_policy) = &explicit_repo_policy {
         let tokens = estimate_text_tokens(repo_policy);
         if tokens > 0 {
             plan.add_section(PromptSectionKind::RepoPolicy, tokens);
@@ -163,5 +174,35 @@ mod tests {
         assert_eq!(context.messages.len(), 1);
         assert_eq!(context.tools.len(), 1);
         assert_eq!(context.system_prompt.as_deref(), Some("system"));
+    }
+
+    #[test]
+    fn assemble_prompt_plan_extracts_embedded_repo_policy_from_system_prompt() {
+        let plan = assemble_prompt_plan(PromptAssemblyInputs {
+            system_prompt: Some(
+                "Base instructions.\n\n<pi_repo_policy_digest>\n# Repo Policy Digest\n\nAlways keep changes scoped.\n</pi_repo_policy_digest>\n\nCurrent date and time: <TIMESTAMP>"
+                    .to_string(),
+            ),
+            ..PromptAssemblyInputs::default()
+        });
+
+        let static_tokens = plan.token_breakdown.static_prefix;
+        let repo_tokens = plan.token_breakdown.repo_policy;
+
+        assert!(static_tokens > 0);
+        assert!(repo_tokens > 0);
+        assert_eq!(plan.sections.len(), 2);
+        assert_eq!(plan.sections[0].kind, PromptSectionKind::StaticPrefix);
+        assert_eq!(plan.sections[1].kind, PromptSectionKind::RepoPolicy);
+        assert!(
+            plan.system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("# Repo Policy Digest"))
+        );
+        assert!(
+            plan.system_prompt
+                .as_deref()
+                .is_some_and(|prompt| !prompt.contains("<pi_repo_policy_digest>"))
+        );
     }
 }
