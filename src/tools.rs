@@ -12,10 +12,10 @@ use crate::agent_cx::AgentCx;
 use crate::config::{Config, ReliabilityEnforcementMode};
 use crate::error::{Error, Result};
 use crate::extensions::{
-    DangerousCommandClass, ExecMediationPolicy, ExecMediationResult, ExecRiskTier,
-    evaluate_exec_mediation, safe_canonicalize, sha256_hex_standalone, strip_unc_prefix,
+    ExecMediationPolicy, ExecRiskTier, safe_canonicalize, sha256_hex_standalone, strip_unc_prefix,
 };
 use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::runtime::policy::{BUILTIN_BASH_POLICY_SOURCE, evaluate_shell_command_policy};
 use crate::sandbox::build_bash_spawn_plan;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
@@ -2043,46 +2043,6 @@ impl BashTool {
     }
 }
 
-fn classify_interactive_bash_command(command: &str) -> Option<&'static str> {
-    let lower = command.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-
-    let first_token = lower.split_whitespace().next().unwrap_or_default();
-    if matches!(
-        first_token,
-        "vi" | "vim"
-            | "nvim"
-            | "nano"
-            | "less"
-            | "more"
-            | "man"
-            | "top"
-            | "htop"
-            | "watch"
-            | "tmux"
-            | "screen"
-    ) {
-        return Some("terminal_ui");
-    }
-    if first_token == "ssh" {
-        return Some("remote_shell");
-    }
-
-    if lower.starts_with("tail -f")
-        || lower.contains(" tail -f ")
-        || lower.contains(" tail -f\t")
-        || lower.contains(" --interactive")
-        || lower.contains(" -it ")
-        || lower.ends_with(" -it")
-    {
-        return Some("interactive_stream");
-    }
-
-    None
-}
-
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for BashTool {
@@ -2124,77 +2084,46 @@ impl Tool for BashTool {
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let hard_mode = self.hard_mode_enabled();
         let mediation_policy = self.effective_exec_mediation_policy();
-        let mediation = evaluate_exec_mediation(&mediation_policy, &input.command, &[]);
-        let interactive_class = if hard_mode {
-            classify_interactive_bash_command(&input.command)
-        } else {
-            None
-        };
-
-        let (decision, command_class, risk_tier, reason) = match &mediation {
-            ExecMediationResult::Allow => ("allow", None, None, None),
-            ExecMediationResult::AllowWithAudit { class, reason } => (
-                "allow_with_audit",
-                Some(class.label()),
-                Some(class.risk_tier().label()),
-                Some(reason.clone()),
-            ),
-            ExecMediationResult::Deny { class, reason } => (
-                "deny",
-                class.map(DangerousCommandClass::label),
-                class.map(|c| c.risk_tier().label()),
-                Some(reason.clone()),
-            ),
-        };
-
-        let interactive_reason = interactive_class.map(|class| {
-            format!(
-                "Command classified as interactive ({class}) and denied in hard reliability mode"
-            )
-        });
-        let denial_reason = match &mediation {
-            ExecMediationResult::Deny { reason, .. } => Some(reason.clone()),
-            _ => interactive_reason.clone(),
-        };
-        let final_decision = if denial_reason.is_some() {
-            "deny"
-        } else {
-            decision
-        };
+        let policy_decision =
+            evaluate_shell_command_policy(&mediation_policy, &input.command, hard_mode);
+        let denial_reason = policy_decision
+            .is_denied()
+            .then(|| policy_decision.reason.clone())
+            .flatten();
 
         let mut exec_mediation_details = serde_json::Map::new();
         exec_mediation_details.insert(
             "decision".to_string(),
-            serde_json::Value::String(final_decision.to_string()),
+            serde_json::Value::String(policy_decision.decision_label().to_string()),
         );
         exec_mediation_details.insert(
             "policySource".to_string(),
-            serde_json::Value::String("builtin_bash_exec_mediation".to_string()),
+            serde_json::Value::String(BUILTIN_BASH_POLICY_SOURCE.to_string()),
         );
         exec_mediation_details.insert("hardMode".to_string(), serde_json::Value::Bool(hard_mode));
         exec_mediation_details.insert(
             "commandHash".to_string(),
             serde_json::Value::String(sha256_hex_standalone(&input.command)),
         );
-        if let Some(class) = command_class {
+        if let Some(class) = policy_decision.command_class {
             exec_mediation_details.insert(
                 "commandClass".to_string(),
                 serde_json::Value::String(class.to_string()),
             );
         }
-        if let Some(tier) = risk_tier {
+        if let Some(tier) = policy_decision.risk_tier {
             exec_mediation_details.insert(
                 "riskTier".to_string(),
                 serde_json::Value::String(tier.to_string()),
             );
         }
-        if let Some(class) = interactive_class {
+        if let Some(class) = policy_decision.interactive_class {
             exec_mediation_details.insert(
                 "interactiveClass".to_string(),
                 serde_json::Value::String(class.to_string()),
             );
         }
-        if let Some(reason) = denial_reason.clone().or_else(|| reason.clone()) {
+        if let Some(reason) = policy_decision.reason.clone() {
             exec_mediation_details.insert("reason".to_string(), serde_json::Value::String(reason));
         }
 
@@ -2258,7 +2187,9 @@ impl Tool for BashTool {
                 serde_json::Value::String(note.clone()),
             );
         }
-        if decision != "allow" || interactive_class.is_some() {
+        if policy_decision.decision_label() != "allow"
+            || policy_decision.interactive_class.is_some()
+        {
             details_map.insert(
                 "execMediation".to_string(),
                 serde_json::Value::Object(exec_mediation_details),
