@@ -1,10 +1,11 @@
-use crate::model::Message;
+use crate::model::{CustomMessage, Message};
 use crate::prompt_plan::{
-    PromptAssemblyPlan, PromptSectionKind, estimate_messages_tokens, estimate_text_tokens,
-    estimate_tools_tokens,
+    PromptAssemblyPlan, PromptSectionKind, estimate_message_tokens, estimate_messages_tokens,
+    estimate_text_tokens, estimate_tools_tokens,
 };
 use crate::provider::{Context, ToolDef};
 use crate::repo_policy::split_embedded_repo_policy;
+use serde_json::json;
 
 #[derive(Debug, Clone, Default)]
 pub struct PromptAssemblyInputs {
@@ -63,32 +64,43 @@ pub fn assemble_prompt_plan(inputs: PromptAssemblyInputs) -> PromptAssemblyPlan 
         plan.add_section(PromptSectionKind::StaticPrefix, tool_tokens);
     }
 
-    if let Some(repo_policy) = &explicit_repo_policy {
-        let tokens = estimate_text_tokens(repo_policy);
-        if tokens > 0 {
-            plan.add_section(PromptSectionKind::RepoPolicy, tokens);
-        }
+    if system_prompt
+        .as_ref()
+        .and_then(|split| split.repo_policy.as_ref())
+        .is_none()
+        && let Some(note) =
+            prompt_section_message(PromptSectionKind::RepoPolicy, &explicit_repo_policy)
+    {
+        plan.add_section(
+            PromptSectionKind::RepoPolicy,
+            estimate_message_tokens(&note),
+        );
+        plan.messages.push(note);
     }
 
-    if let Some(task_manifest) = &inputs.task_manifest {
-        let tokens = estimate_text_tokens(task_manifest);
-        if tokens > 0 {
-            plan.add_section(PromptSectionKind::TaskManifest, tokens);
-        }
+    if let Some(note) =
+        prompt_section_message(PromptSectionKind::TaskManifest, &inputs.task_manifest)
+    {
+        plan.add_section(
+            PromptSectionKind::TaskManifest,
+            estimate_message_tokens(&note),
+        );
+        plan.messages.push(note);
     }
 
-    if let Some(retrieval_bundle) = &inputs.retrieval_bundle {
-        let tokens = estimate_text_tokens(retrieval_bundle);
-        if tokens > 0 {
-            plan.add_section(PromptSectionKind::RetrievalBundle, tokens);
-        }
+    if let Some(note) =
+        prompt_section_message(PromptSectionKind::RetrievalBundle, &inputs.retrieval_bundle)
+    {
+        plan.add_section(
+            PromptSectionKind::RetrievalBundle,
+            estimate_message_tokens(&note),
+        );
+        plan.messages.push(note);
     }
 
-    if let Some(evidence) = &inputs.evidence {
-        let tokens = estimate_text_tokens(evidence);
-        if tokens > 0 {
-            plan.add_section(PromptSectionKind::Evidence, tokens);
-        }
+    if let Some(note) = prompt_section_message(PromptSectionKind::Evidence, &inputs.evidence) {
+        plan.add_section(PromptSectionKind::Evidence, estimate_message_tokens(&note));
+        plan.messages.push(note);
     }
 
     let fallback_tokens = estimate_messages_tokens(&inputs.fallback_history);
@@ -101,7 +113,7 @@ pub fn assemble_prompt_plan(inputs: PromptAssemblyInputs) -> PromptAssemblyPlan 
         plan.add_section(PromptSectionKind::FreshTurn, fresh_turn_tokens);
     }
 
-    plan.messages = inputs.fallback_history;
+    plan.messages.extend(inputs.fallback_history);
     plan.messages.extend(inputs.fresh_turn);
     plan
 }
@@ -112,6 +124,21 @@ pub fn context_from_prompt_plan(plan: &PromptAssemblyPlan) -> Context<'static> {
         plan.messages.clone(),
         plan.tools.clone(),
     )
+}
+
+fn prompt_section_message(kind: PromptSectionKind, content: &Option<String>) -> Option<Message> {
+    let content = content.as_deref()?.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(Message::Custom(CustomMessage {
+        content: format!("[{}]\n{content}", kind.label()),
+        custom_type: "prompt_section".to_string(),
+        display: false,
+        details: Some(json!({ "section": kind.label() })),
+        timestamp: 0,
+    }))
 }
 
 #[cfg(test)]
@@ -151,7 +178,8 @@ mod tests {
         assert!(kinds.contains(&PromptSectionKind::Evidence));
         assert!(kinds.contains(&PromptSectionKind::FallbackHistory));
         assert!(kinds.contains(&PromptSectionKind::FreshTurn));
-        assert_eq!(plan.messages.len(), 2);
+        assert_eq!(plan.messages.len(), 6);
+        assert!(matches!(plan.messages[0], Message::Custom(_)));
         assert!(plan.token_breakdown.total_estimate() > 0);
     }
 
@@ -204,5 +232,30 @@ mod tests {
                 .as_deref()
                 .is_some_and(|prompt| !prompt.contains("<pi_repo_policy_digest>"))
         );
+    }
+
+    #[test]
+    fn assemble_prompt_plan_injects_task_runtime_notes_before_history() {
+        let plan = assemble_prompt_plan(PromptAssemblyInputs {
+            task_manifest: Some("active task: tighten prompt flow".to_string()),
+            retrieval_bundle: Some("symbol: Agent::build_context".to_string()),
+            evidence: Some("verification: pending".to_string()),
+            fallback_history: vec![Message::User(UserMessage {
+                content: UserContent::Text("history".to_string()),
+                timestamp: 0,
+            })],
+            fresh_turn: vec![Message::User(UserMessage {
+                content: UserContent::Text("fresh".to_string()),
+                timestamp: 1,
+            })],
+            ..PromptAssemblyInputs::default()
+        });
+
+        assert_eq!(plan.messages.len(), 5);
+        assert!(matches!(plan.messages[0], Message::Custom(_)));
+        assert!(matches!(plan.messages[1], Message::Custom(_)));
+        assert!(matches!(plan.messages[2], Message::Custom(_)));
+        assert!(matches!(plan.messages[3], Message::User(_)));
+        assert!(matches!(plan.messages[4], Message::User(_)));
     }
 }
