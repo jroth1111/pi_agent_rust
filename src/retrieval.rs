@@ -117,6 +117,10 @@ pub fn symbol_outline_for_file(path: &Path, max_symbol_lines: usize) -> String {
         return "unavailable".to_string();
     };
 
+    symbol_outline_for_text(&content, max_symbol_lines)
+}
+
+pub fn symbol_outline_for_text(content: &str, max_symbol_lines: usize) -> String {
     let mut symbols = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();

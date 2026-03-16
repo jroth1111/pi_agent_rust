@@ -2574,12 +2574,16 @@ impl Session {
         text
     }
 
-    fn tool_path_from_arguments(arguments: &Value) -> Option<String> {
+    fn tool_path_from_arguments_for_tool(tool_name: &str, arguments: &Value) -> Option<String> {
         arguments
             .as_object()
             .and_then(|args| args.get("path"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
+            .or_else(|| match tool_name {
+                "grep" | "find" | "ls" => Some(".".to_string()),
+                _ => None,
+            })
     }
 
     fn tool_command_from_arguments(arguments: &Value) -> Option<String> {
@@ -2675,6 +2679,31 @@ impl Session {
         vec![ContentBlock::Text(TextContent::new(format!(
             "[Truncated {tool_name} output omitted from replay{scope}. Full results remain at {artifact_ref}; use bash to inspect that file if exact output is needed.]"
         )))]
+    }
+
+    fn tool_output_replay_summary(details: Option<&Value>) -> Option<String> {
+        details
+            .and_then(|value| value.get("outputCompaction"))
+            .and_then(|value| value.get("replaySummary"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
+    fn replay_summary_notice(
+        tool_name: &str,
+        path: Option<&str>,
+        artifact_ref: Option<&str>,
+    ) -> Vec<ContentBlock> {
+        let scope = path.map_or_else(String::new, |path| format!(" for {path}"));
+        let fallback = match artifact_ref {
+            Some(artifact_ref) => format!(
+                "[Consumed {tool_name} output omitted from replay{scope}; covered by prompt retrieval context; full={artifact_ref}]"
+            ),
+            None => format!(
+                "[Consumed {tool_name} output omitted from replay{scope}; covered by prompt retrieval context; rerun the tool if exact output is needed.]"
+            ),
+        };
+        vec![ContentBlock::Text(TextContent::new(fallback))]
     }
 
     fn prompt_path_components<'a, F>(
@@ -3713,6 +3742,7 @@ struct PromptVerificationRecord {
 pub(crate) struct PromptAssemblyMetadata {
     consumed_tool_results: HashSet<String>,
     verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
+    retrieval_manifest_paths: HashSet<String>,
 }
 
 const PROMPT_MANIFEST_MAX_EVIDENCE_ROWS: usize = 4;
@@ -3730,9 +3760,12 @@ impl PromptAssemblyPlan {
         entries: &[&SessionEntry],
         workspace_root: Option<&Path>,
     ) -> Self {
-        let metadata = prompt_metadata_from_entries(entries.iter().copied());
+        let mut metadata = prompt_metadata_from_entries(entries.iter().copied());
         let mut session_messages = prefix_messages;
-        if let Some(manifest_message) = build_prompt_manifest(entries, workspace_root) {
+        let (manifest_message, retrieval_manifest_paths) =
+            build_prompt_manifest(entries, workspace_root, &metadata);
+        metadata.retrieval_manifest_paths = retrieval_manifest_paths;
+        if let Some(manifest_message) = manifest_message {
             session_messages.push(manifest_message);
         }
         for entry in entries {
@@ -3769,6 +3802,7 @@ pub(crate) fn prompt_assembly_plan_from_entries<'a>(
 struct PromptManifestBuilder {
     tool_calls: HashMap<String, PromptToolCall>,
     retrieval_targets: BTreeMap<String, PromptRetrievalCandidate>,
+    consumed_retrieval_paths: HashSet<String>,
     tasks: HashMap<String, PromptTaskSnapshot>,
     last_task_id: Option<String>,
     state_digest: Option<StateDigest>,
@@ -3837,9 +3871,11 @@ struct PromptManifestEvidence {
 }
 
 impl PromptManifestBuilder {
-    fn observe_entry(&mut self, entry: &SessionEntry) {
+    fn observe_entry(&mut self, entry: &SessionEntry, consumed_tool_results: &HashSet<String>) {
         match entry {
-            SessionEntry::Message(message_entry) => self.observe_message(&message_entry.message),
+            SessionEntry::Message(message_entry) => {
+                self.observe_message(&message_entry.message, consumed_tool_results);
+            }
             SessionEntry::StateDigest(entry) => self.state_digest = Some(entry.digest.clone()),
             SessionEntry::TaskCreated(entry) => {
                 let task = self.touch_task(&entry.task_id);
@@ -3887,7 +3923,11 @@ impl PromptManifestBuilder {
         }
     }
 
-    fn observe_message(&mut self, message: &SessionMessage) {
+    fn observe_message(
+        &mut self,
+        message: &SessionMessage,
+        consumed_tool_results: &HashSet<String>,
+    ) {
         match message {
             SessionMessage::Assistant { message } => {
                 for block in &message.content {
@@ -3896,7 +3936,10 @@ impl PromptManifestBuilder {
                             call.id.clone(),
                             PromptToolCall {
                                 name: call.name.clone(),
-                                path: Session::tool_path_from_arguments(&call.arguments),
+                                path: Session::tool_path_from_arguments_for_tool(
+                                    &call.name,
+                                    &call.arguments,
+                                ),
                                 command: Session::tool_command_from_arguments(&call.arguments),
                             },
                         );
@@ -3921,6 +3964,9 @@ impl PromptManifestBuilder {
                     .entry(path.clone())
                     .or_default()
                     .observe(&tool_call.name);
+                if consumed_tool_results.contains(tool_call_id) {
+                    self.consumed_retrieval_paths.insert(path.clone());
+                }
             }
             _ => {}
         }
@@ -3931,7 +3977,10 @@ impl PromptManifestBuilder {
         self.tasks.entry(task_id.to_string()).or_default()
     }
 
-    fn into_session_message(self, workspace_root: Option<&Path>) -> Option<SessionMessage> {
+    fn into_session_message(
+        self,
+        workspace_root: Option<&Path>,
+    ) -> (Option<SessionMessage>, HashSet<String>) {
         let mut manifest = CompactManifest::default();
         let active_task_id = self.last_task_id.clone();
 
@@ -4041,6 +4090,7 @@ impl PromptManifestBuilder {
             );
         }
 
+        let consumed_retrieval_paths = self.consumed_retrieval_paths;
         let retrieval_targets = self
             .retrieval_targets
             .into_iter()
@@ -4048,10 +4098,10 @@ impl PromptManifestBuilder {
             .collect::<Vec<_>>();
         let mut retrieval_targets = retrieval_targets;
         retrieval_targets.sort_by(|left, right| {
-            right
-                .1
-                .score()
-                .cmp(&left.1.score())
+            consumed_retrieval_paths
+                .contains(&right.0)
+                .cmp(&consumed_retrieval_paths.contains(&left.0))
+                .then_with(|| right.1.score().cmp(&left.1.score()))
                 .then_with(|| left.0.cmp(&right.0))
         });
         let retrieval_targets = retrieval_targets
@@ -4062,8 +4112,14 @@ impl PromptManifestBuilder {
                 purpose: candidate.purpose(),
             })
             .collect::<Vec<_>>();
+        let retrieval_manifest_paths = retrieval_targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<HashSet<_>>();
 
-        let include_retrieval = !manifest.is_empty() || retrieval_targets.len() >= 2;
+        let include_retrieval = !manifest.is_empty()
+            || !consumed_retrieval_paths.is_empty()
+            || retrieval_targets.len() >= 2;
 
         if include_retrieval
             && let Some(workspace_root) = workspace_root
@@ -4112,26 +4168,30 @@ impl PromptManifestBuilder {
         }
 
         if manifest.is_empty() {
-            return None;
+            return (None, retrieval_manifest_paths);
         }
 
-        Some(SessionMessage::Custom {
-            custom_type: PROMPT_MANIFEST_CUSTOM_TYPE.to_string(),
-            content: format!("Prompt assembly manifest\n{}", manifest.render()),
-            display: false,
-            details: Some(serde_json::json!({ "synthetic": true })),
-            timestamp: Some(chrono::Utc::now().timestamp_millis()),
-        })
+        (
+            Some(SessionMessage::Custom {
+                custom_type: PROMPT_MANIFEST_CUSTOM_TYPE.to_string(),
+                content: format!("Prompt assembly manifest\n{}", manifest.render()),
+                display: false,
+                details: Some(serde_json::json!({ "synthetic": true })),
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            }),
+            retrieval_manifest_paths,
+        )
     }
 }
 
 fn build_prompt_manifest(
     entries: &[&SessionEntry],
     workspace_root: Option<&Path>,
-) -> Option<SessionMessage> {
+    metadata: &PromptAssemblyMetadata,
+) -> (Option<SessionMessage>, HashSet<String>) {
     let mut builder = PromptManifestBuilder::default();
     for entry in entries {
-        builder.observe_entry(entry);
+        builder.observe_entry(entry, &metadata.consumed_tool_results);
     }
     builder.into_session_message(workspace_root)
 }
@@ -4160,6 +4220,7 @@ struct PromptContextState {
     read_results: HashMap<(String, u64), PromptReadRecord>,
     consumed_tool_results: HashSet<String>,
     verification_records: HashMap<(String, i32), VecDeque<PromptVerificationRecord>>,
+    retrieval_manifest_paths: HashSet<String>,
 }
 
 impl PromptContextState {
@@ -4167,6 +4228,7 @@ impl PromptContextState {
         Self {
             consumed_tool_results: metadata.consumed_tool_results,
             verification_records: metadata.verification_records,
+            retrieval_manifest_paths: metadata.retrieval_manifest_paths,
             ..Self::default()
         }
     }
@@ -4180,7 +4242,10 @@ impl PromptContextState {
                             call.id.clone(),
                             PromptToolCall {
                                 name: call.name.clone(),
-                                path: Session::tool_path_from_arguments(&call.arguments),
+                                path: Session::tool_path_from_arguments_for_tool(
+                                    &call.name,
+                                    &call.arguments,
+                                ),
                                 command: Session::tool_command_from_arguments(&call.arguments),
                             },
                         );
@@ -4262,27 +4327,80 @@ impl PromptContextState {
                         }
                     }
                     "grep" | "find" | "ls" => {
-                        if self.consumed_tool_results.contains(tool_call_id)
-                            && Session::tool_output_was_truncated(details.as_ref())
-                            && let Some(artifact_ref) =
-                                Session::tool_full_output_path(details.as_ref())
-                        {
-                            return SessionMessage::ToolResult {
-                                tool_call_id: tool_call_id.to_string(),
-                                tool_name: tool_name.to_string(),
-                                content: Session::replay_artifact_notice(
-                                    &metadata.name,
-                                    metadata.path.as_deref(),
-                                    &artifact_ref,
-                                ),
-                                details,
-                                is_error,
-                                timestamp,
-                            };
+                        if self.consumed_tool_results.contains(tool_call_id) {
+                            let covered_by_manifest = metadata
+                                .path
+                                .as_ref()
+                                .is_some_and(|path| self.retrieval_manifest_paths.contains(path));
+                            if covered_by_manifest {
+                                let content = Session::tool_output_replay_summary(details.as_ref())
+                                    .map(|summary| {
+                                        vec![ContentBlock::Text(TextContent::new(summary))]
+                                    })
+                                    .unwrap_or_else(|| {
+                                        let artifact_ref =
+                                            Session::tool_full_output_path(details.as_ref());
+                                        Session::replay_summary_notice(
+                                            &metadata.name,
+                                            metadata.path.as_deref(),
+                                            artifact_ref.as_deref(),
+                                        )
+                                    });
+                                return SessionMessage::ToolResult {
+                                    tool_call_id: tool_call_id.to_string(),
+                                    tool_name: tool_name.to_string(),
+                                    content,
+                                    details,
+                                    is_error,
+                                    timestamp,
+                                };
+                            }
+                            if Session::tool_output_was_truncated(details.as_ref())
+                                && let Some(artifact_ref) =
+                                    Session::tool_full_output_path(details.as_ref())
+                            {
+                                return SessionMessage::ToolResult {
+                                    tool_call_id: tool_call_id.to_string(),
+                                    tool_name: tool_name.to_string(),
+                                    content: Session::replay_artifact_notice(
+                                        &metadata.name,
+                                        metadata.path.as_deref(),
+                                        &artifact_ref,
+                                    ),
+                                    details,
+                                    is_error,
+                                    timestamp,
+                                };
+                            }
                         }
                     }
                     "read" => {
                         if let Some(path) = &metadata.path {
+                            if self.consumed_tool_results.contains(tool_call_id)
+                                && self.retrieval_manifest_paths.contains(path)
+                            {
+                                let content = Session::tool_output_replay_summary(details.as_ref())
+                                    .map(|summary| {
+                                        vec![ContentBlock::Text(TextContent::new(summary))]
+                                    })
+                                    .unwrap_or_else(|| {
+                                        let artifact_ref =
+                                            Session::tool_full_output_path(details.as_ref());
+                                        Session::replay_summary_notice(
+                                            &metadata.name,
+                                            Some(path),
+                                            artifact_ref.as_deref(),
+                                        )
+                                    });
+                                return SessionMessage::ToolResult {
+                                    tool_call_id: tool_call_id.to_string(),
+                                    tool_name: tool_name.to_string(),
+                                    content,
+                                    details,
+                                    is_error,
+                                    timestamp,
+                                };
+                            }
                             let version = self.file_versions.get(path).copied().unwrap_or_default();
                             let key = (path.clone(), version);
                             if let Some(fingerprint) = Session::dedupable_read_fingerprint(content)
@@ -6624,7 +6742,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_messages_for_current_path_dedups_identical_repeated_reads() {
+    fn test_to_messages_for_current_path_keeps_latest_read_raw_when_prior_read_is_consumed() {
         let mut session = Session::in_memory();
         session.append_message(make_test_message("read the file twice"));
         session.append_message(make_test_tool_call("call-1", "read", "src/lib.rs"));
@@ -6633,20 +6751,20 @@ mod tests {
         session.append_message(make_test_tool_result("call-2", "read", "same contents"));
 
         let messages = session.to_messages_for_current_path();
-        assert_eq!(messages.len(), 5);
+        let read_results = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "read" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(read_results.len(), 2);
 
-        let first = match &messages[2] {
-            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
-            other => panic!("expected first tool result, got {other:?}"),
-        };
-        let second = match &messages[4] {
-            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
-            other => panic!("expected second tool result, got {other:?}"),
-        };
-
-        assert_eq!(first, "same contents");
-        assert!(second.contains("Repeated read omitted"));
-        assert!(second.contains("src/lib.rs"));
+        assert!(read_results[0].contains("Consumed read output omitted from replay"));
+        assert!(read_results[0].contains("src/lib.rs"));
+        assert_eq!(read_results[1], "same contents");
     }
 
     #[test]
@@ -6661,12 +6779,16 @@ mod tests {
         session.append_message(make_test_tool_result("call-3", "read", "same contents"));
 
         let messages = session.to_messages_for_current_path();
-        assert_eq!(messages.len(), 7);
-
-        let reread = match &messages[6] {
-            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
-            other => panic!("expected reread tool result, got {other:?}"),
-        };
+        let reread = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "read" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .last()
+            .expect("expected reread tool result");
 
         assert_eq!(reread, "same contents");
     }
@@ -6707,10 +6829,14 @@ mod tests {
         });
 
         let messages = session.to_messages_for_current_path();
-        let repeated = match &messages[4] {
-            Message::ToolResult(result) => &result.content,
-            other => panic!("expected repeated image tool result, got {other:?}"),
-        };
+        let repeated = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "read" => Some(&result.content),
+                _ => None,
+            })
+            .last()
+            .expect("expected repeated image tool result");
 
         assert!(
             repeated
@@ -6852,6 +6978,12 @@ mod tests {
             details: Some(serde_json::json!({
                 "truncation": { "totalBytes": 60000 },
                 "fullOutputPath": "/tmp/pi-grep-test.log",
+                "outputCompaction": {
+                    "family": "grep",
+                    "strategy": "replay_summary",
+                    "artifactBacked": true,
+                    "replaySummary": "[Consumed grep output folded into retrieval manifest for src; files=1; matches=1; sample=src/session.rs:2540; full=/tmp/pi-grep-test.log]"
+                }
             })),
             is_error: false,
             timestamp: Some(0),
@@ -6859,15 +6991,125 @@ mod tests {
         session.append_message(make_test_assistant_text("I found the relevant matches"));
 
         let messages = session.to_messages_for_current_path();
-        let output = match &messages[2] {
-            Message::ToolResult(result) => Session::text_from_blocks(&result.content),
-            other => panic!("expected grep tool result, got {other:?}"),
-        };
+        let output = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "grep" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected grep tool result");
 
-        assert!(output.contains("Truncated grep output omitted from replay"));
+        assert!(output.contains("Consumed grep output folded into retrieval manifest"));
         assert!(output.contains("/tmp/pi-grep-test.log"));
         assert!(output.contains("src"));
         assert!(!output.contains("large grep output"));
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_folds_consumed_read_into_retrieval_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path();
+        std::fs::create_dir_all(workspace.join("src")).expect("mkdir src");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub struct Demo;\n\npub fn run() {}\n",
+        )
+        .expect("write lib");
+
+        let mut session = Session::in_memory();
+        session.header.cwd = workspace.display().to_string();
+        session.append_message(make_test_message("inspect the target file"));
+        session.append_message(make_test_tool_call("call-1", "read", "src/lib.rs"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "    1→pub struct Demo;\n    2→\n    3→pub fn run() {}",
+            ))],
+            details: Some(serde_json::json!({
+                "outputCompaction": {
+                    "family": "read",
+                    "strategy": "replay_summary",
+                    "artifactBacked": false,
+                    "replaySummary": "[Consumed read output folded into retrieval manifest for src/lib.rs; lines=1-3; outline=pub struct Demo; pub fn run() {}]"
+                }
+            })),
+            is_error: false,
+            timestamp: Some(0),
+        });
+        session.append_message(make_test_assistant_text("I found the relevant symbol"));
+
+        let messages = session.to_messages_for_current_path();
+        let manifest = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Custom(custom) if custom.custom_type == PROMPT_MANIFEST_CUSTOM_TYPE => {
+                    Some(custom.content.as_str())
+                }
+                _ => None,
+            })
+            .expect("expected prompt manifest");
+        let output = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "read" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected read tool result");
+
+        assert!(manifest.contains("@table code_retrieval"));
+        assert!(manifest.contains("src/lib.rs"));
+        assert!(output.contains("Consumed read output folded into retrieval manifest"));
+        assert!(!output.contains("1→pub struct Demo"));
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_folds_consumed_grep_into_replay_summary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path();
+        std::fs::create_dir_all(workspace.join("src")).expect("mkdir src");
+        std::fs::write(workspace.join("src/lib.rs"), "pub struct Demo;\n").expect("write lib");
+
+        let mut session = Session::in_memory();
+        session.header.cwd = workspace.display().to_string();
+        session.append_message(make_test_message("search for Demo"));
+        session.append_message(make_test_tool_call("call-1", "grep", "src"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "grep".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "src/lib.rs:1: pub struct Demo;",
+            ))],
+            details: Some(serde_json::json!({
+                "outputCompaction": {
+                    "family": "grep",
+                    "strategy": "replay_summary",
+                    "artifactBacked": false,
+                    "replaySummary": "[Consumed grep output folded into retrieval manifest for src; files=1; matches=1; sample=src/lib.rs:1]"
+                }
+            })),
+            is_error: false,
+            timestamp: Some(0),
+        });
+        session.append_message(make_test_assistant_text("The symbol lives in src/lib.rs"));
+
+        let messages = session.to_messages_for_current_path();
+        let output = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "grep" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected grep tool result");
+
+        assert!(output.contains("Consumed grep output folded into retrieval manifest"));
+        assert!(!output.contains("src/lib.rs:1: pub struct Demo;"));
     }
 
     #[test]
