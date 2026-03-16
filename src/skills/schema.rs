@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 
 pub const MAX_SKILL_NAME_LEN: usize = 64;
@@ -30,7 +31,8 @@ pub struct SkillSections {
     pub instructions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillLineage {
     pub created_by_skill: Option<String>,
     pub created_by_revision: Option<String>,
@@ -42,6 +44,16 @@ pub struct SkillLineage {
 }
 
 impl SkillLineage {
+    pub fn is_empty(&self) -> bool {
+        self.created_by_skill.is_none()
+            && self.created_by_revision.is_none()
+            && self.last_improved_by_skill.is_none()
+            && self.last_improved_by_revision.is_none()
+            && self.session_id.is_none()
+            && self.intended_outcome.is_none()
+            && self.baseline.is_none()
+    }
+
     pub fn has_creator(&self) -> bool {
         self.created_by_skill.is_some()
     }

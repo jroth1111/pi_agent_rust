@@ -1,7 +1,7 @@
 use super::loader::{LoadSkillsOptions, load_skills};
 use super::schema::{
-    ExplicitSkillInvocation, Skill, SkillSections, parse_frontmatter, parse_skill_sections,
-    strip_frontmatter,
+    ExplicitSkillInvocation, Skill, SkillLineage, SkillSections, parse_frontmatter,
+    parse_skill_sections, strip_frontmatter,
 };
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -75,6 +75,8 @@ pub struct SkillObservation {
     pub activation_source: SkillActivationSource,
     pub task_preview: String,
     pub outcome: SkillRunOutcome,
+    #[serde(default, skip_serializing_if = "SkillLineage::is_empty")]
+    pub lineage: SkillLineage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_failures: Vec<SkillToolFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +152,8 @@ pub struct SkillFeedback {
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub skill_digest: String,
+    #[serde(default, skip_serializing_if = "SkillLineage::is_empty")]
+    pub lineage: SkillLineage,
     pub rating: u8,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub notes: String,
@@ -291,6 +295,7 @@ struct TrackedSkill {
     name: String,
     path: PathBuf,
     digest: String,
+    lineage: SkillLineage,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +309,7 @@ struct SkillFeedbackTarget {
     name: String,
     path: PathBuf,
     digest: String,
+    lineage: SkillLineage,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -350,6 +356,7 @@ impl SkillRunTracker {
                     name: skill.name.clone(),
                     path: skill.file_path.clone(),
                     digest: file_digest(&skill.file_path),
+                    lineage: skill.lineage.clone(),
                 },
             );
         }
@@ -452,6 +459,7 @@ impl SkillRunTracker {
                 name: skill_name.to_string(),
                 path: path.to_path_buf(),
                 digest: file_digest(path),
+                lineage: SkillLineage::default(),
             });
         self.activations
             .entry(skill.name.clone())
@@ -472,6 +480,7 @@ impl SkillRunTracker {
                 activation_source: activation.source,
                 task_preview: self.task_preview.clone(),
                 outcome,
+                lineage: activation.skill.lineage.clone(),
                 tool_failures: self.tool_failures.clone(),
                 agent_error: self.agent_error.clone(),
             })
@@ -524,6 +533,7 @@ pub fn handle_skill_feedback(
         skill_name: target.name,
         skill_path: target.path,
         skill_digest: target.digest,
+        lineage: target.lineage,
         rating,
         notes: normalize_optional_text(notes).unwrap_or_default(),
     };
@@ -552,12 +562,6 @@ pub fn handle_skill_doctor(
     fix: bool,
 ) -> Result<SkillDoctorReport> {
     let criteria = SkillSuccessCriteria::default();
-    let loaded_skills = load_skills(LoadSkillsOptions {
-        cwd: cwd.to_path_buf(),
-        agent_dir: Config::global_dir(),
-        skill_paths: Vec::new(),
-        include_defaults: true,
-    });
     let observations = load_observations(cwd)?;
     let feedback = load_feedback(cwd)?;
     let amendments = load_amendments(cwd)?;
@@ -642,7 +646,14 @@ pub fn handle_skill_doctor(
         }
     }
 
-    let producers = build_skill_producer_reports(&loaded_skills.skills, &skills);
+    let loaded_skills = load_skills(LoadSkillsOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir: Config::global_dir(),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+    let producers =
+        build_skill_producer_reports(&loaded_skills.skills, &skills, &observations, &feedback);
     let report = SkillDoctorReport {
         criteria,
         observation_count: observations.len(),
@@ -798,6 +809,8 @@ fn mark_report_pending_for_unobserved_revision(
 fn build_skill_producer_reports(
     loaded_skills: &[Skill],
     skill_reports: &[SkillHealthReport],
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
 ) -> Vec<SkillProducerReport> {
     let reports_by_path = skill_reports
         .iter()
@@ -809,18 +822,11 @@ fn build_skill_producer_reports(
         let report = reports_by_path
             .get(&canonicalize_with_fallback(&skill.file_path))
             .copied();
-        if let Some(key) = producer_key(
-            SkillProducerRole::Creator,
-            skill.lineage.created_by_skill.as_deref(),
-            skill.lineage.created_by_revision.as_deref(),
-        ) {
-            grouped.entry(key).or_default().push(report);
-        }
-        if let Some(key) = producer_key(
-            SkillProducerRole::Improver,
-            skill.lineage.last_improved_by_skill.as_deref(),
-            skill.lineage.last_improved_by_revision.as_deref(),
-        ) {
+        let lineage = report.map_or_else(
+            || skill.lineage.clone(),
+            |report| lineage_for_skill_report(report, skill, observations, feedback),
+        );
+        if let Some(key) = producer_key_from_lineage(&lineage) {
             grouped.entry(key).or_default().push(report);
         }
     }
@@ -831,16 +837,72 @@ fn build_skill_producer_reports(
         .collect()
 }
 
-fn producer_key(
-    role: SkillProducerRole,
-    name: Option<&str>,
-    revision: Option<&str>,
-) -> Option<SkillProducerKey> {
-    let name = name.map(str::trim).filter(|value| !value.is_empty())?;
+fn lineage_for_skill_report(
+    report: &SkillHealthReport,
+    skill: &Skill,
+    observations: &[SkillObservation],
+    feedback: &[SkillFeedback],
+) -> SkillLineage {
+    if report.current_digest != report.latest_digest {
+        return skill.lineage.clone();
+    }
+
+    observations
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.skill_name == report.skill_name
+                && entry.skill_path == report.skill_path
+                && entry.skill_digest == report.latest_digest
+                && !entry.lineage.is_empty()
+        })
+        .map(|entry| entry.lineage.clone())
+        .or_else(|| {
+            feedback
+                .iter()
+                .rev()
+                .find(|entry| {
+                    entry.skill_name == report.skill_name
+                        && entry.skill_path == report.skill_path
+                        && entry.skill_digest == report.latest_digest
+                        && !entry.lineage.is_empty()
+                })
+                .map(|entry| entry.lineage.clone())
+        })
+        .filter(|lineage| !lineage.is_empty())
+        .unwrap_or_else(|| skill.lineage.clone())
+}
+
+fn producer_key_from_lineage(lineage: &SkillLineage) -> Option<SkillProducerKey> {
+    if let Some(name) = lineage
+        .last_improved_by_skill
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(SkillProducerKey {
+            role: SkillProducerRole::Improver,
+            name: name.to_string(),
+            revision: lineage
+                .last_improved_by_revision
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+        });
+    }
+
+    let name = lineage
+        .created_by_skill
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
     Some(SkillProducerKey {
-        role,
+        role: SkillProducerRole::Creator,
         name: name.to_string(),
-        revision: revision
+        revision: lineage
+            .created_by_revision
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string),
@@ -2142,6 +2204,7 @@ fn resolve_skill_feedback_target(
                 name: observation.skill_name.clone(),
                 path: observation.skill_path.clone(),
                 digest: observation.skill_digest.clone(),
+                lineage: observation.lineage.clone(),
             });
         }
     }
@@ -2161,6 +2224,7 @@ fn resolve_skill_feedback_target(
             name: skill.name,
             digest: file_digest(&skill.file_path),
             path: skill.file_path,
+            lineage: skill.lineage,
         });
     }
 
@@ -2173,6 +2237,7 @@ fn resolve_skill_feedback_target(
             name: observation.skill_name.clone(),
             path: observation.skill_path.clone(),
             digest: observation.skill_digest.clone(),
+            lineage: observation.lineage.clone(),
         });
     }
 
@@ -2268,6 +2333,7 @@ mod tests {
             skill_name: skill_name.to_string(),
             skill_path: skill_path.to_path_buf(),
             skill_digest: skill_digest.to_string(),
+            lineage: SkillLineage::default(),
             rating,
             notes: notes.to_string(),
         }
@@ -2328,6 +2394,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "bash".to_string(),
                     signature: "cargo: command not found".to_string(),
@@ -2345,6 +2412,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix again".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "bash".to_string(),
                     signature: "cargo: command not found".to_string(),
@@ -2362,6 +2430,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix again".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "bash".to_string(),
                     signature: "cargo: command not found".to_string(),
@@ -2443,6 +2512,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review this rust diff for bugs".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -2456,6 +2526,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "draft a launch email".to_string(),
                 outcome: SkillRunOutcome::AgentFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: Some("Wrong task".to_string()),
             },
@@ -2469,6 +2540,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "write release marketing copy".to_string(),
                 outcome: SkillRunOutcome::AgentFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: Some("Wrong task".to_string()),
             },
@@ -2709,6 +2781,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize this".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             }],
@@ -2767,6 +2840,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "bash".to_string(),
                     signature: "cargo: command not found".to_string(),
@@ -2784,6 +2858,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix again".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "bash".to_string(),
                     signature: "cargo: command not found".to_string(),
@@ -2801,6 +2876,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix once more".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "bash".to_string(),
                     signature: "cargo: command not found".to_string(),
@@ -2848,6 +2924,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix after amendment".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -2861,6 +2938,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix after amendment again".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -2874,6 +2952,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "fix after amendment one more time".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -2925,6 +3004,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review this rust diff for bugs".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -2938,6 +3018,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "draft a launch email".to_string(),
                 outcome: SkillRunOutcome::AgentFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: Some("Wrong task".to_string()),
             },
@@ -2951,6 +3032,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "write release marketing copy".to_string(),
                 outcome: SkillRunOutcome::AgentFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: Some("Wrong task".to_string()),
             },
@@ -3060,6 +3142,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review this diff".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3073,6 +3156,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review this diff again".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3086,6 +3170,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review this diff one more time".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3150,6 +3235,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review after amendment".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3163,6 +3249,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review after amendment again".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3176,6 +3263,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "review after amendment one more time".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3266,6 +3354,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "check this release candidate".to_string(),
                     outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
                     tool_failures: Vec::new(),
                     agent_error: None,
                 },
@@ -3279,6 +3368,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "audit this release branch".to_string(),
                     outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
                     tool_failures: Vec::new(),
                     agent_error: None,
                 },
@@ -3292,6 +3382,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "run release readiness".to_string(),
                     outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
                     tool_failures: Vec::new(),
                     agent_error: None,
                 },
@@ -3305,6 +3396,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "draft release notes".to_string(),
                     outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
                     tool_failures: vec![SkillToolFailure {
                         tool_name: "write".to_string(),
                         signature: "missing release summary".to_string(),
@@ -3322,6 +3414,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "draft notes again".to_string(),
                     outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
                     tool_failures: vec![SkillToolFailure {
                         tool_name: "write".to_string(),
                         signature: "missing release summary".to_string(),
@@ -3339,6 +3432,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "draft notes once more".to_string(),
                     outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
                     tool_failures: vec![SkillToolFailure {
                         tool_name: "write".to_string(),
                         signature: "missing release summary".to_string(),
@@ -3366,6 +3460,87 @@ mod tests {
         assert_eq!(producer.effective_descendant_skill_count, 1);
         assert_eq!(producer.needs_amendment_descendant_skill_count, 1);
         assert_eq!(producer.regressed_descendant_skill_count, 0);
+    }
+
+    #[test]
+    fn doctor_attributes_observed_child_to_latest_improver_only() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("deploy-readiness")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: deploy-readiness\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    last-improved-by-skill: pi-skills-doctor\n    last-improved-by-revision: managed-patch-v1\n    intended-outcome: catch release blockers before deploy\n    baseline: manual checklist review\n---\nReady\n",
+        )
+        .expect("write skill");
+        let digest = file_digest(&skill_path);
+        let lineage = parse_skill_lineage(
+            &parse_frontmatter(&fs::read_to_string(&skill_path).expect("read skill")).frontmatter,
+        );
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "check this release candidate".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: lineage.clone(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "audit this release branch".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: lineage.clone(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "run release readiness".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage,
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write observations");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        assert!(report.producers.iter().any(|producer| {
+            producer.producer_skill_name == PI_SKILLS_DOCTOR_NAME
+                && producer.role == SkillProducerRole::Improver
+                && producer.descendant_skill_count == 1
+        }));
+        assert!(!report.producers.iter().any(|producer| {
+            producer.producer_skill_name == "skill-creator"
+                && producer.role == SkillProducerRole::Creator
+        }));
     }
 
     #[test]
@@ -3397,6 +3572,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "fix first".to_string(),
                     outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
                     tool_failures: vec![SkillToolFailure {
                         tool_name: "bash".to_string(),
                         signature: "cargo: command not found".to_string(),
@@ -3414,6 +3590,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "fix second".to_string(),
                     outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
                     tool_failures: vec![SkillToolFailure {
                         tool_name: "bash".to_string(),
                         signature: "cargo: command not found".to_string(),
@@ -3431,6 +3608,7 @@ mod tests {
                     activation_source: SkillActivationSource::SlashCommand,
                     task_preview: "fix third".to_string(),
                     outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
                     tool_failures: vec![SkillToolFailure {
                         tool_name: "bash".to_string(),
                         signature: "cargo: command not found".to_string(),
@@ -3445,6 +3623,11 @@ mod tests {
         let report =
             handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
         assert_eq!(report.applied_amendments.len(), 1);
+        assert!(report.producers.iter().any(|producer| {
+            producer.producer_skill_name == PI_SKILLS_DOCTOR_NAME
+                && producer.role == SkillProducerRole::Improver
+                && producer.descendant_skill_count == 1
+        }));
         let raw = fs::read_to_string(&skill_path).expect("read amended skill");
         let parsed = parse_frontmatter(&raw);
         let lineage = parse_skill_lineage(&parsed.frontmatter);
@@ -3485,6 +3668,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize first".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3498,6 +3682,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize second".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3511,6 +3696,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize third".to_string(),
                 outcome: SkillRunOutcome::Success,
+                lineage: SkillLineage::default(),
                 tool_failures: Vec::new(),
                 agent_error: None,
             },
@@ -3552,6 +3738,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize after amendment".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "write".to_string(),
                     signature: "unexpected output".to_string(),
@@ -3569,6 +3756,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize after amendment again".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "write".to_string(),
                     signature: "unexpected output".to_string(),
@@ -3586,6 +3774,7 @@ mod tests {
                 activation_source: SkillActivationSource::SlashCommand,
                 task_preview: "summarize after amendment one more".to_string(),
                 outcome: SkillRunOutcome::ToolFailure,
+                lineage: SkillLineage::default(),
                 tool_failures: vec![SkillToolFailure {
                     tool_name: "write".to_string(),
                     signature: "unexpected output".to_string(),
