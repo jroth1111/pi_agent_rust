@@ -201,6 +201,7 @@ fn main_impl() -> Result<()> {
                         not_for,
                         trigger_examples,
                         anti_trigger_examples,
+                        success_criteria,
                         global,
                         format,
                     } => {
@@ -212,6 +213,7 @@ fn main_impl() -> Result<()> {
                             not_for,
                             trigger_examples,
                             anti_trigger_examples,
+                            success_criteria,
                             *global,
                             SkillDoctorFormat::parse(format)?,
                         )?;
@@ -1427,6 +1429,7 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 not_for,
                 trigger_examples,
                 anti_trigger_examples,
+                success_criteria,
                 global,
                 format,
             } => {
@@ -1438,6 +1441,7 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                     &not_for,
                     &trigger_examples,
                     &anti_trigger_examples,
+                    &success_criteria,
                     global,
                     SkillDoctorFormat::parse(&format)?,
                 )?;

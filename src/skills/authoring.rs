@@ -64,6 +64,7 @@ pub fn handle_skill_init(
     not_for: &str,
     trigger_examples: &[String],
     anti_trigger_examples: &[String],
+    success_criteria: &[String],
     global: bool,
     format: SkillDoctorFormat,
 ) -> Result<SkillInitReceipt> {
@@ -75,6 +76,7 @@ pub fn handle_skill_init(
         not_for,
         trigger_examples,
         anti_trigger_examples,
+        success_criteria,
         global,
     )?;
 
@@ -186,12 +188,16 @@ fn create_skill_scaffold(
     not_for: &str,
     trigger_examples: &[String],
     anti_trigger_examples: &[String],
+    success_criteria: &[String],
     global: bool,
 ) -> Result<SkillInitReceipt> {
     let name = name.trim();
     let description = description.trim();
     let use_when = use_when.trim();
     let not_for = not_for.trim();
+    let trigger_examples = normalize_examples(trigger_examples);
+    let anti_trigger_examples = normalize_examples(anti_trigger_examples);
+    let success_criteria = normalize_examples(success_criteria);
 
     let mut validation_errors = validate_name(name, name);
     validation_errors.extend(validate_description(description));
@@ -200,6 +206,22 @@ fn create_skill_scaffold(
     }
     if not_for.is_empty() {
         validation_errors.push("`--not-for` is required".to_string());
+    }
+    if trigger_examples.len() < 2 {
+        validation_errors.push(
+            "at least two concrete `--trigger` examples are required before scaffolding"
+                .to_string(),
+        );
+    }
+    if anti_trigger_examples.len() < 2 {
+        validation_errors.push(
+            "at least two concrete `--anti-trigger` examples are required before scaffolding"
+                .to_string(),
+        );
+    }
+    if success_criteria.is_empty() {
+        validation_errors
+            .push("at least one `--success-criterion` is required before scaffolding".to_string());
     }
     if !validation_errors.is_empty() {
         return Err(Error::validation(validation_errors.join("; ")));
@@ -226,8 +248,9 @@ fn create_skill_scaffold(
         description,
         use_when,
         not_for,
-        trigger_examples,
-        anti_trigger_examples,
+        &trigger_examples,
+        &anti_trigger_examples,
+        &success_criteria,
     );
     fs::write(&skill_path, body.as_bytes()).map_err(|err| {
         Error::config(format!(
@@ -422,32 +445,24 @@ fn render_skill_template(
     not_for: &str,
     trigger_examples: &[String],
     anti_trigger_examples: &[String],
+    success_criteria: &[String],
 ) -> String {
     let full_description = build_skill_description(description, use_when, not_for);
     let title = humanize_skill_name(name);
 
-    let trigger_examples = scaffold_examples(
-        trigger_examples,
-        "Replace with a concrete request that should activate this skill.",
-    );
-    let anti_trigger_examples = scaffold_examples(
-        anti_trigger_examples,
-        "Replace with a near-miss request that should not activate this skill.",
-    );
-
     format!(
-        "---\nname: {}\ndescription: {}\n---\n# {}\n\n## Purpose\n{}\n\n## Use When\n- {}\n\n## Not For\n- {}\n\n## Trigger Examples\n{}\n\n## Anti-Trigger Examples\n{}\n\n## Inputs\n- {} List required inputs, optional inputs, and missing-input behavior.\n\n## Output Contract\n- {} Describe the exact response shape, files, and verification evidence this skill must produce.\n\n## Success Criteria\n- Reach at least 80% successful observed runs across 3 runs.\n- Reach at least 3.5/5 average feedback across 2 ratings.\n- {} Add task-specific thresholds or a baseline this skill must beat.\n\n## Instructions\n1. Restate the task and confirm the needed inputs.\n2. Follow the output contract exactly.\n3. Verify the result before responding.\n4. State blockers explicitly instead of guessing.\n",
+        "---\nname: {}\ndescription: {}\n---\n# {}\n\n## Purpose\n{}\n\n## Use When\n- {}\n\n## Not For\n- {}\n\n## Trigger Examples\n{}\n\n## Anti-Trigger Examples\n{}\n\n## Inputs\n- {} List required inputs, optional inputs, and missing-input behavior.\n\n## Output Contract\n- {} Describe the exact response shape, files, and verification evidence this skill must produce.\n\n## Success Criteria\n- Reach at least 80% successful observed runs across 3 runs.\n- Reach at least 3.5/5 average feedback across 2 ratings.\n{}\n\n## Instructions\n1. Restate the task and confirm the needed inputs.\n2. Follow the output contract exactly.\n3. Verify the result before responding.\n4. State blockers explicitly instead of guessing.\n",
         name,
         yaml_quote(&full_description),
         title,
         description.trim_end_matches('.'),
         use_when.trim_end_matches('.'),
         not_for.trim_end_matches('.'),
-        format_examples(&trigger_examples),
-        format_examples(&anti_trigger_examples),
+        format_examples(trigger_examples),
+        format_examples(anti_trigger_examples),
         TODO_MARKER,
         TODO_MARKER,
-        TODO_MARKER,
+        format_examples(success_criteria),
     )
 }
 
@@ -532,22 +547,13 @@ fn trim_sentence(value: &str) -> &str {
     value.trim().trim_end_matches('.')
 }
 
-fn scaffold_examples(examples: &[String], placeholder: &str) -> Vec<String> {
-    let examples = examples
+fn normalize_examples(examples: &[String]) -> Vec<String> {
+    examples
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
-    if examples.is_empty() {
-        vec![
-            format!("{TODO_MARKER} {placeholder}"),
-            format!("{TODO_MARKER} Add a second distinct example with different wording."),
-        ]
-    } else {
-        examples
-    }
+        .collect::<Vec<_>>()
 }
 
 fn format_examples(examples: &[String]) -> String {
@@ -603,8 +609,15 @@ mod tests {
             "Check deploy readiness before release",
             "the user wants a release audit or go/no-go decision",
             "fixing unrelated product bugs",
-            &[],
-            &[],
+            &[
+                "run a deploy readiness check".to_string(),
+                "audit this release candidate".to_string(),
+            ],
+            &[
+                "fix this production outage".to_string(),
+                "write release marketing copy".to_string(),
+            ],
+            &["must identify all blocking deploy risks before release".to_string()],
             false,
         )
         .unwrap();
@@ -612,7 +625,31 @@ mod tests {
         let content = fs::read_to_string(&receipt.skill_path).unwrap();
         assert!(content.contains("## Trigger Examples"));
         assert!(content.contains("Use when the user wants a release audit or go/no-go decision."));
-        assert!(content.contains("TODO: Replace with a concrete request"));
+        assert!(content.contains("- run a deploy readiness check"));
+        assert!(content.contains("- audit this release candidate"));
+        assert!(content.contains("must identify all blocking deploy risks before release"));
+    }
+
+    #[test]
+    fn init_requires_concrete_examples_and_success_criteria() {
+        let tmp = TempDir::new().unwrap();
+        let err = create_skill_scaffold(
+            tmp.path(),
+            "deploy-readiness",
+            "Check deploy readiness before release",
+            "the user wants a release audit or go/no-go decision",
+            "fixing unrelated product bugs",
+            &["run a deploy readiness check".to_string()],
+            &["fix this production outage".to_string()],
+            &[],
+            false,
+        )
+        .expect_err("expected intake validation failure");
+
+        let message = err.to_string();
+        assert!(message.contains("at least two concrete `--trigger` examples"));
+        assert!(message.contains("at least two concrete `--anti-trigger` examples"));
+        assert!(message.contains("at least one `--success-criterion`"));
     }
 
     #[test]
@@ -709,11 +746,15 @@ mod tests {
             "Audit a release plan",
             "the user wants release readiness checked",
             "incident response",
-            &["audit this release plan".to_string()],
+            &[
+                "audit this release plan".to_string(),
+                "check whether this release is safe to deploy".to_string(),
+            ],
             &[
                 "debug a live outage".to_string(),
                 "write changelog copy".to_string(),
             ],
+            &["must separate blockers from non-blocking release warnings".to_string()],
             false,
         )
         .unwrap();
@@ -731,15 +772,11 @@ mod tests {
     #[test]
     fn lint_flags_placeholder_sections() {
         let tmp = TempDir::new().unwrap();
-        create_skill_scaffold(
-            tmp.path(),
-            "sql-review",
-            "Review SQL queries",
-            "the user wants SQL reviewed or improved",
-            "general backend design questions",
-            &[],
-            &[],
-            false,
+        let skill_dir = tmp.path().join(".pi/skills/sql-review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sql-review\ndescription: Review SQL queries. Use when the user wants SQL reviewed or improved. Not for general backend design questions.\n---\n## Purpose\nReview SQL queries.\n\n## Use When\n- the user wants SQL reviewed or improved\n\n## Not For\n- general backend design questions\n\n## Trigger Examples\n- TODO: Replace with a concrete request\n- TODO: Add a second distinct example with different wording.\n\n## Anti-Trigger Examples\n- TODO: Replace with a near-miss request that should not activate this skill.\n- TODO: Add a second distinct example with different wording.\n\n## Inputs\n- TODO: List required inputs, optional inputs, and missing-input behavior.\n\n## Output Contract\n- TODO: Describe the exact response shape, files, and verification evidence this skill must produce.\n\n## Success Criteria\n- Reach at least 80% successful observed runs across 3 runs.\n- Reach at least 3.5/5 average feedback across 2 ratings.\n- TODO: Add task-specific thresholds or a baseline this skill must beat.\n\n## Instructions\n1. Restate the task and confirm the needed inputs.\n2. Follow the output contract exactly.\n3. Verify the result before responding.\n4. State blockers explicitly instead of guessing.\n",
         )
         .unwrap();
 

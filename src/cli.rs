@@ -891,8 +891,14 @@ mod tests {
             "incident response",
             "--trigger",
             "run a deploy readiness check",
+            "--trigger",
+            "audit this release candidate",
             "--anti-trigger",
             "fix a live outage",
+            "--anti-trigger",
+            "write release marketing copy",
+            "--success-criterion",
+            "must identify blocking deploy risks before release",
             "--global",
             "--format",
             "json",
@@ -907,6 +913,7 @@ mod tests {
                         not_for,
                         trigger_examples,
                         anti_trigger_examples,
+                        success_criteria,
                         global,
                         format,
                     },
@@ -915,8 +922,21 @@ mod tests {
                 assert_eq!(description, "Check deploy readiness");
                 assert_eq!(use_when, "the user wants a release audit");
                 assert_eq!(not_for, "incident response");
-                assert_eq!(trigger_examples, vec!["run a deploy readiness check"]);
-                assert_eq!(anti_trigger_examples, vec!["fix a live outage"]);
+                assert_eq!(
+                    trigger_examples,
+                    vec![
+                        "run a deploy readiness check",
+                        "audit this release candidate"
+                    ]
+                );
+                assert_eq!(
+                    anti_trigger_examples,
+                    vec!["fix a live outage", "write release marketing copy"]
+                );
+                assert_eq!(
+                    success_criteria,
+                    vec!["must identify blocking deploy risks before release"]
+                );
                 assert!(global);
                 assert_eq!(format, "json");
             }
@@ -1873,6 +1893,9 @@ pub enum SkillCommands {
         /// Concrete near-miss request that should not trigger the skill
         #[arg(long = "anti-trigger", action = clap::ArgAction::Append)]
         anti_trigger_examples: Vec<String>,
+        /// Explicit task-specific success criterion or threshold the skill must meet
+        #[arg(long = "success-criterion", action = clap::ArgAction::Append)]
+        success_criteria: Vec<String>,
         /// Write the scaffold to global skills instead of `.pi/skills`
         #[arg(long)]
         global: bool,

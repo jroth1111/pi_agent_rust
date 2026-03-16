@@ -89,12 +89,25 @@ Use the built-in scaffold command to create a project-local or global skill skel
 pi skills init deploy-readiness \
   --description "Check deploy readiness before release" \
   --use-when "the user wants a release audit, release validation, or a go/no-go decision" \
-  --not-for "incident response or unrelated bug fixing"
+  --not-for "incident response or unrelated bug fixing" \
+  --trigger "run a deploy readiness check on this branch" \
+  --trigger "audit this release candidate before deployment" \
+  --anti-trigger "fix this production outage right now" \
+  --anti-trigger "write release marketing copy" \
+  --success-criterion "must identify blocking deploy risks before release"
 ```
 
 By default this writes `.pi/skills/<name>/SKILL.md`. Use `--global` to scaffold into `~/.pi/skills/<name>/SKILL.md`.
 
-The scaffold keeps `SKILL.md` as the source artifact, but gives it an explicit structure:
+The scaffold keeps `SKILL.md` as the source artifact, but now requires concrete routing evidence up front:
+
+- at least 2 `--trigger` examples
+- at least 2 `--anti-trigger` examples
+- at least 1 `--success-criterion`
+
+That follows the same principle as `skill-creator`: do not scaffold a skill until the activation boundary and success threshold are explicit.
+
+Once those are provided, Pi generates an explicit structure:
 
 - `## Purpose`
 - `## Use When`
@@ -106,7 +119,7 @@ The scaffold keeps `SKILL.md` as the source artifact, but gives it an explicit s
 - `## Success Criteria`
 - `## Instructions`
 
-New scaffolds intentionally include `TODO:` markers in the example and contract sections so weak first drafts do not look finished.
+New scaffolds still include `TODO:` markers for inputs and output-contract details, but trigger routing and task-specific success thresholds are no longer left as placeholders.
 
 ### Lint A Skill
 
