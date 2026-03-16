@@ -383,7 +383,6 @@ const INPUT_TEXT_AND_IMAGE: [InputType; 2] = [InputType::Text, InputType::Image]
 fn canonicalize_openrouter_model_id(model_id: &str) -> String {
     let trimmed = model_id.trim();
     match trimmed.to_ascii_lowercase().as_str() {
-        "auto" => "openrouter/auto".to_string(),
         "gpt-4o-mini" => "openai/gpt-4o-mini".to_string(),
         "gpt-4o" => "openai/gpt-4o".to_string(),
         "claude-3.5-sonnet" => "anthropic/claude-3.5-sonnet".to_string(),
@@ -1441,6 +1440,11 @@ where
     if normalized_model_id.is_empty() {
         return None;
     }
+    if canonical_provider_id(provider).is_some_and(|canonical| canonical == "openrouter")
+        && normalized_model_id.eq_ignore_ascii_case("auto")
+    {
+        return None;
+    }
     Some(ModelEntry {
         model: Model {
             id: normalized_model_id.clone(),
@@ -2046,10 +2050,8 @@ mod tests {
         assert_eq!(gpt4o_mini.model.provider, "openrouter");
         assert_eq!(gpt4o_mini.model.id, "openai/gpt-4o-mini");
 
-        let auto = registry
-            .find("openrouter", "auto")
-            .expect("openrouter auto alias should resolve");
-        assert_eq!(auto.model.id, "openrouter/auto");
+        assert!(registry.find("openrouter", "auto").is_none());
+        assert!(registry.find("openrouter", "openrouter/auto").is_some());
 
         let provider_alias = registry
             .find("open-router", "gpt-4o-mini")
@@ -2060,8 +2062,7 @@ mod tests {
 
     #[test]
     fn ad_hoc_model_entry_normalizes_openrouter_aliases() {
-        let auto = ad_hoc_model_entry("openrouter", "auto").expect("openrouter auto ad-hoc");
-        assert_eq!(auto.model.id, "openrouter/auto");
+        assert!(ad_hoc_model_entry("openrouter", "auto").is_none());
 
         let gpt4o_mini =
             ad_hoc_model_entry("openrouter", "gpt-4o-mini").expect("openrouter gpt-4o-mini ad-hoc");
@@ -2145,7 +2146,7 @@ mod tests {
                             ..ModelConfig::default()
                         },
                         ModelConfig {
-                            id: "auto".to_string(),
+                            id: "openrouter/auto".to_string(),
                             ..ModelConfig::default()
                         },
                     ]),
@@ -3305,9 +3306,8 @@ mod tests {
 
             /// `canonicalize_openrouter_model_id` maps known aliases.
             #[test]
-            fn openrouter_known_aliases(idx in 0..5usize) {
+            fn openrouter_known_aliases(idx in 0..4usize) {
                 let pairs = [
-                    ("auto", "openrouter/auto"),
                     ("gpt-4o-mini", "openai/gpt-4o-mini"),
                     ("gpt-4o", "openai/gpt-4o"),
                     ("claude-3.5-sonnet", "anthropic/claude-3.5-sonnet"),
@@ -3319,8 +3319,8 @@ mod tests {
 
             /// `canonicalize_openrouter_model_id` is case-insensitive for aliases.
             #[test]
-            fn openrouter_case_insensitive(idx in 0..5usize) {
-                let aliases = ["auto", "gpt-4o-mini", "gpt-4o", "claude-3.5-sonnet", "gemini-2.5-pro"];
+            fn openrouter_case_insensitive(idx in 0..4usize) {
+                let aliases = ["gpt-4o-mini", "gpt-4o", "claude-3.5-sonnet", "gemini-2.5-pro"];
                 let lower = canonicalize_openrouter_model_id(aliases[idx]);
                 let upper = canonicalize_openrouter_model_id(&aliases[idx].to_uppercase());
                 assert_eq!(lower, upper);
