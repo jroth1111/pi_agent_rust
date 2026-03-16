@@ -3,6 +3,7 @@ use crate::runtime::types::{
     ApprovalState, ContinuationReason, LeaseRecord, RunPhase, RunSnapshot, TaskNode, TaskState,
 };
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 
 pub fn maintenance_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<RuntimeEventKind> {
     let mut task_ids = snapshot.tasks.keys().cloned().collect::<Vec<_>>();
@@ -176,6 +177,53 @@ pub fn phase_and_wake_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<
     }
 
     Vec::new()
+}
+
+pub fn rebuild_ready_queue(snapshot: &mut RunSnapshot) {
+    let mut ready_task_ids = snapshot
+        .tasks
+        .iter()
+        .filter_map(|(task_id, task)| {
+            (task.runtime.state == TaskState::Ready && dependencies_satisfied(snapshot, task))
+                .then_some(task_id.clone())
+        })
+        .collect::<Vec<_>>();
+    ready_task_ids.sort();
+
+    let mut scheduled = Vec::new();
+    let mut touched_paths = HashSet::new();
+    let max_tasks = snapshot.effective_max_parallelism();
+
+    for task_id in ready_task_ids {
+        if scheduled.len() >= max_tasks {
+            break;
+        }
+        let Some(task) = snapshot.tasks.get(&task_id) else {
+            continue;
+        };
+        if task.spec.planned_touches.is_empty() {
+            if scheduled.is_empty() {
+                scheduled.push(task_id);
+            }
+            break;
+        }
+
+        let conflicts = task
+            .spec
+            .planned_touches
+            .iter()
+            .any(|path| touched_paths.contains(path));
+        if conflicts {
+            continue;
+        }
+
+        for path in &task.spec.planned_touches {
+            touched_paths.insert(path.clone());
+        }
+        scheduled.push(task_id);
+    }
+
+    snapshot.ready_queue = scheduled.into();
 }
 
 fn phase_event(snapshot: &RunSnapshot, phase: RunPhase, summary: &str) -> Vec<RuntimeEventKind> {
@@ -359,5 +407,35 @@ mod tests {
             }
         ));
         assert!(matches!(events[1], RuntimeEventKind::WakeScheduled { .. }));
+    }
+
+    #[test]
+    fn rebuild_ready_queue_respects_parallelism_and_touch_conflicts() {
+        let mut snapshot = sample_snapshot();
+        snapshot.spec.budgets.max_parallelism = 2;
+        snapshot.dispatch.selected_tier = crate::orchestration::ExecutionTier::Wave;
+
+        let mut task_a = sample_task("task-a");
+        task_a.runtime.state = TaskState::Ready;
+        task_a.spec.planned_touches = vec![PathBuf::from("src/a.rs")];
+
+        let mut task_b = sample_task("task-b");
+        task_b.runtime.state = TaskState::Ready;
+        task_b.spec.planned_touches = vec![PathBuf::from("src/b.rs")];
+
+        let mut task_c = sample_task("task-c");
+        task_c.runtime.state = TaskState::Ready;
+        task_c.spec.planned_touches = vec![PathBuf::from("src/a.rs")];
+
+        snapshot.tasks.insert("task-a".to_string(), task_a);
+        snapshot.tasks.insert("task-b".to_string(), task_b);
+        snapshot.tasks.insert("task-c".to_string(), task_c);
+
+        rebuild_ready_queue(&mut snapshot);
+
+        assert_eq!(
+            snapshot.ready_queue.iter().cloned().collect::<Vec<_>>(),
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
     }
 }

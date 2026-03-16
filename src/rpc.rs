@@ -43,10 +43,12 @@ use crate::runtime::controller::{
 };
 use crate::runtime::model_routing::{ModelRoute, PhaseModelRouter};
 use crate::runtime::policy::PolicySet;
+use crate::runtime::scheduler;
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
-    AutonomyLevel, ModelProfile, ModelSelector, PlanArtifact, RunBudgets, RunConstraints, RunPhase,
-    RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState, VerifySpec,
+    AutonomyLevel, LeaseRecord, ModelProfile, ModelSelector, PlanArtifact, RunBudgets,
+    RunConstraints, RunPhase, RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState,
+    VerifySpec,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -498,17 +500,6 @@ impl RpcReliabilityState {
             self.parent_goal_trace_by_task.remove(&contract.task_id);
         }
         Ok(entry)
-    }
-
-    fn task_counts_for(&self, task_ids: &[String]) -> BTreeMap<String, usize> {
-        let mut counts = BTreeMap::new();
-        for task_id in task_ids {
-            if let Some(task) = self.tasks.get(task_id) {
-                let label = Self::state_label(&task.runtime.state).to_string();
-                *counts.entry(label).or_insert(0) += 1;
-            }
-        }
-        counts
     }
 
     fn trigger_satisfied(
@@ -1364,6 +1355,163 @@ const fn runtime_task_state_label(state: TaskState) -> &'static str {
     }
 }
 
+fn sync_runtime_task_from_reliability(
+    runtime_task: &mut TaskNode,
+    reliability_task: &reliability::TaskNode,
+) {
+    runtime_task.runtime.attempt = reliability_task.runtime.attempt;
+    runtime_task.runtime.continuation_reason = None;
+    runtime_task.runtime.last_error = None;
+
+    match &reliability_task.runtime.state {
+        reliability::RuntimeState::Blocked { .. } => {
+            runtime_task.runtime.state = TaskState::Blocked;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+        }
+        reliability::RuntimeState::Ready => {
+            runtime_task.runtime.state = TaskState::Ready;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+        }
+        reliability::RuntimeState::Leased {
+            lease_id,
+            agent_id,
+            fence_token,
+            expires_at,
+        } => {
+            runtime_task.runtime.state = TaskState::Leased;
+            runtime_task.runtime.lease = Some(LeaseRecord {
+                lease_id: lease_id.clone(),
+                owner: agent_id.clone(),
+                fence_token: *fence_token,
+                expires_at: *expires_at,
+            });
+            runtime_task.runtime.retry_at = None;
+        }
+        reliability::RuntimeState::Verifying { .. } => {
+            runtime_task.runtime.state = TaskState::Verifying;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+        }
+        reliability::RuntimeState::Recoverable {
+            reason,
+            handoff_summary,
+            retry_after,
+            ..
+        } => {
+            runtime_task.runtime.state = TaskState::Recoverable;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = *retry_after;
+            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
+                code: failure_class_label(*reason).to_string(),
+                message: handoff_summary.clone(),
+                retry_at: *retry_after,
+            });
+        }
+        reliability::RuntimeState::AwaitingHuman {
+            question, context, ..
+        } => {
+            runtime_task.runtime.state = TaskState::AwaitingHuman;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
+                code: failure_class_label(reliability::FailureClass::HumanBlocker).to_string(),
+                message: format!("{question}: {context}"),
+                retry_at: None,
+            });
+        }
+        reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded { .. }) => {
+            runtime_task.runtime.state = TaskState::Succeeded;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+        }
+        reliability::RuntimeState::Terminal(reliability::TerminalState::Failed {
+            class,
+            failed_at,
+            ..
+        }) => {
+            runtime_task.runtime.state = TaskState::Failed;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
+                code: failure_class_label(*class).to_string(),
+                message: format!("task failed at {}", failed_at.to_rfc3339()),
+                retry_at: None,
+            });
+        }
+        reliability::RuntimeState::Terminal(reliability::TerminalState::Superseded { .. }) => {
+            runtime_task.runtime.state = TaskState::Superseded;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+        }
+        reliability::RuntimeState::Terminal(reliability::TerminalState::Canceled {
+            reason,
+            ..
+        }) => {
+            runtime_task.runtime.state = TaskState::Canceled;
+            runtime_task.runtime.lease = None;
+            runtime_task.runtime.retry_at = None;
+            runtime_task.runtime.last_error = Some(crate::runtime::types::FailureRecord {
+                code: "canceled".to_string(),
+                message: reason.clone(),
+                retry_at: None,
+            });
+        }
+    }
+}
+
+fn sync_runtime_snapshot_from_reliability(
+    reliability: &RpcReliabilityState,
+    snapshot: &mut RunSnapshot,
+) {
+    for (task_id, runtime_task) in &mut snapshot.tasks {
+        let Some(reliability_task) = reliability.tasks.get(task_id) else {
+            continue;
+        };
+        sync_runtime_task_from_reliability(runtime_task, reliability_task);
+    }
+    recompute_runtime_task_counts(snapshot);
+    scheduler::rebuild_ready_queue(snapshot);
+}
+
+fn apply_runtime_scheduler_lifecycle(snapshot: &mut RunSnapshot) {
+    let mut next_action = None;
+    snapshot.wake_at = None;
+
+    for event in scheduler::phase_and_wake_events(snapshot, Utc::now()) {
+        match event {
+            crate::runtime::events::RuntimeEventKind::PhaseChanged { phase, summary } => {
+                snapshot.phase = phase;
+                if next_action.is_none() {
+                    next_action = summary;
+                }
+            }
+            crate::runtime::events::RuntimeEventKind::WakeScheduled { wake_at, reason } => {
+                snapshot.wake_at = Some(wake_at);
+                if next_action.is_none() {
+                    next_action = Some(reason);
+                }
+            }
+            crate::runtime::events::RuntimeEventKind::RunCompleted => {
+                snapshot.phase = RunPhase::Completed;
+                next_action = Some("run completed".to_string());
+            }
+            crate::runtime::events::RuntimeEventKind::RunFailed { reason } => {
+                snapshot.phase = RunPhase::Failed;
+                next_action = Some(reason);
+            }
+            crate::runtime::events::RuntimeEventKind::RunCanceled { reason } => {
+                snapshot.phase = RunPhase::Canceled;
+                next_action = Some(reason);
+            }
+            _ => {}
+        }
+    }
+
+    snapshot.summary.next_action = next_action;
+}
+
 fn runtime_snapshot_dag_depth(snapshot: &RunSnapshot) -> usize {
     fn visit(
         task_id: &str,
@@ -1415,6 +1563,7 @@ fn runtime_snapshot_execution_tier(snapshot: &RunSnapshot) -> ExecutionTier {
     }
 }
 
+#[cfg(test)]
 const fn run_lifecycle_to_runtime_phase(
     lifecycle: RunLifecycle,
     current_phase: RunPhase,
@@ -1435,6 +1584,7 @@ const fn run_lifecycle_to_runtime_phase(
     }
 }
 
+#[cfg(test)]
 fn set_run_lifecycle(snapshot: &mut RunSnapshot, lifecycle: RunLifecycle) {
     snapshot.phase = run_lifecycle_to_runtime_phase(lifecycle, snapshot.phase);
     snapshot.touch();
@@ -2363,59 +2513,6 @@ fn planned_subruns(reliability: &RpcReliabilityState, run: &RunSnapshot) -> Vec<
     planned
 }
 
-fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) -> RunLifecycle {
-    let mut saw_ready = false;
-    let mut saw_in_flight = false;
-    let mut saw_blocked = false;
-    let mut saw_recoverable = false;
-    let mut saw_awaiting_human = false;
-    let mut saw_terminal_failure = false;
-    let mut saw_terminal_success = false;
-
-    for task_id in task_ids {
-        let Some(task) = reliability.tasks.get(task_id) else {
-            continue;
-        };
-
-        match &task.runtime.state {
-            reliability::RuntimeState::AwaitingHuman { .. } => saw_awaiting_human = true,
-            reliability::RuntimeState::Leased { .. }
-            | reliability::RuntimeState::Verifying { .. } => saw_in_flight = true,
-            reliability::RuntimeState::Recoverable { .. } => saw_recoverable = true,
-            reliability::RuntimeState::Blocked { .. } => saw_blocked = true,
-            reliability::RuntimeState::Ready => saw_ready = true,
-            reliability::RuntimeState::Terminal(
-                reliability::TerminalState::Succeeded { .. }
-                | reliability::TerminalState::Superseded { .. },
-            ) => {
-                saw_terminal_success = true;
-            }
-            reliability::RuntimeState::Terminal(
-                reliability::TerminalState::Failed { .. }
-                | reliability::TerminalState::Canceled { .. },
-            ) => {
-                saw_terminal_failure = true;
-            }
-        }
-    }
-
-    if saw_awaiting_human {
-        RunLifecycle::AwaitingHuman
-    } else if saw_in_flight {
-        RunLifecycle::Running
-    } else if saw_ready || saw_recoverable {
-        RunLifecycle::Pending
-    } else if saw_blocked {
-        RunLifecycle::Blocked
-    } else if saw_terminal_failure {
-        RunLifecycle::Failed
-    } else if saw_terminal_success {
-        RunLifecycle::Succeeded
-    } else {
-        RunLifecycle::Pending
-    }
-}
-
 fn planned_wave_task_ids(
     reliability: &RpcReliabilityState,
     run: &RunSnapshot,
@@ -2492,8 +2589,8 @@ fn refresh_live_run_from_reliability(
 fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunSnapshot) {
     let preserve_canceled = matches!(run.phase, RunPhase::Canceled);
     let task_ids = run.task_ids();
-    run.summary.task_counts = reliability.task_counts_for(&task_ids);
     run.dispatch.planned_subruns = planned_subruns(reliability, run);
+    sync_runtime_snapshot_from_reliability(reliability, run);
 
     if preserve_canceled || run_requires_plan_acceptance(run) {
         run.dispatch.active_subrun_id = None;
@@ -2539,8 +2636,9 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
     if run_requires_plan_acceptance(run) {
         run.phase = RunPhase::Planning;
         run.summary.next_action = Some("accept plan before dispatch".to_string());
+        run.wake_at = None;
     } else if !preserve_canceled {
-        set_run_lifecycle(run, derive_run_lifecycle(reliability, &task_ids));
+        apply_runtime_scheduler_lifecycle(run);
     }
     apply_run_verify_lifecycle(run);
     run.touch();
@@ -9186,8 +9284,10 @@ mod tests {
         set_run_task_ids(&mut run, vec![contract.task_id.clone()]);
         refresh_run_from_reliability(&reliability, &mut run);
 
-        assert_eq!(run_lifecycle(&run), RunLifecycle::Pending);
+        assert_eq!(run.phase, RunPhase::Recovering);
+        assert_eq!(run_lifecycle(&run), RunLifecycle::Running);
         assert_eq!(run.summary.task_counts.get("recoverable"), Some(&1));
+        assert!(run.wake_at.is_some());
         assert!(run.dispatch.active_wave.is_none());
     }
 
