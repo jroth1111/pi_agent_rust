@@ -2595,6 +2595,31 @@ impl Session {
         )
     }
 
+    /// Convert session entries along the current path to model messages using a
+    /// derived active prompt scope. This prefers the most recent explicit
+    /// message scope, then falls back to the latest non-closed reliability task.
+    pub fn to_messages_for_active_prompt_scope(&self) -> Vec<Message> {
+        let scope = self.derived_prompt_scope_for_current_path();
+        self.to_messages_for_prompt_scope(scope.task_id.as_deref(), scope.workset_id.as_deref())
+    }
+
+    /// Derive the most specific active prompt scope available on the current
+    /// path. This is the canonical restore policy for provider-facing replay.
+    pub fn derived_prompt_scope_for_current_path(&self) -> MessageContextRefs {
+        if self.leaf_id.is_none() {
+            return MessageContextRefs::default();
+        }
+
+        if self.is_linear {
+            return Self::derived_prompt_scope_from_path(self.entries.len(), |idx| {
+                &self.entries[idx]
+            });
+        }
+
+        let path_entries = self.entries_for_current_path();
+        Self::derived_prompt_scope_from_path(path_entries.len(), |idx| path_entries[idx])
+    }
+
     fn append_model_message_for_entry(messages: &mut Vec<Message>, entry: &SessionEntry) {
         Self::append_model_message_for_entry_scoped(messages, entry, None, None);
     }
@@ -2652,6 +2677,73 @@ impl Session {
         }
         task_id.is_some_and(|candidate| context.task_id.as_deref() == Some(candidate))
             || workset_id.is_some_and(|candidate| context.workset_id.as_deref() == Some(candidate))
+    }
+
+    fn derived_prompt_scope_from_path<'a, F>(path_len: usize, entry_at: F) -> MessageContextRefs
+    where
+        F: Fn(usize) -> &'a SessionEntry,
+    {
+        let mut closed_tasks = HashSet::new();
+
+        for idx in (0..path_len).rev() {
+            match entry_at(idx) {
+                SessionEntry::CloseDecision(entry) => {
+                    closed_tasks.insert(entry.payload.task_id.clone());
+                }
+                SessionEntry::TaskTransition(entry) if entry.to == "close" => {
+                    closed_tasks.insert(entry.task_id.clone());
+                }
+                SessionEntry::Message(msg_entry)
+                    if msg_entry.is_agent_visible() && !msg_entry.context.is_empty() =>
+                {
+                    let task_is_closed = msg_entry
+                        .context
+                        .task_id
+                        .as_ref()
+                        .is_some_and(|task_id| closed_tasks.contains(task_id));
+                    if !task_is_closed {
+                        return msg_entry.context.clone();
+                    }
+                }
+                SessionEntry::TaskCheckpoint(entry) if !closed_tasks.contains(&entry.task_id) => {
+                    return MessageContextRefs {
+                        task_id: Some(entry.task_id.clone()),
+                        ..MessageContextRefs::default()
+                    };
+                }
+                SessionEntry::TaskCreated(entry) if !closed_tasks.contains(&entry.task_id) => {
+                    return MessageContextRefs {
+                        task_id: Some(entry.task_id.clone()),
+                        ..MessageContextRefs::default()
+                    };
+                }
+                SessionEntry::TaskTransition(entry) if !closed_tasks.contains(&entry.task_id) => {
+                    return MessageContextRefs {
+                        task_id: Some(entry.task_id.clone()),
+                        ..MessageContextRefs::default()
+                    };
+                }
+                SessionEntry::HumanBlockerRaised(entry)
+                    if !closed_tasks.contains(&entry.task_id) =>
+                {
+                    return MessageContextRefs {
+                        task_id: Some(entry.task_id.clone()),
+                        ..MessageContextRefs::default()
+                    };
+                }
+                SessionEntry::HumanBlockerResolved(entry)
+                    if !closed_tasks.contains(&entry.task_id) =>
+                {
+                    return MessageContextRefs {
+                        task_id: Some(entry.task_id.clone()),
+                        ..MessageContextRefs::default()
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        MessageContextRefs::default()
     }
 
     fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<Message>
@@ -6075,7 +6167,135 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec!["global".to_string(), "task-a tool".to_string()]
+            vec!["global".to_string(), "task-b tool".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_derived_prompt_scope_prefers_latest_scoped_message_context() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("global"));
+        session.append_task_created_entry(
+            "task-a".to_string(),
+            "Fix A".to_string(),
+            Some("agent".to_string()),
+        );
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-a".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-a tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-a".to_string()),
+                workset_id: Some("workset-a".to_string()),
+                retrieval_refs: vec!["symbol:crate::task_a".to_string()],
+                ..MessageContextRefs::default()
+            },
+        );
+
+        let scope = session.derived_prompt_scope_for_current_path();
+        assert_eq!(scope.task_id.as_deref(), Some("task-a"));
+        assert_eq!(scope.workset_id.as_deref(), Some("workset-a"));
+        assert_eq!(scope.retrieval_refs, vec!["symbol:crate::task_a"]);
+    }
+
+    #[test]
+    fn test_derived_prompt_scope_falls_back_to_latest_open_task() {
+        let mut session = Session::in_memory();
+        session.append_task_created_entry(
+            "task-a".to_string(),
+            "Fix A".to_string(),
+            Some("agent".to_string()),
+        );
+        session.append_task_transition_entry(
+            "task-a".to_string(),
+            Some("plan".to_string()),
+            "execute".to_string(),
+            None,
+        );
+        session.append_task_transition_entry(
+            "task-a".to_string(),
+            Some("execute".to_string()),
+            "close".to_string(),
+            None,
+        );
+        session.append_task_created_entry(
+            "task-b".to_string(),
+            "Fix B".to_string(),
+            Some("agent".to_string()),
+        );
+        session.append_task_transition_entry(
+            "task-b".to_string(),
+            Some("plan".to_string()),
+            "verify".to_string(),
+            None,
+        );
+
+        let scope = session.derived_prompt_scope_for_current_path();
+        assert_eq!(scope.task_id.as_deref(), Some("task-b"));
+        assert!(scope.workset_id.is_none());
+    }
+
+    #[test]
+    fn test_to_messages_for_active_prompt_scope_uses_derived_scope() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("global"));
+        session.append_task_created_entry(
+            "task-a".to_string(),
+            "Fix A".to_string(),
+            Some("agent".to_string()),
+        );
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-a".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-a tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-a".to_string()),
+                ..MessageContextRefs::default()
+            },
+        );
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-b".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-b tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-b".to_string()),
+                ..MessageContextRefs::default()
+            },
+        );
+
+        let rendered: Vec<_> = session
+            .to_messages_for_active_prompt_scope()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user_content_to_text(&user.content)),
+                Message::ToolResult(result) => {
+                    result.content.iter().find_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec!["global".to_string(), "task-b tool".to_string()]
         );
     }
 

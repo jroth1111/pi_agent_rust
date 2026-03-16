@@ -423,7 +423,7 @@ impl PiApp {
                 return;
             }
 
-            let messages_for_agent = new_session.to_messages_for_current_path();
+            let messages_for_agent = new_session.to_messages_for_active_prompt_scope();
             {
                 let mut agent_guard = match agent.lock(&cx).await {
                     Ok(guard) => guard,
@@ -434,6 +434,8 @@ impl PiApp {
                     }
                 };
                 agent_guard.replace_messages(messages_for_agent);
+                agent_guard.clear_prompt_runtime_context();
+                agent_guard.clear_scope_objective();
             }
 
             {

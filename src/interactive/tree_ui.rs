@@ -310,7 +310,7 @@ impl PiApp {
             }
 
             let (messages, usage) = conversation_from_session(&session_guard);
-            let agent_messages = session_guard.to_messages_for_current_path();
+            let agent_messages = session_guard.to_messages_for_active_prompt_scope();
             let status_leaf = pending
                 .new_leaf_id
                 .clone()
@@ -321,6 +321,8 @@ impl PiApp {
 
             if let Ok(mut agent_guard) = self.agent.try_lock() {
                 agent_guard.replace_messages(agent_messages);
+                agent_guard.clear_prompt_runtime_context();
+                agent_guard.clear_scope_objective();
             }
 
             self.messages = messages;
@@ -450,7 +452,7 @@ impl PiApp {
                 }
 
                 let _ = guard.save().await;
-                guard.to_messages_for_current_path()
+                guard.to_messages_for_active_prompt_scope()
             };
 
             {
@@ -463,6 +465,8 @@ impl PiApp {
                     }
                 };
                 agent_guard.replace_messages(messages_for_agent);
+                agent_guard.clear_prompt_runtime_context();
+                agent_guard.clear_scope_objective();
             }
 
             let (messages, usage) = {

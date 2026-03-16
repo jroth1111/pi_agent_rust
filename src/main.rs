@@ -1087,10 +1087,12 @@ async fn run(
             .lock(cx.cx())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        session.to_messages_for_current_path()
+        session.to_messages_for_active_prompt_scope()
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
+        agent_session.agent.clear_prompt_runtime_context();
+        agent_session.agent.clear_scope_objective();
     }
 
     if !resources.extensions().is_empty() {

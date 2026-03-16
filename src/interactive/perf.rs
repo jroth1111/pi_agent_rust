@@ -525,7 +525,7 @@ impl PiApp {
                     None,
                 );
                 let _ = guard.save().await;
-                guard.to_messages_for_current_path()
+                guard.to_messages_for_active_prompt_scope()
             };
 
             {
@@ -539,6 +539,8 @@ impl PiApp {
                     }
                 };
                 agent_guard.replace_messages(messages_for_agent);
+                agent_guard.clear_prompt_runtime_context();
+                agent_guard.clear_scope_objective();
             }
 
             let (messages, usage) = {

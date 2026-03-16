@@ -971,7 +971,7 @@ impl PiApp {
             let new_session_id = loaded_session.header.id.clone();
             loaded_session.session_dir = session_dir;
 
-            let messages_for_agent = loaded_session.to_messages_for_current_path();
+            let messages_for_agent = loaded_session.to_messages_for_active_prompt_scope();
 
             // Replace the session.
             {
@@ -997,6 +997,8 @@ impl PiApp {
                     }
                 };
                 agent_guard.replace_messages(messages_for_agent);
+                agent_guard.clear_prompt_runtime_context();
+                agent_guard.clear_scope_objective();
             }
 
             let (messages, usage) = {

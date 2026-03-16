@@ -246,6 +246,10 @@ fn command_payload(parsed: &Value) -> Value {
         .unwrap_or_else(|| parsed.clone())
 }
 
+fn restore_prompt_messages(session: &Session) -> Vec<Message> {
+    session.to_messages_for_active_prompt_scope()
+}
+
 fn parse_command_payload<T>(parsed: &Value, command_type: &str) -> Result<T>
 where
     T: DeserializeOwned,
@@ -3606,10 +3610,12 @@ pub async fn run(
                             Some(details_value.clone()),
                             None,
                         );
-                        inner_session.to_messages_for_current_path()
+                        restore_prompt_messages(&inner_session)
                     };
                     guard.persist_session().await?;
                     guard.agent.replace_messages(messages);
+                    guard.agent.clear_prompt_runtime_context();
+                    guard.agent.clear_scope_objective();
 
                     json!({
                         "summary": result.summary,
@@ -3665,6 +3671,8 @@ pub async fn run(
                         *inner_session = new_session;
                     }
                     guard.agent.clear_messages();
+                    guard.agent.clear_prompt_runtime_context();
+                    guard.agent.clear_scope_objective();
                     guard.agent.stream_options_mut().session_id = Some(session_id);
                 }
                 {
@@ -3695,7 +3703,7 @@ pub async fn run(
                 let loaded = crate::session::Session::open(session_path).await;
                 match loaded {
                     Ok(new_session) => {
-                        let messages = new_session.to_messages_for_current_path();
+                        let messages = restore_prompt_messages(&new_session);
                         let session_id = new_session.header.id.clone();
                         let mut guard = session
                             .lock(&cx)
@@ -3709,6 +3717,8 @@ pub async fn run(
                             *inner_session = new_session;
                         }
                         guard.agent.replace_messages(messages);
+                        guard.agent.clear_prompt_runtime_context();
+                        guard.agent.clear_scope_objective();
                         guard.agent.stream_options_mut().session_id = Some(session_id);
                         let _ = out_tx.send(response_ok(
                             id,
@@ -3780,7 +3790,7 @@ pub async fn run(
                 new_session.leaf_id = leaf_id;
                 new_session.ensure_entry_ids();
 
-                let messages = new_session.to_messages_for_current_path();
+                let messages = restore_prompt_messages(&new_session);
                 let session_id = new_session.header.id.clone();
 
                 // Phase 3: Swap — brief lock to install the new session.
@@ -3795,6 +3805,8 @@ pub async fn run(
                     *inner = new_session;
                     drop(inner);
                     guard.agent.replace_messages(messages);
+                    guard.agent.clear_prompt_runtime_context();
+                    guard.agent.clear_scope_objective();
                     guard.agent.stream_options_mut().session_id = Some(session_id);
                 }
 
@@ -5122,10 +5134,12 @@ async fn maybe_auto_compact(
                     Some(details_value.clone()),
                     None,
                 );
-                inner_session.to_messages_for_current_path()
+                restore_prompt_messages(&inner_session)
             };
             let _ = guard.persist_session().await;
             guard.agent.replace_messages(messages);
+            guard.agent.clear_prompt_runtime_context();
+            guard.agent.clear_scope_objective();
             drop(guard);
 
             let _ = out_tx.send(event(&json!({

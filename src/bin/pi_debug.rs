@@ -247,10 +247,12 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         step!("    Session mutex locked");
-        session.to_messages_for_current_path()
+        session.to_messages_for_active_prompt_scope()
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history.clone());
+        agent_session.agent.clear_prompt_runtime_context();
+        agent_session.agent.clear_scope_objective();
     }
     step!("    History loaded: {} messages", history.len());
 

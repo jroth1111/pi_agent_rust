@@ -1250,7 +1250,7 @@ impl AgentSessionHandle {
             .lock(cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
-        Ok(guard.to_messages_for_current_path())
+        Ok(guard.to_messages_for_active_prompt_scope())
     }
 
     /// Return a lightweight state snapshot.
@@ -1266,7 +1266,7 @@ impl AgentSessionHandle {
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         let session_id = Some(guard.header.id.clone());
-        let message_count = guard.to_messages_for_current_path().len();
+        let message_count = guard.to_messages_for_active_prompt_scope().len();
 
         Ok(AgentSessionState {
             session_id,
@@ -1630,10 +1630,12 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             .lock(cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
-        guard.to_messages_for_current_path()
+        guard.to_messages_for_active_prompt_scope()
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
+        agent_session.agent.clear_prompt_runtime_context();
+        agent_session.agent.clear_scope_objective();
     }
 
     let mut listeners = EventListeners::new();
