@@ -596,6 +596,17 @@ pub fn handle_skill_doctor(
     let observations = load_observations(cwd)?;
     let feedback = load_feedback(cwd)?;
     let amendments = load_amendments(cwd)?;
+    let loaded_skills = load_skills(LoadSkillsOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir: Config::global_dir(),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+    let loaded_skills_by_id = loaded_skills
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.clone(), skill))
+        .collect::<HashMap<_, _>>();
     let mut grouped_observations: BTreeMap<String, Vec<SkillObservation>> = BTreeMap::new();
     for observation in observations.iter().cloned() {
         grouped_observations
@@ -634,6 +645,7 @@ pub fn handle_skill_doctor(
             &skill_name,
             &entries,
             &feedback_entries,
+            loaded_skills_by_id.get(&skill_id).copied(),
             &criteria,
         ));
     }
@@ -648,7 +660,11 @@ pub fn handle_skill_doctor(
         for index in 0..skills.len() {
             match skills[index].status {
                 SkillHealthStatus::Regressed => {
+                    if skills[index].current_digest == "missing" {
+                        continue;
+                    }
                     if let Some(amendment) = rollback_managed_skill_patch(
+                        &skills[index].skill_id,
                         &skills[index].skill_name,
                         &skills[index].skill_path,
                         &skills[index].current_digest,
@@ -665,12 +681,16 @@ pub fn handle_skill_doctor(
                     }
                 }
                 SkillHealthStatus::NeedsAmendment => {
+                    if skills[index].current_digest == "missing" {
+                        continue;
+                    }
                     if skills[index].proposed_guardrails.is_empty()
                         && skills[index].proposed_routing_hints.is_empty()
                     {
                         continue;
                     }
                     if let Some(amendment) = apply_managed_skill_patch(
+                        &skills[index].skill_id,
                         &skills[index].skill_name,
                         &skills[index].skill_path,
                         &skills[index].proposed_guardrails,
@@ -691,14 +711,18 @@ pub fn handle_skill_doctor(
         }
     }
 
-    let loaded_skills = load_skills(LoadSkillsOptions {
-        cwd: cwd.to_path_buf(),
-        agent_dir: Config::global_dir(),
-        skill_paths: Vec::new(),
-        include_defaults: true,
-    });
+    let producer_loaded_skills = if fix {
+        load_skills(LoadSkillsOptions {
+            cwd: cwd.to_path_buf(),
+            agent_dir: Config::global_dir(),
+            skill_paths: Vec::new(),
+            include_defaults: true,
+        })
+    } else {
+        loaded_skills.clone()
+    };
     let producers = build_skill_producer_reports(
-        &loaded_skills.skills,
+        &producer_loaded_skills.skills,
         &skills,
         &observations,
         &feedback,
@@ -735,6 +759,7 @@ fn build_skill_health_report(
     skill_name: &str,
     observations: &[SkillObservation],
     feedback: &[SkillFeedback],
+    current_skill: Option<&Skill>,
     criteria: &SkillSuccessCriteria,
 ) -> SkillHealthReport {
     let (latest_path, latest_digest) = if let Some(latest) = observations.last() {
@@ -748,7 +773,8 @@ fn build_skill_health_report(
     let (previous_observations, latest_observations) =
         split_observations_by_digest(observations, &latest_digest);
     let (previous_feedback, latest_feedback) = split_feedback_by_digest(feedback, &latest_digest);
-    let current_digest = current_skill_revision_digest(&latest_path, skill_id);
+    let (current_path, current_digest) =
+        resolve_current_skill_revision(skill_id, current_skill, &latest_path);
     let run_count = latest_observations.len();
     let success_rate = success_rate(latest_observations);
     let consecutive_failures = consecutive_failures(latest_observations);
@@ -766,7 +792,7 @@ fn build_skill_health_report(
         let mut report = SkillHealthReport {
             skill_id: skill_id.to_string(),
             skill_name: skill_name.to_string(),
-            skill_path: latest_path,
+            skill_path: current_path,
             latest_digest,
             current_digest,
             run_count,
@@ -815,7 +841,7 @@ fn build_skill_health_report(
     SkillHealthReport {
         skill_id: skill_id.to_string(),
         skill_name: skill_name.to_string(),
-        skill_path: latest_path,
+        skill_path: current_path,
         latest_digest,
         current_digest,
         run_count,
@@ -1188,6 +1214,21 @@ fn current_skill_revision_digest(skill_path: &Path, expected_skill_id: &str) -> 
         return "missing".to_string();
     }
     sha256_hex_standalone(&raw)
+}
+
+fn resolve_current_skill_revision(
+    skill_id: &str,
+    current_skill: Option<&Skill>,
+    latest_path: &Path,
+) -> (PathBuf, String) {
+    if let Some(skill) = current_skill.filter(|skill| skill.skill_id == skill_id) {
+        return (skill.file_path.clone(), file_digest(&skill.file_path));
+    }
+
+    (
+        latest_path.to_path_buf(),
+        current_skill_revision_digest(latest_path, skill_id),
+    )
 }
 
 fn evaluate_latest_revision(
@@ -1565,6 +1606,7 @@ fn summarize_evidence(
 }
 
 fn apply_managed_skill_patch(
+    expected_skill_id: &str,
     skill_name: &str,
     skill_path: &Path,
     guardrails: &[String],
@@ -1580,6 +1622,12 @@ fn apply_managed_skill_patch(
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
     let skill_id = skill_id_from_raw(&raw, skill_path);
+    if skill_id != expected_skill_id {
+        return Err(Error::validation(format!(
+            "refusing to amend skill `{skill_name}` at {}: expected skill-id `{expected_skill_id}` but found `{skill_id}`",
+            skill_path.display()
+        )));
+    }
     let previous_guardrails = extract_guardrails_from_raw(&raw);
     let previous_routing_hints = extract_routing_hints_from_raw(&raw);
     let block = guardrail_block(guardrails);
@@ -1619,6 +1667,7 @@ fn apply_managed_skill_patch(
 }
 
 fn rollback_managed_skill_patch(
+    expected_skill_id: &str,
     skill_name: &str,
     skill_path: &Path,
     current_digest: &str,
@@ -1627,8 +1676,7 @@ fn rollback_managed_skill_patch(
     cwd: &Path,
 ) -> Result<Option<SkillAmendment>> {
     let Some(source_amendment) = amendments.iter().rev().find(|amendment| {
-        amendment.skill_name == skill_name
-            && amendment.skill_path == skill_path
+        amendment.skill_id == expected_skill_id
             && amendment.new_digest == current_digest
     }) else {
         return Ok(None);
@@ -1642,6 +1690,12 @@ fn rollback_managed_skill_patch(
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
     let skill_id = skill_id_from_raw(&raw, skill_path);
+    if skill_id != expected_skill_id {
+        return Err(Error::validation(format!(
+            "refusing to roll back skill `{skill_name}` at {}: expected skill-id `{expected_skill_id}` but found `{skill_id}`",
+            skill_path.display()
+        )));
+    }
     let current_guardrails = extract_guardrails_from_raw(&raw);
     let current_routing_hints = extract_routing_hints_from_raw(&raw);
     let restored_guardrails = restore_guardrail_block(&raw, &source_amendment.previous_guardrails);
@@ -2667,6 +2721,7 @@ mod tests {
             "bug-triage",
             &entries,
             &[],
+            None,
             &SkillSuccessCriteria::default(),
         );
         assert_eq!(report.status, SkillHealthStatus::NeedsAmendment);
@@ -2705,6 +2760,7 @@ mod tests {
             "summarize",
             &[],
             &feedback,
+            None,
             &SkillSuccessCriteria::default(),
         );
         assert_eq!(report.status, SkillHealthStatus::NeedsAmendment);
@@ -2799,6 +2855,7 @@ mod tests {
             "code-review",
             &observations,
             &feedback,
+            None,
             &SkillSuccessCriteria::default(),
         );
 
@@ -3719,6 +3776,197 @@ mod tests {
     }
 
     #[test]
+    fn doctor_tracks_moved_skill_by_skill_id() {
+        let dir = tempdir().expect("tempdir");
+        let old_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("deploy-readiness")
+            .join("SKILL.md");
+        fs::create_dir_all(old_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &old_path,
+            "---\nname: deploy-readiness\nskill-id: deploy-readiness-id\ndescription: check release readiness\n---\nReady\n",
+        )
+        .expect("write original skill");
+        let digest = file_digest(&old_path);
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: old_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "check one".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: old_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "check two".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: old_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "check three".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write observations");
+
+        let new_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("release")
+            .join("deploy-readiness")
+            .join("SKILL.md");
+        fs::create_dir_all(new_path.parent().expect("parent")).expect("create moved dir");
+        fs::rename(old_path.parent().expect("parent"), new_path.parent().expect("parent"))
+            .expect("move skill directory");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let skill = report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == test_skill_id("deploy-readiness"))
+            .expect("moved skill report");
+        assert_eq!(skill.status, SkillHealthStatus::Healthy);
+        assert_eq!(skill.skill_path, new_path);
+        assert_eq!(skill.current_digest, skill.latest_digest);
+    }
+
+    #[test]
+    fn doctor_fix_skips_replaced_skill_path() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("bug-triage")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: bug-triage\nskill-id: bug-triage-old-id\ndescription: triage bugs\n---\nOld body\n",
+        )
+        .expect("write original skill");
+        let old_digest = file_digest(&skill_path);
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_id: "bug-triage-old-id".to_string(),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: old_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old fail one".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "missing binary".to_string(),
+                        message: "missing binary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_id: "bug-triage-old-id".to_string(),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: old_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old fail two".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "missing binary".to_string(),
+                        message: "missing binary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_id: "bug-triage-old-id".to_string(),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: old_digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old fail three".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    lineage: SkillLineage::default(),
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "missing binary".to_string(),
+                        message: "missing binary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write old observations");
+
+        fs::write(
+            &skill_path,
+            "---\nname: bug-triage\nskill-id: bug-triage-new-id\ndescription: triage bugs\n---\nNew body\n",
+        )
+        .expect("replace skill");
+        let replacement_before = fs::read_to_string(&skill_path).expect("read replacement");
+
+        let report = handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true)
+            .expect("doctor fix");
+        let old_skill = report
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == "bug-triage-old-id")
+            .expect("old skill report");
+        assert_eq!(old_skill.current_digest, "missing");
+        assert!(report.applied_amendments.is_empty());
+        let replacement_after = fs::read_to_string(&skill_path).expect("read replacement after");
+        assert_eq!(replacement_after, replacement_before);
+    }
+
+    #[test]
     fn doctor_rolls_child_outcomes_up_to_creator_report() {
         let dir = tempdir().expect("tempdir");
         let healthy_skill_path = dir
@@ -4256,6 +4504,7 @@ mod tests {
             .expect("write healthy observations");
 
         let forward_amendment = apply_managed_skill_patch(
+            &test_skill_id("summarize"),
             "summarize",
             &skill_path,
             &["Always emit exactly three bullet points.".to_string()],
