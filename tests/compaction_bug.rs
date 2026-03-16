@@ -14,6 +14,7 @@ fn test_compaction_usage_double_counting_bug() {
         cache_write: 30,
         total_tokens: 0, // Simulate missing/default total_tokens
         cost: Cost::default(),
+        prompt_breakdown: None,
     };
 
     let message = SessionMessage::Assistant {

@@ -205,6 +205,8 @@ pub struct Usage {
     pub cache_write: u64,
     pub total_tokens: u64,
     pub cost: Cost,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_breakdown: Option<PromptUsageBreakdown>,
 }
 
 /// Cost breakdown in dollars.
@@ -213,6 +215,39 @@ pub struct Usage {
 pub struct Cost {
     pub input: f64,
     pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub total: f64,
+}
+
+/// Prompt-side usage attribution by context bucket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptUsageBreakdown {
+    pub static_prefix: PromptUsageBucket,
+    pub task_runtime_manifest: PromptUsageBucket,
+    pub fresh_conversation: PromptUsageBucket,
+    pub tool_outputs: PromptUsageBucket,
+    pub compaction_summary: PromptUsageBucket,
+}
+
+/// Prompt usage for a single context bucket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptUsageBucket {
+    pub estimated_bytes: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub cost: PromptUsageCost,
+}
+
+/// Cost attribution for a prompt bucket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptUsageCost {
+    pub input: f64,
     pub cache_read: f64,
     pub cache_write: f64,
     pub total: f64,
@@ -444,6 +479,37 @@ mod tests {
                 cache_write: 0.0002,
                 total: 0.0033,
             },
+            prompt_breakdown: Some(PromptUsageBreakdown {
+                static_prefix: PromptUsageBucket {
+                    estimated_bytes: 128,
+                    input_tokens: 25,
+                    cache_read_tokens: 3,
+                    cache_write_tokens: 2,
+                    total_tokens: 30,
+                    cost: PromptUsageCost {
+                        input: 0.00025,
+                        cache_read: 0.00003,
+                        cache_write: 0.00002,
+                        total: 0.0003,
+                    },
+                },
+                task_runtime_manifest: PromptUsageBucket::default(),
+                fresh_conversation: PromptUsageBucket {
+                    estimated_bytes: 256,
+                    input_tokens: 75,
+                    cache_read_tokens: 7,
+                    cache_write_tokens: 3,
+                    total_tokens: 85,
+                    cost: PromptUsageCost {
+                        input: 0.00075,
+                        cache_read: 0.00007,
+                        cache_write: 0.00003,
+                        total: 0.00085,
+                    },
+                },
+                tool_outputs: PromptUsageBucket::default(),
+                compaction_summary: PromptUsageBucket::default(),
+            }),
         }
     }
 
@@ -963,6 +1029,13 @@ mod tests {
         assert_eq!(parsed.input, 100);
         assert_eq!(parsed.output, 50);
         assert!((parsed.cost.total - 0.0033).abs() < 1e-10);
+        assert_eq!(
+            parsed
+                .prompt_breakdown
+                .as_ref()
+                .map(|breakdown| breakdown.static_prefix.input_tokens),
+            Some(25)
+        );
     }
 
     #[test]
@@ -1413,6 +1486,7 @@ mod tests {
                         cache_write: f64::from(cost_cache_write) / 1_000_000.0,
                         total: f64::from(cost_total) / 1_000_000.0,
                     },
+                    prompt_breakdown: None,
                 },
             )
     }

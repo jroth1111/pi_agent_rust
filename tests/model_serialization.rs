@@ -170,6 +170,7 @@ fn test_assistant_message_round_trip() {
                 cache_write: 0.0001,
                 total: 0.0032,
             },
+            prompt_breakdown: None,
         },
         stop_reason: StopReason::Stop,
         error_message: None,
@@ -757,6 +758,7 @@ fn test_usage_round_trip() {
             cache_write: 0.001,
             total: 0.032,
         },
+        prompt_breakdown: None,
     };
 
     let json = serde_json::to_string(&usage).unwrap();

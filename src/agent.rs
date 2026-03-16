@@ -39,6 +39,7 @@ use crate::model::{
     UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry};
+use crate::prompt_usage::{attribute_prompt_usage, estimate_context_bytes};
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
 #[allow(unused_imports)]
 use crate::reliability::{
@@ -47,7 +48,10 @@ use crate::reliability::{
     ReviewerScorer, StateDigest, StuckDetector, TokenUsage, VerificationOutcome,
 };
 use crate::retrieval::symbol_outline_for_text;
-use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
+use crate::session::{
+    AutosaveFlushTrigger, PROMPT_MANIFEST_CUSTOM_TYPE, Session, SessionHandle,
+    prompt_transform_model_messages,
+};
 use crate::state::{
     CompletionGate as StateCompletionGate, DiscoveryPriority, DiscoveryTracker, Evidence,
     EvidenceGate, TaskEventKind, TaskEventLog, TaskResult,
@@ -120,75 +124,6 @@ impl Default for AgentConfig {
 pub type MessageFetcher = Arc<dyn Fn() -> BoxFuture<'static, Vec<Message>> + Send + Sync + 'static>;
 
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
-
-fn estimate_tool_def_bytes(tool: &ToolDef) -> usize {
-    tool.name.len()
-        + tool.description.len()
-        + serde_json::to_string(&tool.parameters).map_or(0, |json| json.len())
-}
-
-fn estimate_message_bytes(message: &Message) -> usize {
-    fn estimate_blocks(blocks: &[ContentBlock]) -> usize {
-        blocks
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text(text) => text.text.len(),
-                ContentBlock::Thinking(thinking) => thinking.thinking.len(),
-                ContentBlock::Image(image) => image.data.len() + image.mime_type.len(),
-                ContentBlock::ToolCall(tool_call) => {
-                    tool_call.id.len()
-                        + tool_call.name.len()
-                        + serde_json::to_string(&tool_call.arguments).map_or(0, |json| json.len())
-                }
-            })
-            .sum()
-    }
-
-    match message {
-        Message::User(UserMessage { content, .. }) => match content {
-            UserContent::Text(text) => text.len(),
-            UserContent::Blocks(blocks) => estimate_blocks(blocks),
-        },
-        Message::Assistant(message) => estimate_blocks(&message.content),
-        Message::ToolResult(result) => {
-            result.tool_call_id.len()
-                + result.tool_name.len()
-                + estimate_blocks(&result.content)
-                + result
-                    .details
-                    .as_ref()
-                    .and_then(|details| serde_json::to_string(details).ok())
-                    .map_or(0, |json| json.len())
-        }
-        Message::Custom(custom) => {
-            custom.custom_type.len()
-                + custom.content.len()
-                + custom
-                    .details
-                    .as_ref()
-                    .and_then(|details| serde_json::to_string(details).ok())
-                    .map_or(0, |json| json.len())
-        }
-    }
-}
-
-fn estimate_context_bytes(context: &Context<'_>) -> usize {
-    let system_bytes = context
-        .system_prompt
-        .as_ref()
-        .map_or(0, |prompt| prompt.len());
-    let message_bytes = context
-        .messages
-        .iter()
-        .map(estimate_message_bytes)
-        .sum::<usize>();
-    let tool_bytes = context
-        .tools
-        .iter()
-        .map(estimate_tool_def_bytes)
-        .sum::<usize>();
-    system_bytes + message_bytes + tool_bytes
-}
 
 fn maybe_compact_tool_output(tool_call: &ToolCall, output: &mut ToolOutput, is_error: bool) {
     match tool_call.name.as_str() {
@@ -1345,13 +1280,26 @@ impl Agent {
         defs
     }
 
+    fn custom_message_visible_to_provider(message: &CustomMessage) -> bool {
+        message.display || message.custom_type == PROMPT_MANIFEST_CUSTOM_TYPE
+    }
+
+    fn attach_prompt_breakdown(
+        mut message: AssistantMessage,
+        context: &Context<'_>,
+    ) -> AssistantMessage {
+        message.usage.prompt_breakdown = Some(attribute_prompt_usage(context, &message.usage));
+        message
+    }
+
     /// Build context for a completion request.
     fn build_context(&mut self) -> Context<'_> {
+        let provider_messages = prompt_transform_model_messages(self.messages.as_slice());
         let messages: Cow<'_, [Message]> = if self.config.block_images {
-            let mut msgs = self.messages.clone();
+            let mut msgs = provider_messages;
             // Filter out hidden custom messages.
             msgs.retain(|m| match m {
-                Message::Custom(c) => c.display,
+                Message::Custom(c) => Self::custom_message_visible_to_provider(c),
                 _ => true,
             });
             let stats = filter_images_for_provider(&mut msgs);
@@ -1365,20 +1313,20 @@ impl Agent {
             Cow::Owned(msgs)
         } else {
             // Check if we need to filter hidden custom messages to avoid cloning if not needed.
-            let has_hidden = self.messages.iter().any(|m| match m {
-                Message::Custom(c) => !c.display,
+            let has_hidden = provider_messages.iter().any(|m| match m {
+                Message::Custom(c) => !Self::custom_message_visible_to_provider(c),
                 _ => false,
             });
 
             if has_hidden {
-                let mut msgs = self.messages.clone();
+                let mut msgs = provider_messages;
                 msgs.retain(|m| match m {
-                    Message::Custom(c) => c.display,
+                    Message::Custom(c) => Self::custom_message_visible_to_provider(c),
                     _ => true,
                 });
                 Cow::Owned(msgs)
             } else {
-                Cow::Borrowed(self.messages.as_slice())
+                Cow::Owned(provider_messages)
             }
         };
 
@@ -1855,6 +1803,11 @@ impl Agent {
         let provider = Arc::clone(&self.provider);
         let mut stream_options = self.config.stream_options.clone();
         let context = self.build_context();
+        let context = Context::owned(
+            context.system_prompt.map(Cow::into_owned),
+            context.messages.into_owned(),
+            context.tools.into_owned(),
+        );
         stream_options.cache_retention = Self::resolve_cache_retention(
             provider.as_ref(),
             stream_options.cache_retention,
@@ -1892,7 +1845,10 @@ impl Agent {
                             }),
                         });
                         return Ok(self.finalize_assistant_message(
-                            Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                            Self::attach_prompt_breakdown(
+                                Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                                &context,
+                            ),
                             &on_event,
                             added_partial,
                         ));
@@ -2186,10 +2142,18 @@ impl Agent {
                     }
                 }
                 StreamEvent::Done { message, .. } => {
-                    return Ok(self.finalize_assistant_message(message, &on_event, added_partial));
+                    return Ok(self.finalize_assistant_message(
+                        Self::attach_prompt_breakdown(message, &context),
+                        &on_event,
+                        added_partial,
+                    ));
                 }
                 StreamEvent::Error { error, .. } => {
-                    return Ok(self.finalize_assistant_message(error, &on_event, added_partial));
+                    return Ok(self.finalize_assistant_message(
+                        Self::attach_prompt_breakdown(error, &context),
+                        &on_event,
+                        added_partial,
+                    ));
                 }
             }
         }
@@ -2202,7 +2166,11 @@ impl Agent {
                 let mut final_msg = (**last_msg).clone();
                 final_msg.stop_reason = StopReason::Error;
                 final_msg.error_message = Some("Stream ended without Done event".to_string());
-                return Ok(self.finalize_assistant_message(final_msg, &on_event, true));
+                return Ok(self.finalize_assistant_message(
+                    Self::attach_prompt_breakdown(final_msg, &context),
+                    &on_event,
+                    true,
+                ));
             }
         }
         Err(Error::api("Stream ended without Done event"))
@@ -7862,6 +7830,7 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 mod tests {
     use super::*;
     use crate::auth::AuthCredential;
+    use crate::model::Cost;
     use crate::provider::{InputType, Model, ModelCost};
     use crate::reliability::{ArtifactQuery, ArtifactStore, FsArtifactStore};
     use async_trait::async_trait;
@@ -8415,6 +8384,242 @@ mod tests {
         let context = agent.build_context();
         assert_eq!(context.messages.len(), 1);
         assert_eq!(image_count_in_message(&context.messages[0]), 1);
+    }
+
+    #[test]
+    fn build_context_keeps_hidden_prompt_manifest_messages() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.add_message(Message::Custom(CustomMessage {
+            custom_type: PROMPT_MANIFEST_CUSTOM_TYPE.to_string(),
+            content: "Prompt assembly manifest\n@fields task_runtime\ntask=task-1".to_string(),
+            display: false,
+            details: Some(json!({ "synthetic": true })),
+            timestamp: 0,
+        }));
+
+        let context = agent.build_context();
+        assert_eq!(context.messages.len(), 1);
+        assert!(matches!(
+            &context.messages[0],
+            Message::Custom(CustomMessage { custom_type, display, .. })
+                if custom_type == PROMPT_MANIFEST_CUSTOM_TYPE && !display
+        ));
+    }
+
+    #[test]
+    fn build_context_strips_hidden_non_manifest_custom_messages() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.add_message(Message::Custom(CustomMessage {
+            custom_type: "note".to_string(),
+            content: "hidden".to_string(),
+            display: false,
+            details: None,
+            timestamp: 0,
+        }));
+
+        let context = agent.build_context();
+        assert!(context.messages.is_empty());
+    }
+
+    #[test]
+    fn build_context_compacts_consumed_grep_history_for_provider() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Text("search for PromptAssemblyPlan".to_string()),
+            timestamp: 0,
+        }));
+        agent.add_message(Message::assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "call-1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({ "pattern": "PromptAssemblyPlan", "path": "src" }),
+                thought_signature: None,
+            })],
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        }));
+        agent.add_message(Message::tool_result(ToolResultMessage {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "grep".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "src/session.rs:2540: pub(crate) fn prompt_assembly_for_current_path(...)",
+            ))],
+            details: Some(json!({
+                "outputCompaction": {
+                    "family": "grep",
+                    "strategy": "replay_summary",
+                    "artifactBacked": true,
+                    "replaySummary": "[Consumed grep output folded into retrieval manifest for src; pattern=PromptAssemblyPlan; files=1; matches=1; sample=src/session.rs:2540; full=/tmp/pi-grep.log]"
+                },
+                "fullOutputPath": "/tmp/pi-grep.log",
+            })),
+            is_error: false,
+            timestamp: 0,
+        }));
+        agent.add_message(Message::assistant(AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new(
+                "I found the relevant symbol.",
+            ))],
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        }));
+
+        let context = agent.build_context();
+        let grep_output = context
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "grep" => {
+                    text_output_from_tool_blocks(&result.content)
+                }
+                _ => None,
+            })
+            .expect("expected grep tool result");
+
+        assert!(grep_output.contains("Consumed grep output folded into retrieval manifest"));
+        assert!(!grep_output.contains("prompt_assembly_for_current_path"));
+    }
+
+    #[test]
+    fn run_continue_attaches_prompt_breakdown_to_final_message() {
+        #[derive(Debug)]
+        struct UsageProvider;
+
+        #[async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl Provider for UsageProvider {
+            fn name(&self) -> &str {
+                "usage-provider"
+            }
+
+            fn api(&self) -> &str {
+                "anthropic-messages"
+            }
+
+            fn model_id(&self) -> &str {
+                "usage-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+            > {
+                let message = AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("done"))],
+                    api: "test-api".to_string(),
+                    provider: "usage-provider".to_string(),
+                    model: "usage-model".to_string(),
+                    usage: Usage {
+                        input: 120,
+                        cache_read: 30,
+                        cache_write: 15,
+                        total_tokens: 165,
+                        cost: Cost {
+                            input: 1.2,
+                            cache_read: 0.3,
+                            cache_write: 0.15,
+                            total: 1.65,
+                            ..Cost::default()
+                        },
+                        prompt_breakdown: None,
+                        ..Usage::default()
+                    },
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                Ok(Box::pin(futures::stream::iter(vec![Ok(
+                    StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message,
+                    },
+                )])))
+            }
+        }
+
+        let mut agent = Agent::new(
+            Arc::new(UsageProvider),
+            ToolRegistry::new(&["read"], Path::new("."), None),
+            AgentConfig {
+                system_prompt: Some("system prompt".repeat(32)),
+                ..AgentConfig::default()
+            },
+        );
+        agent.add_message(Message::Custom(CustomMessage {
+            custom_type: PROMPT_MANIFEST_CUSTOM_TYPE.to_string(),
+            content: "Prompt assembly manifest\n@fields task_runtime\ntask=demo".to_string(),
+            display: false,
+            details: Some(json!({ "synthetic": true })),
+            timestamp: 0,
+        }));
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(format!(
+                "{}previous summary",
+                crate::session::COMPACTION_SUMMARY_PREFIX
+            )))]),
+            timestamp: 0,
+        }));
+        agent.add_message(Message::tool_result(ToolResultMessage {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "grep".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "src/lib.rs:1: pub fn demo() {}",
+            ))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }));
+        agent.add_message(user_message("fresh request"));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let message = runtime
+            .block_on(async { agent.run_continue_with_abort(None, |_| {}).await })
+            .expect("assistant result");
+        let breakdown = message
+            .usage
+            .prompt_breakdown
+            .expect("prompt breakdown attached");
+
+        assert!(breakdown.static_prefix.estimated_bytes > 0);
+        assert!(breakdown.task_runtime_manifest.estimated_bytes > 0);
+        assert!(breakdown.fresh_conversation.estimated_bytes > 0);
+        assert!(breakdown.tool_outputs.estimated_bytes > 0);
+        assert!(breakdown.compaction_summary.estimated_bytes > 0);
+        assert_eq!(
+            breakdown.static_prefix.input_tokens
+                + breakdown.task_runtime_manifest.input_tokens
+                + breakdown.fresh_conversation.input_tokens
+                + breakdown.tool_outputs.input_tokens
+                + breakdown.compaction_summary.input_tokens,
+            120
+        );
     }
 
     #[test]

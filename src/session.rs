@@ -47,7 +47,7 @@ pub const RELIABILITY_CLOSE_DECISION_ENTRY_TYPE: &str = "reliability/close_decis
 pub const RELIABILITY_HUMAN_BLOCKER_RAISED_ENTRY_TYPE: &str = "reliability/human_blocker_raised.v1";
 pub const RELIABILITY_HUMAN_BLOCKER_RESOLVED_ENTRY_TYPE: &str =
     "reliability/human_blocker_resolved.v1";
-const PROMPT_MANIFEST_CUSTOM_TYPE: &str = "prompt_manifest";
+pub(crate) const PROMPT_MANIFEST_CUSTOM_TYPE: &str = "prompt_manifest";
 
 type JsonlSaveResult = std::result::Result<Vec<SessionEntry>, (Error, Vec<SessionEntry>)>;
 
@@ -2706,6 +2706,23 @@ impl Session {
         vec![ContentBlock::Text(TextContent::new(fallback))]
     }
 
+    fn working_set_omission_notice(
+        tool_name: &str,
+        path: Option<&str>,
+        artifact_ref: Option<&str>,
+    ) -> Vec<ContentBlock> {
+        let scope = path.map_or_else(String::new, |path| format!(" for {path}"));
+        let fallback = match artifact_ref {
+            Some(artifact_ref) => format!(
+                "[Consumed {tool_name} output omitted from replay{scope}; outside the current retrieval working set; full={artifact_ref}]"
+            ),
+            None => format!(
+                "[Consumed {tool_name} output omitted from replay{scope}; outside the current retrieval working set; rerun the tool if exact output is needed.]"
+            ),
+        };
+        vec![ContentBlock::Text(TextContent::new(fallback))]
+    }
+
     fn prompt_path_components<'a, F>(
         path_len: usize,
         entry_at: F,
@@ -4176,7 +4193,10 @@ impl PromptManifestBuilder {
                 custom_type: PROMPT_MANIFEST_CUSTOM_TYPE.to_string(),
                 content: format!("Prompt assembly manifest\n{}", manifest.render()),
                 display: false,
-                details: Some(serde_json::json!({ "synthetic": true })),
+                details: Some(serde_json::json!({
+                    "synthetic": true,
+                    "agentVisible": true,
+                })),
                 timestamp: Some(chrono::Utc::now().timestamp_millis()),
             }),
             retrieval_manifest_paths,
@@ -4288,8 +4308,42 @@ impl PromptContextState {
         timestamp: Option<i64>,
     ) -> SessionMessage {
         let metadata = self.tool_calls.get(tool_call_id).cloned();
+        let consumed = self.consumed_tool_results.contains(tool_call_id);
         if !is_error {
             if let Some(metadata) = &metadata {
+                if consumed
+                    && !matches!(
+                        metadata.name.as_str(),
+                        "bash" | "read" | "grep" | "find" | "ls"
+                    )
+                {
+                    if let Some(summary) = Session::tool_output_replay_summary(details.as_ref()) {
+                        return SessionMessage::ToolResult {
+                            tool_call_id: tool_call_id.to_string(),
+                            tool_name: tool_name.to_string(),
+                            content: vec![ContentBlock::Text(TextContent::new(summary))],
+                            details,
+                            is_error,
+                            timestamp,
+                        };
+                    }
+                    if Session::tool_output_was_truncated(details.as_ref())
+                        && let Some(artifact_ref) = Session::tool_full_output_path(details.as_ref())
+                    {
+                        return SessionMessage::ToolResult {
+                            tool_call_id: tool_call_id.to_string(),
+                            tool_name: tool_name.to_string(),
+                            content: Session::replay_artifact_notice(
+                                &metadata.name,
+                                metadata.path.as_deref(),
+                                &artifact_ref,
+                            ),
+                            details,
+                            is_error,
+                            timestamp,
+                        };
+                    }
+                }
                 match metadata.name.as_str() {
                     "write" | "edit" => {
                         if let Some(path) = &metadata.path {
@@ -4327,11 +4381,12 @@ impl PromptContextState {
                         }
                     }
                     "grep" | "find" | "ls" => {
-                        if self.consumed_tool_results.contains(tool_call_id) {
+                        if consumed {
                             let covered_by_manifest = metadata
                                 .path
                                 .as_ref()
                                 .is_some_and(|path| self.retrieval_manifest_paths.contains(path));
+                            let has_working_set = !self.retrieval_manifest_paths.is_empty();
                             if covered_by_manifest {
                                 let content = Session::tool_output_replay_summary(details.as_ref())
                                     .map(|summary| {
@@ -4350,6 +4405,21 @@ impl PromptContextState {
                                     tool_call_id: tool_call_id.to_string(),
                                     tool_name: tool_name.to_string(),
                                     content,
+                                    details,
+                                    is_error,
+                                    timestamp,
+                                };
+                            }
+                            if has_working_set {
+                                let artifact_ref = Session::tool_full_output_path(details.as_ref());
+                                return SessionMessage::ToolResult {
+                                    tool_call_id: tool_call_id.to_string(),
+                                    tool_name: tool_name.to_string(),
+                                    content: Session::working_set_omission_notice(
+                                        &metadata.name,
+                                        metadata.path.as_deref(),
+                                        artifact_ref.as_deref(),
+                                    ),
                                     details,
                                     is_error,
                                     timestamp,
@@ -4376,30 +4446,48 @@ impl PromptContextState {
                     }
                     "read" => {
                         if let Some(path) = &metadata.path {
-                            if self.consumed_tool_results.contains(tool_call_id)
-                                && self.retrieval_manifest_paths.contains(path)
-                            {
-                                let content = Session::tool_output_replay_summary(details.as_ref())
-                                    .map(|summary| {
-                                        vec![ContentBlock::Text(TextContent::new(summary))]
-                                    })
-                                    .unwrap_or_else(|| {
-                                        let artifact_ref =
-                                            Session::tool_full_output_path(details.as_ref());
-                                        Session::replay_summary_notice(
+                            if consumed {
+                                if self.retrieval_manifest_paths.contains(path) {
+                                    let content =
+                                        Session::tool_output_replay_summary(details.as_ref())
+                                            .map(|summary| {
+                                                vec![ContentBlock::Text(TextContent::new(summary))]
+                                            })
+                                            .unwrap_or_else(|| {
+                                                let artifact_ref = Session::tool_full_output_path(
+                                                    details.as_ref(),
+                                                );
+                                                Session::replay_summary_notice(
+                                                    &metadata.name,
+                                                    Some(path),
+                                                    artifact_ref.as_deref(),
+                                                )
+                                            });
+                                    return SessionMessage::ToolResult {
+                                        tool_call_id: tool_call_id.to_string(),
+                                        tool_name: tool_name.to_string(),
+                                        content,
+                                        details,
+                                        is_error,
+                                        timestamp,
+                                    };
+                                }
+                                if !self.retrieval_manifest_paths.is_empty() {
+                                    let artifact_ref =
+                                        Session::tool_full_output_path(details.as_ref());
+                                    return SessionMessage::ToolResult {
+                                        tool_call_id: tool_call_id.to_string(),
+                                        tool_name: tool_name.to_string(),
+                                        content: Session::working_set_omission_notice(
                                             &metadata.name,
                                             Some(path),
                                             artifact_ref.as_deref(),
-                                        )
-                                    });
-                                return SessionMessage::ToolResult {
-                                    tool_call_id: tool_call_id.to_string(),
-                                    tool_name: tool_name.to_string(),
-                                    content,
-                                    details,
-                                    is_error,
-                                    timestamp,
-                                };
+                                        ),
+                                        details,
+                                        is_error,
+                                        timestamp,
+                                    };
+                                }
                             }
                             let version = self.file_versions.get(path).copied().unwrap_or_default();
                             let key = (path.clone(), version);
@@ -4506,6 +4594,43 @@ pub(crate) fn prompt_transform_messages(messages: &[SessionMessage]) -> Vec<Sess
     prompt_transform_messages_with_metadata(messages, PromptAssemblyMetadata::default())
 }
 
+fn prompt_metadata_from_session_messages(messages: &[SessionMessage]) -> PromptAssemblyMetadata {
+    let mut metadata = PromptAssemblyMetadata::default();
+    let last_assistant_idx = messages
+        .iter()
+        .rposition(|message| matches!(message, SessionMessage::Assistant { .. }));
+
+    for (idx, message) in messages.iter().enumerate() {
+        if last_assistant_idx.is_some_and(|last_assistant_idx| idx < last_assistant_idx)
+            && let SessionMessage::ToolResult { tool_call_id, .. } = message
+        {
+            metadata.consumed_tool_results.insert(tool_call_id.clone());
+        }
+    }
+
+    let mut builder = PromptManifestBuilder::default();
+    for message in messages {
+        builder.observe_message(message, &metadata.consumed_tool_results);
+    }
+    let (_, retrieval_manifest_paths) = builder.into_session_message(None);
+    metadata.retrieval_manifest_paths = retrieval_manifest_paths;
+    metadata
+}
+
+pub(crate) fn prompt_transform_model_messages(messages: &[Message]) -> Vec<Message> {
+    let session_messages = messages
+        .iter()
+        .cloned()
+        .map(SessionMessage::from)
+        .collect::<Vec<_>>();
+    let metadata = prompt_metadata_from_session_messages(&session_messages);
+
+    prompt_transform_messages_with_metadata(&session_messages, metadata)
+        .iter()
+        .filter_map(session_message_to_model)
+        .collect()
+}
+
 pub(crate) fn prompt_transform_messages_with_metadata(
     messages: &[SessionMessage],
     metadata: PromptAssemblyMetadata,
@@ -4609,7 +4734,7 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
     }
 }
 
-const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 const BRANCH_SUMMARY_PREFIX: &str =
@@ -7113,6 +7238,93 @@ mod tests {
     }
 
     #[test]
+    fn test_to_messages_for_current_path_omits_consumed_read_outside_retrieval_working_set() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path();
+        std::fs::create_dir_all(workspace.join("src")).expect("mkdir src");
+        for file in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"] {
+            std::fs::write(
+                workspace.join("src").join(file),
+                format!("pub fn {}() {{}}\n", file.trim_end_matches(".rs")),
+            )
+            .expect("write file");
+        }
+
+        let mut session = Session::in_memory();
+        session.header.cwd = workspace.display().to_string();
+        session.append_message(make_test_message("inspect several files"));
+        for (idx, file) in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"].iter().enumerate() {
+            let call_id = format!("call-{}", idx + 1);
+            session.append_message(make_test_tool_call(
+                &call_id,
+                "read",
+                &format!("src/{file}"),
+            ));
+            session.append_message(make_test_tool_result(
+                &call_id,
+                "read",
+                &format!("contents of {file}"),
+            ));
+        }
+        session.append_message(make_test_assistant_text("I know which files matter now"));
+
+        let messages = session.to_messages_for_current_path();
+        let omitted = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result)
+                    if result.tool_name == "read" && result.tool_call_id == "call-5" =>
+                {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected read tool result");
+
+        assert!(omitted.contains("outside the current retrieval working set"));
+        assert!(omitted.contains("src/e.rs"));
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path_elides_consumed_extension_output_with_replay_summary() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("query extension index"));
+        session.append_message(make_test_tool_call("call-1", "semantic_search", "src"));
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "semantic_search".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "verbose extension output that should not replay forever",
+            ))],
+            details: Some(serde_json::json!({
+                "outputCompaction": {
+                    "family": "semantic_search",
+                    "strategy": "replay_summary",
+                    "artifactBacked": false,
+                    "replaySummary": "[Consumed semantic_search output omitted from replay for src; summary=2 relevant symbols]"
+                }
+            })),
+            is_error: false,
+            timestamp: Some(0),
+        });
+        session.append_message(make_test_assistant_text("The extension found the symbols"));
+
+        let messages = session.to_messages_for_current_path();
+        let output = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "semantic_search" => {
+                    Some(Session::text_from_blocks(&result.content))
+                }
+                _ => None,
+            })
+            .expect("expected extension tool result");
+
+        assert!(output.contains("Consumed semantic_search output omitted from replay"));
+        assert!(!output.contains("verbose extension output"));
+    }
+
+    #[test]
     fn test_prompt_assembly_injects_task_aware_manifest_for_nontrivial_working_set() {
         let mut session = Session::in_memory();
         session.append_task_created_entry(
@@ -8666,6 +8878,7 @@ mod tests {
                 cache_write: 0,
                 total_tokens: 150,
                 cost: Cost::default(),
+                prompt_breakdown: None,
             },
             stop_reason: StopReason::ToolUse,
             error_message: None,
@@ -11311,6 +11524,7 @@ mod property_tests {
                     cache_write: cache_write % 500_000,
                     total_tokens: total_tokens % 2_000_000,
                     cost: Cost::default(),
+                    prompt_breakdown: None,
                 },
             )
     }

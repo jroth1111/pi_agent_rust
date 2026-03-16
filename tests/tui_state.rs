@@ -1030,6 +1030,7 @@ fn sample_usage(input: u64, output: u64) -> Usage {
         cache_write: 0,
         total_tokens: input + output,
         cost: Cost::default(),
+        prompt_breakdown: None,
     }
 }
 
@@ -5024,6 +5025,7 @@ fn create_two_branch_session() -> (Session, String, String, String) {
                 cache_write: 0,
                 total_tokens: 15,
                 cost: Cost::default(),
+                prompt_breakdown: None,
             },
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -5052,6 +5054,7 @@ fn create_two_branch_session() -> (Session, String, String, String) {
                 cache_write: 0,
                 total_tokens: 15,
                 cost: Cost::default(),
+                prompt_breakdown: None,
             },
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -5093,6 +5096,7 @@ fn create_many_branch_session(branch_count: usize) -> Session {
                     cache_write: 0,
                     total_tokens: 15,
                     cost: Cost::default(),
+                    prompt_breakdown: None,
                 },
                 stop_reason: StopReason::Stop,
                 error_message: None,
@@ -8073,6 +8077,7 @@ fn tui_perf_streaming_to_cache_transition() {
                     cache_write: 0.0,
                     total: 0.001,
                 },
+                prompt_breakdown: None,
             }),
             stop_reason: StopReason::Stop,
             error_message: None,

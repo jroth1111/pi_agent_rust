@@ -17,6 +17,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ThinkingLevel, ToolCall,
     Usage, UserContent, UserMessage,
 };
+use crate::prompt_usage::attribute_prompt_usage;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions};
 use crate::session::{SessionEntry, SessionMessage, prompt_assembly_plan_from_entries};
 use futures::StreamExt;
@@ -1301,13 +1302,14 @@ async fn complete_simple(
         }
     }
 
-    let message = final_message.ok_or_else(|| Error::api("Stream ended without Done event"))?;
+    let mut message = final_message.ok_or_else(|| Error::api("Stream ended without Done event"))?;
     if matches!(message.stop_reason, StopReason::Aborted | StopReason::Error) {
         let msg = message
             .error_message
             .unwrap_or_else(|| "Summarization error".to_string());
         return Err(Error::api(msg));
     }
+    message.usage.prompt_breakdown = Some(attribute_prompt_usage(&context, &message.usage));
     Ok(message)
 }
 
@@ -3164,6 +3166,7 @@ mod property_tests {
                     cache_write: cache_write % 500_000,
                     total_tokens: total_tokens % 2_000_000,
                     cost: Cost::default(),
+                    prompt_breakdown: None,
                 },
             )
     }
