@@ -30,6 +30,27 @@ pub struct SkillSections {
     pub instructions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillLineage {
+    pub created_by_skill: Option<String>,
+    pub created_by_revision: Option<String>,
+    pub last_improved_by_skill: Option<String>,
+    pub last_improved_by_revision: Option<String>,
+    pub session_id: Option<String>,
+    pub intended_outcome: Option<String>,
+    pub baseline: Option<String>,
+}
+
+impl SkillLineage {
+    pub fn has_creator(&self) -> bool {
+        self.created_by_skill.is_some()
+    }
+
+    pub fn has_improver(&self) -> bool {
+        self.last_improved_by_skill.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -39,6 +60,7 @@ pub struct Skill {
     pub source: String,
     pub disable_model_invocation: bool,
     pub sections: SkillSections,
+    pub lineage: SkillLineage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +319,25 @@ pub fn frontmatter_bool(frontmatter: &HashMap<String, YamlValue>, key: &str) -> 
     }
 }
 
+pub fn parse_skill_lineage(frontmatter: &HashMap<String, YamlValue>) -> SkillLineage {
+    let Some(metadata) = frontmatter_mapping(frontmatter, "metadata") else {
+        return SkillLineage::default();
+    };
+    let source = mapping_value(metadata, "provenance")
+        .and_then(YamlValue::as_mapping)
+        .unwrap_or(metadata);
+
+    SkillLineage {
+        created_by_skill: mapping_string(source, "created-by-skill"),
+        created_by_revision: mapping_string(source, "created-by-revision"),
+        last_improved_by_skill: mapping_string(source, "last-improved-by-skill"),
+        last_improved_by_revision: mapping_string(source, "last-improved-by-revision"),
+        session_id: mapping_string(source, "session-id"),
+        intended_outcome: mapping_string(source, "intended-outcome"),
+        baseline: mapping_string(source, "baseline"),
+    }
+}
+
 fn frontmatter_scalar_string(value: &YamlValue) -> Option<String> {
     match value {
         YamlValue::Null => None,
@@ -305,6 +346,21 @@ fn frontmatter_scalar_string(value: &YamlValue) -> Option<String> {
         YamlValue::String(value) => Some(value.clone()),
         _ => None,
     }
+}
+
+fn frontmatter_mapping<'a>(
+    frontmatter: &'a HashMap<String, YamlValue>,
+    key: &str,
+) -> Option<&'a serde_yaml::Mapping> {
+    frontmatter.get(key)?.as_mapping()
+}
+
+fn mapping_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_string()))
+}
+
+fn mapping_string(mapping: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    mapping_value(mapping, key).and_then(frontmatter_scalar_string)
 }
 
 pub fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
@@ -771,6 +827,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_skill_lineage_reads_provenance_metadata() {
+        let raw = "---\nname: my-skill\ndescription: test\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    last-improved-by-skill: pi-skills-doctor\n    last-improved-by-revision: managed-patch-v1\n    session-id: sess-7\n    intended-outcome: improve routing quality\n    baseline: manual authoring\n---\nBody";
+        let parsed = parse_frontmatter(raw);
+        let lineage = parse_skill_lineage(&parsed.frontmatter);
+        assert_eq!(lineage.created_by_skill.as_deref(), Some("skill-creator"));
+        assert_eq!(lineage.created_by_revision.as_deref(), Some("rev-a"));
+        assert_eq!(
+            lineage.last_improved_by_skill.as_deref(),
+            Some("pi-skills-doctor")
+        );
+        assert_eq!(
+            lineage.last_improved_by_revision.as_deref(),
+            Some("managed-patch-v1")
+        );
+        assert_eq!(lineage.session_id.as_deref(), Some("sess-7"));
+        assert_eq!(
+            lineage.intended_outcome.as_deref(),
+            Some("improve routing quality")
+        );
+        assert_eq!(lineage.baseline.as_deref(), Some("manual authoring"));
+    }
+
+    #[test]
     fn parse_skill_sections_collects_authoring_fields() {
         let sections = parse_skill_sections(
             "## Purpose\nHelp with release checks.\n\n## Use When\n- user asks for a release audit\n- user wants a go/no-go check\n\n## Not For\n- unrelated bug fixes\n\n## Trigger Examples\n- check deployment readiness\n\n## Anti-Trigger Examples\n- fix a production outage\n\n## Inputs\n- release branch\n\n## Output Contract\n- concise checklist\n\n## Success Criteria\n- zero missing critical blockers\n\n## Instructions\n1. inspect the release diff",
@@ -890,6 +969,7 @@ mod tests {
             source: "test".to_string(),
             disable_model_invocation: false,
             sections: SkillSections::default(),
+            lineage: SkillLineage::default(),
         }];
 
         let result = expand_skill_command("/skill:my-skill", &skills);
@@ -917,6 +997,7 @@ mod tests {
             source: "test".to_string(),
             disable_model_invocation: false,
             sections: SkillSections::default(),
+            lineage: SkillLineage::default(),
         }];
 
         let result = expand_skill_command("/skill:my-skill extra args here", &skills);
@@ -940,6 +1021,7 @@ mod tests {
             source: "test".to_string(),
             disable_model_invocation: true,
             sections: SkillSections::default(),
+            lineage: SkillLineage::default(),
         }];
         assert_eq!(format_skills_for_prompt(&skills), "");
     }
@@ -961,6 +1043,7 @@ mod tests {
                     anti_trigger_examples: vec!["fix a production outage".to_string()],
                     ..SkillSections::default()
                 },
+                lineage: SkillLineage::default(),
             },
             Skill {
                 name: "skill-b".to_string(),
@@ -970,6 +1053,7 @@ mod tests {
                 source: "test".to_string(),
                 disable_model_invocation: false,
                 sections: SkillSections::default(),
+                lineage: SkillLineage::default(),
             },
         ];
         let result = format_skills_for_prompt(&skills);

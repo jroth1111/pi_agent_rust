@@ -94,7 +94,9 @@ pi skills init deploy-readiness \
   --trigger "audit this release candidate before deployment" \
   --anti-trigger "fix this production outage right now" \
   --anti-trigger "write release marketing copy" \
-  --success-criterion "must identify blocking deploy risks before release"
+  --success-criterion "must identify blocking deploy risks before release" \
+  --intended-outcome "produce a deploy-readiness skill that catches blockers before release" \
+  --baseline "manual release checklist review"
 ```
 
 By default this writes `.pi/skills/<name>/SKILL.md`. Use `--global` to scaffold into `~/.pi/skills/<name>/SKILL.md`.
@@ -104,8 +106,12 @@ The scaffold keeps `SKILL.md` as the source artifact, but now requires concrete 
 - at least 2 `--trigger` examples
 - at least 2 `--anti-trigger` examples
 - at least 1 `--success-criterion`
+- an `--intended-outcome` describing what the finished skill must achieve downstream
+- a `--baseline` describing what workflow or prior result the new skill must beat or match
 
 That follows the same principle as `skill-creator`: do not scaffold a skill until the activation boundary and success threshold are explicit.
+
+Every scaffold now stamps creator provenance into `metadata.provenance`. By default the creator is `pi-skills-init`, and you can override it with `--created-by-skill`, `--created-by-revision`, and `--session-id` when an external meta-skill authored the child skill.
 
 Once those are provided, Pi generates an explicit structure:
 
@@ -137,6 +143,7 @@ The lint currently checks for:
 - all required authoring sections exist and are non-empty
 - trigger and anti-trigger sections have at least two concrete examples
 - scaffold placeholders such as `TODO:` have been replaced
+- creator-attributed skills declare both an intended downstream outcome and a baseline
 
 ## Self-Improving Skills
 
@@ -187,6 +194,13 @@ If a skill has been amended but the new revision has not been observed yet, `pi 
 The doctor now evaluates both execution evidence and user feedback. A skill can therefore be marked unhealthy even when tool calls succeeded, if the resulting output repeatedly earned low ratings.
 
 If a Pi-managed guardrail amendment regresses, `pi skills doctor --fix` now rolls that managed block back automatically and waits for fresh observations before judging the restored revision again.
+
+The doctor also rolls descendant outcomes up to upstream producers:
+
+- `creator` rollups show whether a skill-authoring workflow is producing healthy child skills
+- `improver` rollups show whether a repair loop is leaving descendant skills healthier after intervention
+
+That means the creation and self-healing loops are no longer judged only on artifact quality. They are judged on the runtime quality of the skills they produced or modified.
 
 ### Success Criteria
 

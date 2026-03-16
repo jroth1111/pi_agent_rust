@@ -8,7 +8,8 @@ use crate::resources::{CollisionInfo, DiagnosticKind, ResourceDiagnostic};
 use super::resolver::is_under_path;
 use super::schema::{
     Skill, frontmatter_bool, frontmatter_string, infer_skill_name, parse_frontmatter,
-    parse_skill_sections, validate_description, validate_frontmatter_fields, validate_name,
+    parse_skill_lineage, parse_skill_sections, validate_description, validate_frontmatter_fields,
+    validate_name,
 };
 
 #[derive(Debug, Clone)]
@@ -331,6 +332,7 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
             source,
             disable_model_invocation,
             sections: parse_skill_sections(&parsed.body),
+            lineage: parse_skill_lineage(frontmatter),
         }),
         diagnostics,
     }
@@ -357,7 +359,7 @@ mod tests {
         let skill_dir = make_skill_dir(
             tmp.path(),
             "my-skill",
-            "---\nname: my-skill\ndescription: A valid skill\n---\nBody",
+            "---\nname: my-skill\ndescription: A valid skill\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    intended-outcome: improve child skill quality\n    baseline: manual authoring\n---\nBody",
         );
         let result = load_skill_from_file(&skill_dir.join("SKILL.md"), "test".to_string());
         assert!(result.skill.is_some());
@@ -365,6 +367,14 @@ mod tests {
         assert_eq!(skill.name, "my-skill");
         assert_eq!(skill.description, "A valid skill");
         assert!(!skill.disable_model_invocation);
+        assert_eq!(
+            skill.lineage.created_by_skill.as_deref(),
+            Some("skill-creator")
+        );
+        assert_eq!(
+            skill.lineage.intended_outcome.as_deref(),
+            Some("improve child skill quality")
+        );
     }
 
     #[test]

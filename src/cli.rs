@@ -899,6 +899,16 @@ mod tests {
             "write release marketing copy",
             "--success-criterion",
             "must identify blocking deploy risks before release",
+            "--created-by-skill",
+            "skill-creator",
+            "--created-by-revision",
+            "rev-a",
+            "--session-id",
+            "sess-7",
+            "--intended-outcome",
+            "produce a deploy-readiness skill that catches blockers before release",
+            "--baseline",
+            "manual release checklist review",
             "--global",
             "--format",
             "json",
@@ -914,6 +924,11 @@ mod tests {
                         trigger_examples,
                         anti_trigger_examples,
                         success_criteria,
+                        created_by_skill,
+                        created_by_revision,
+                        session_id,
+                        intended_outcome,
+                        baseline,
                         global,
                         format,
                     },
@@ -937,6 +952,14 @@ mod tests {
                     success_criteria,
                     vec!["must identify blocking deploy risks before release"]
                 );
+                assert_eq!(created_by_skill.as_deref(), Some("skill-creator"));
+                assert_eq!(created_by_revision.as_deref(), Some("rev-a"));
+                assert_eq!(session_id.as_deref(), Some("sess-7"));
+                assert_eq!(
+                    intended_outcome.as_deref(),
+                    Some("produce a deploy-readiness skill that catches blockers before release")
+                );
+                assert_eq!(baseline.as_deref(), Some("manual release checklist review"));
                 assert!(global);
                 assert_eq!(format, "json");
             }
@@ -1896,6 +1919,21 @@ pub enum SkillCommands {
         /// Explicit task-specific success criterion or threshold the skill must meet
         #[arg(long = "success-criterion", action = clap::ArgAction::Append)]
         success_criteria: Vec<String>,
+        /// Optional creator skill identity for downstream attribution
+        #[arg(long = "created-by-skill")]
+        created_by_skill: Option<String>,
+        /// Optional creator skill revision or digest for downstream attribution
+        #[arg(long = "created-by-revision")]
+        created_by_revision: Option<String>,
+        /// Optional session id linking the created skill to a creation run
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+        /// Intended downstream outcome the finished skill must achieve
+        #[arg(long = "intended-outcome")]
+        intended_outcome: Option<String>,
+        /// Baseline workflow or prior result the finished skill must beat or match
+        #[arg(long = "baseline")]
+        baseline: Option<String>,
         /// Write the scaffold to global skills instead of `.pi/skills`
         #[arg(long)]
         global: bool,

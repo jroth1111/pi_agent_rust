@@ -2,7 +2,7 @@ use super::improvement::SkillDoctorFormat;
 use super::loader::{LoadSkillsOptions, load_skills};
 #[cfg(test)]
 use super::schema::SkillSections;
-use super::schema::{Skill, infer_skill_name, validate_description, validate_name};
+use super::schema::{Skill, SkillLineage, infer_skill_name, validate_description, validate_name};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::resources::{DiagnosticKind, ResourceDiagnostic};
@@ -65,6 +65,11 @@ pub fn handle_skill_init(
     trigger_examples: &[String],
     anti_trigger_examples: &[String],
     success_criteria: &[String],
+    created_by_skill: Option<&str>,
+    created_by_revision: Option<&str>,
+    session_id: Option<&str>,
+    intended_outcome: Option<&str>,
+    baseline: Option<&str>,
     global: bool,
     format: SkillDoctorFormat,
 ) -> Result<SkillInitReceipt> {
@@ -77,6 +82,16 @@ pub fn handle_skill_init(
         trigger_examples,
         anti_trigger_examples,
         success_criteria,
+        SkillLineage {
+            created_by_skill: normalize_optional_text(created_by_skill)
+                .or_else(|| Some("pi-skills-init".to_string())),
+            created_by_revision: normalize_optional_text(created_by_revision),
+            last_improved_by_skill: None,
+            last_improved_by_revision: None,
+            session_id: normalize_optional_text(session_id),
+            intended_outcome: normalize_optional_text(intended_outcome),
+            baseline: normalize_optional_text(baseline),
+        },
         global,
     )?;
 
@@ -189,6 +204,7 @@ fn create_skill_scaffold(
     trigger_examples: &[String],
     anti_trigger_examples: &[String],
     success_criteria: &[String],
+    lineage: SkillLineage,
     global: bool,
 ) -> Result<SkillInitReceipt> {
     let name = name.trim();
@@ -198,6 +214,7 @@ fn create_skill_scaffold(
     let trigger_examples = normalize_examples(trigger_examples);
     let anti_trigger_examples = normalize_examples(anti_trigger_examples);
     let success_criteria = normalize_examples(success_criteria);
+    let lineage = normalize_lineage(lineage);
 
     let mut validation_errors = validate_name(name, name);
     validation_errors.extend(validate_description(description));
@@ -222,6 +239,14 @@ fn create_skill_scaffold(
     if success_criteria.is_empty() {
         validation_errors
             .push("at least one `--success-criterion` is required before scaffolding".to_string());
+    }
+    if lineage.has_creator() && lineage.intended_outcome.is_none() {
+        validation_errors
+            .push("a creator-attributed skill scaffold requires `--intended-outcome`".to_string());
+    }
+    if lineage.has_creator() && lineage.baseline.is_none() {
+        validation_errors
+            .push("a creator-attributed skill scaffold requires `--baseline`".to_string());
     }
     if !validation_errors.is_empty() {
         return Err(Error::validation(validation_errors.join("; ")));
@@ -251,6 +276,7 @@ fn create_skill_scaffold(
         &trigger_examples,
         &anti_trigger_examples,
         &success_criteria,
+        &lineage,
     );
     fs::write(&skill_path, body.as_bytes()).map_err(|err| {
         Error::config(format!(
@@ -348,6 +374,25 @@ fn lint_skill(skill: Skill) -> SkillLintSkillReport {
         &skill.sections.instructions,
         false,
     );
+    if skill.lineage.has_creator() {
+        if skill.lineage.intended_outcome.is_none() {
+            findings.push(SkillLintFinding {
+                code: "lineage_missing_intended_outcome".to_string(),
+                section: Some("metadata.provenance".to_string()),
+                message:
+                    "Skills with creator provenance should declare the intended downstream outcome."
+                        .to_string(),
+            });
+        }
+        if skill.lineage.baseline.is_none() {
+            findings.push(SkillLintFinding {
+                code: "lineage_missing_baseline".to_string(),
+                section: Some("metadata.provenance".to_string()),
+                message: "Skills with creator provenance should record the baseline or workflow they must beat or match."
+                    .to_string(),
+            });
+        }
+    }
 
     SkillLintSkillReport {
         skill_name: skill.name,
@@ -446,14 +491,15 @@ fn render_skill_template(
     trigger_examples: &[String],
     anti_trigger_examples: &[String],
     success_criteria: &[String],
+    lineage: &SkillLineage,
 ) -> String {
     let full_description = build_skill_description(description, use_when, not_for);
     let title = humanize_skill_name(name);
+    let frontmatter = render_skill_frontmatter(name, &full_description, lineage);
 
     format!(
-        "---\nname: {}\ndescription: {}\n---\n# {}\n\n## Purpose\n{}\n\n## Use When\n- {}\n\n## Not For\n- {}\n\n## Trigger Examples\n{}\n\n## Anti-Trigger Examples\n{}\n\n## Inputs\n- {} List required inputs, optional inputs, and missing-input behavior.\n\n## Output Contract\n- {} Describe the exact response shape, files, and verification evidence this skill must produce.\n\n## Success Criteria\n- Reach at least 80% successful observed runs across 3 runs.\n- Reach at least 3.5/5 average feedback across 2 ratings.\n{}\n\n## Instructions\n1. Restate the task and confirm the needed inputs.\n2. Follow the output contract exactly.\n3. Verify the result before responding.\n4. State blockers explicitly instead of guessing.\n",
-        name,
-        yaml_quote(&full_description),
+        "{}# {}\n\n## Purpose\n{}\n\n## Use When\n- {}\n\n## Not For\n- {}\n\n## Trigger Examples\n{}\n\n## Anti-Trigger Examples\n{}\n\n## Inputs\n- {} List required inputs, optional inputs, and missing-input behavior.\n\n## Output Contract\n- {} Describe the exact response shape, files, and verification evidence this skill must produce.\n\n## Success Criteria\n- Reach at least 80% successful observed runs across 3 runs.\n- Reach at least 3.5/5 average feedback across 2 ratings.\n{}\n\n## Instructions\n1. Restate the task and confirm the needed inputs.\n2. Follow the output contract exactly.\n3. Verify the result before responding.\n4. State blockers explicitly instead of guessing.\n",
+        frontmatter,
         title,
         description.trim_end_matches('.'),
         use_when.trim_end_matches('.'),
@@ -464,6 +510,67 @@ fn render_skill_template(
         TODO_MARKER,
         format_examples(success_criteria),
     )
+}
+
+fn render_skill_frontmatter(name: &str, description: &str, lineage: &SkillLineage) -> String {
+    let mut out = String::new();
+    writeln!(out, "---").expect("write frontmatter");
+    writeln!(out, "name: {name}").expect("write frontmatter");
+    writeln!(out, "description: {}", yaml_quote(description)).expect("write frontmatter");
+    if let Some(metadata) = render_lineage_metadata(lineage) {
+        write!(out, "{metadata}").expect("write frontmatter");
+    }
+    writeln!(out, "---").expect("write frontmatter");
+    out
+}
+
+fn render_lineage_metadata(lineage: &SkillLineage) -> Option<String> {
+    let mut lines = Vec::new();
+    push_lineage_entry(
+        &mut lines,
+        "created-by-skill",
+        lineage.created_by_skill.as_deref(),
+    );
+    push_lineage_entry(
+        &mut lines,
+        "created-by-revision",
+        lineage.created_by_revision.as_deref(),
+    );
+    push_lineage_entry(
+        &mut lines,
+        "last-improved-by-skill",
+        lineage.last_improved_by_skill.as_deref(),
+    );
+    push_lineage_entry(
+        &mut lines,
+        "last-improved-by-revision",
+        lineage.last_improved_by_revision.as_deref(),
+    );
+    push_lineage_entry(&mut lines, "session-id", lineage.session_id.as_deref());
+    push_lineage_entry(
+        &mut lines,
+        "intended-outcome",
+        lineage.intended_outcome.as_deref(),
+    );
+    push_lineage_entry(&mut lines, "baseline", lineage.baseline.as_deref());
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    writeln!(out, "metadata:").expect("write metadata");
+    writeln!(out, "  provenance:").expect("write metadata");
+    for line in lines {
+        writeln!(out, "    {line}").expect("write metadata");
+    }
+    Some(out)
+}
+
+fn push_lineage_entry(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    lines.push(format!("{key}: {}", yaml_quote(value)));
 }
 
 fn render_skill_init_receipt(receipt: &SkillInitReceipt) -> Result<String> {
@@ -586,6 +693,25 @@ fn yaml_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn normalize_optional_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn normalize_lineage(mut lineage: SkillLineage) -> SkillLineage {
+    lineage.created_by_skill = normalize_optional_text(lineage.created_by_skill.as_deref());
+    lineage.created_by_revision = normalize_optional_text(lineage.created_by_revision.as_deref());
+    lineage.last_improved_by_skill =
+        normalize_optional_text(lineage.last_improved_by_skill.as_deref());
+    lineage.last_improved_by_revision =
+        normalize_optional_text(lineage.last_improved_by_revision.as_deref());
+    lineage.session_id = normalize_optional_text(lineage.session_id.as_deref());
+    lineage.intended_outcome = normalize_optional_text(lineage.intended_outcome.as_deref());
+    lineage.baseline = normalize_optional_text(lineage.baseline.as_deref());
+    lineage
+}
+
 fn contains_placeholder(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     normalized.contains("todo:")
@@ -618,11 +744,25 @@ mod tests {
                 "write release marketing copy".to_string(),
             ],
             &["must identify all blocking deploy risks before release".to_string()],
+            SkillLineage {
+                created_by_skill: Some("skill-creator".to_string()),
+                created_by_revision: Some("rev-a".to_string()),
+                last_improved_by_skill: None,
+                last_improved_by_revision: None,
+                session_id: Some("sess-7".to_string()),
+                intended_outcome: Some(
+                    "produce a deploy-readiness skill that catches blockers before release"
+                        .to_string(),
+                ),
+                baseline: Some("manual release checklist review".to_string()),
+            },
             false,
         )
         .unwrap();
 
         let content = fs::read_to_string(&receipt.skill_path).unwrap();
+        assert!(content.contains("created-by-skill: \"skill-creator\""));
+        assert!(content.contains("intended-outcome: \"produce a deploy-readiness skill that catches blockers before release\""));
         assert!(content.contains("## Trigger Examples"));
         assert!(content.contains("Use when the user wants a release audit or go/no-go decision."));
         assert!(content.contains("- run a deploy readiness check"));
@@ -642,6 +782,7 @@ mod tests {
             &["run a deploy readiness check".to_string()],
             &["fix this production outage".to_string()],
             &[],
+            SkillLineage::default(),
             false,
         )
         .expect_err("expected intake validation failure");
@@ -650,6 +791,42 @@ mod tests {
         assert!(message.contains("at least two concrete `--trigger` examples"));
         assert!(message.contains("at least two concrete `--anti-trigger` examples"));
         assert!(message.contains("at least one `--success-criterion`"));
+    }
+
+    #[test]
+    fn init_requires_outcome_and_baseline_for_creator_attribution() {
+        let tmp = TempDir::new().unwrap();
+        let err = create_skill_scaffold(
+            tmp.path(),
+            "deploy-readiness",
+            "Check deploy readiness before release",
+            "the user wants a release audit or go/no-go decision",
+            "fixing unrelated product bugs",
+            &[
+                "run a deploy readiness check".to_string(),
+                "audit this release candidate".to_string(),
+            ],
+            &[
+                "fix this production outage".to_string(),
+                "write release marketing copy".to_string(),
+            ],
+            &["must identify all blocking deploy risks before release".to_string()],
+            SkillLineage {
+                created_by_skill: Some("skill-creator".to_string()),
+                created_by_revision: Some("rev-a".to_string()),
+                last_improved_by_skill: None,
+                last_improved_by_revision: None,
+                session_id: None,
+                intended_outcome: None,
+                baseline: None,
+            },
+            false,
+        )
+        .expect_err("expected missing outcome/baseline failure");
+
+        let message = err.to_string();
+        assert!(message.contains("`--intended-outcome`"));
+        assert!(message.contains("`--baseline`"));
     }
 
     #[test]
@@ -755,6 +932,7 @@ mod tests {
                 "write changelog copy".to_string(),
             ],
             &["must separate blockers from non-blocking release warnings".to_string()],
+            SkillLineage::default(),
             false,
         )
         .unwrap();
@@ -843,6 +1021,7 @@ mod tests {
             base_dir: PathBuf::from("/tmp/single-trigger"),
             source: "test".to_string(),
             disable_model_invocation: false,
+            lineage: SkillLineage::default(),
             sections: SkillSections {
                 purpose: vec!["Review deploy readiness.".to_string()],
                 use_when: vec!["the user wants a release audit".to_string()],
@@ -875,6 +1054,7 @@ mod tests {
             base_dir: PathBuf::from("/tmp/blank-trigger"),
             source: "test".to_string(),
             disable_model_invocation: false,
+            lineage: SkillLineage::default(),
             sections: SkillSections {
                 purpose: vec!["Review deploy readiness.".to_string()],
                 use_when: vec!["the user wants a release audit".to_string()],

@@ -1,6 +1,7 @@
 use super::loader::{LoadSkillsOptions, load_skills};
 use super::schema::{
-    ExplicitSkillInvocation, Skill, SkillSections, parse_skill_sections, strip_frontmatter,
+    ExplicitSkillInvocation, Skill, SkillSections, parse_frontmatter, parse_skill_sections,
+    strip_frontmatter,
 };
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -27,6 +28,8 @@ const GUARDRAIL_BLOCK_BEGIN: &str = "<!-- PI-SKILL-GUARDRAILS:BEGIN -->";
 const GUARDRAIL_BLOCK_END: &str = "<!-- PI-SKILL-GUARDRAILS:END -->";
 const ROUTING_BLOCK_BEGIN: &str = "<!-- PI-SKILL-ROUTING:BEGIN -->";
 const ROUTING_BLOCK_END: &str = "<!-- PI-SKILL-ROUTING:END -->";
+const PI_SKILLS_DOCTOR_NAME: &str = "pi-skills-doctor";
+const PI_SKILLS_DOCTOR_REVISION: &str = "managed-patch-v1";
 const LOW_FEEDBACK_THRESHOLD: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +224,36 @@ pub struct SkillHealthReport {
     pub latest_average_feedback_score: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillProducerRole {
+    Creator,
+    Improver,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillProducerReport {
+    pub producer_skill_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_revision: Option<String>,
+    pub role: SkillProducerRole,
+    pub descendant_skill_count: usize,
+    pub observed_descendant_skill_count: usize,
+    pub unobserved_descendant_skill_count: usize,
+    pub effective_descendant_skill_count: usize,
+    pub pending_descendant_skill_count: usize,
+    pub needs_amendment_descendant_skill_count: usize,
+    pub regressed_descendant_skill_count: usize,
+    pub effective_descendant_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_descendant_success_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_descendant_feedback_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillDoctorReport {
@@ -229,6 +262,8 @@ pub struct SkillDoctorReport {
     pub feedback_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillHealthReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producers: Vec<SkillProducerReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied_amendments: Vec<SkillAmendment>,
 }
@@ -278,6 +313,13 @@ struct RevisionEvaluation {
     latest_success_rate: Option<f64>,
     previous_average_feedback_score: Option<f64>,
     latest_average_feedback_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SkillProducerKey {
+    role: SkillProducerRole,
+    name: String,
+    revision: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -510,6 +552,12 @@ pub fn handle_skill_doctor(
     fix: bool,
 ) -> Result<SkillDoctorReport> {
     let criteria = SkillSuccessCriteria::default();
+    let loaded_skills = load_skills(LoadSkillsOptions {
+        cwd: cwd.to_path_buf(),
+        agent_dir: Config::global_dir(),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
     let observations = load_observations(cwd)?;
     let feedback = load_feedback(cwd)?;
     let amendments = load_amendments(cwd)?;
@@ -594,11 +642,13 @@ pub fn handle_skill_doctor(
         }
     }
 
+    let producers = build_skill_producer_reports(&loaded_skills.skills, &skills);
     let report = SkillDoctorReport {
         criteria,
         observation_count: observations.len(),
         feedback_count: feedback.len(),
         skills,
+        producers,
         applied_amendments,
     };
 
@@ -742,6 +792,171 @@ fn mark_report_pending_for_unobserved_revision(
     let evidence = pending_revision_evidence(criteria);
     if !report.evidence.iter().any(|entry| entry == &evidence) {
         report.evidence.insert(0, evidence);
+    }
+}
+
+fn build_skill_producer_reports(
+    loaded_skills: &[Skill],
+    skill_reports: &[SkillHealthReport],
+) -> Vec<SkillProducerReport> {
+    let reports_by_path = skill_reports
+        .iter()
+        .map(|report| (canonicalize_with_fallback(&report.skill_path), report))
+        .collect::<HashMap<_, _>>();
+    let mut grouped: BTreeMap<SkillProducerKey, Vec<Option<&SkillHealthReport>>> = BTreeMap::new();
+
+    for skill in loaded_skills {
+        let report = reports_by_path
+            .get(&canonicalize_with_fallback(&skill.file_path))
+            .copied();
+        if let Some(key) = producer_key(
+            SkillProducerRole::Creator,
+            skill.lineage.created_by_skill.as_deref(),
+            skill.lineage.created_by_revision.as_deref(),
+        ) {
+            grouped.entry(key).or_default().push(report);
+        }
+        if let Some(key) = producer_key(
+            SkillProducerRole::Improver,
+            skill.lineage.last_improved_by_skill.as_deref(),
+            skill.lineage.last_improved_by_revision.as_deref(),
+        ) {
+            grouped.entry(key).or_default().push(report);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(key, descendants)| build_skill_producer_report(key, &descendants))
+        .collect()
+}
+
+fn producer_key(
+    role: SkillProducerRole,
+    name: Option<&str>,
+    revision: Option<&str>,
+) -> Option<SkillProducerKey> {
+    let name = name.map(str::trim).filter(|value| !value.is_empty())?;
+    Some(SkillProducerKey {
+        role,
+        name: name.to_string(),
+        revision: revision
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    })
+}
+
+fn build_skill_producer_report(
+    key: SkillProducerKey,
+    descendants: &[Option<&SkillHealthReport>],
+) -> SkillProducerReport {
+    let descendant_skill_count = descendants.len();
+    let observed_descendant_skill_count =
+        descendants.iter().filter(|report| report.is_some()).count();
+    let unobserved_descendant_skill_count =
+        descendant_skill_count - observed_descendant_skill_count;
+    let mut effective_descendant_skill_count = 0usize;
+    let mut pending_descendant_skill_count = 0usize;
+    let mut needs_amendment_descendant_skill_count = 0usize;
+    let mut regressed_descendant_skill_count = 0usize;
+    let mut success_rates = Vec::new();
+    let mut feedback_scores = Vec::new();
+    let mut evidence_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for report in descendants.iter().flatten() {
+        if report.run_count > 0 {
+            success_rates.push(report.success_rate);
+        }
+        if let Some(score) = report.average_feedback_score {
+            feedback_scores.push(score);
+        }
+        match report.status {
+            SkillHealthStatus::Healthy | SkillHealthStatus::Improved => {
+                effective_descendant_skill_count += 1;
+            }
+            SkillHealthStatus::PendingData => {
+                pending_descendant_skill_count += 1;
+            }
+            SkillHealthStatus::NeedsAmendment => {
+                needs_amendment_descendant_skill_count += 1;
+            }
+            SkillHealthStatus::Regressed => {
+                regressed_descendant_skill_count += 1;
+            }
+        }
+
+        if matches!(
+            report.status,
+            SkillHealthStatus::NeedsAmendment | SkillHealthStatus::Regressed
+        ) {
+            for item in &report.evidence {
+                *evidence_counts
+                    .entry(normalize_signature(item))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    let effective_descendant_rate = if descendant_skill_count == 0 {
+        0.0
+    } else {
+        effective_descendant_skill_count as f64 / descendant_skill_count as f64
+    };
+    let average_descendant_success_rate = (!success_rates.is_empty())
+        .then(|| success_rates.iter().sum::<f64>() / success_rates.len() as f64);
+    let average_descendant_feedback_score = (!feedback_scores.is_empty())
+        .then(|| feedback_scores.iter().sum::<f64>() / feedback_scores.len() as f64);
+
+    let mut evidence = vec![format!(
+        "{effective_descendant_skill_count}/{descendant_skill_count} descendant skills are healthy or improved."
+    )];
+    if unobserved_descendant_skill_count > 0 {
+        evidence.push(format!(
+            "{unobserved_descendant_skill_count} descendant skill(s) have no runtime evidence yet."
+        ));
+    }
+    if pending_descendant_skill_count > 0 {
+        evidence.push(format!(
+            "{pending_descendant_skill_count} descendant skill(s) are still pending post-amend evaluation."
+        ));
+    }
+    if needs_amendment_descendant_skill_count > 0 {
+        evidence.push(format!(
+            "{needs_amendment_descendant_skill_count} descendant skill(s) currently need amendment."
+        ));
+    }
+    if regressed_descendant_skill_count > 0 {
+        evidence.push(format!(
+            "{regressed_descendant_skill_count} descendant skill(s) regressed after amendment."
+        ));
+    }
+
+    let mut ranked_evidence = evidence_counts.into_iter().collect::<Vec<_>>();
+    ranked_evidence.sort_by(|(left_message, left_count), (right_message, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_message.cmp(right_message))
+    });
+    for (message, count) in ranked_evidence.into_iter().take(3) {
+        evidence.push(format!("{message} ({count}x across descendants)"));
+    }
+
+    SkillProducerReport {
+        producer_skill_name: key.name,
+        producer_revision: key.revision,
+        role: key.role,
+        descendant_skill_count,
+        observed_descendant_skill_count,
+        unobserved_descendant_skill_count,
+        effective_descendant_skill_count,
+        pending_descendant_skill_count,
+        needs_amendment_descendant_skill_count,
+        regressed_descendant_skill_count,
+        effective_descendant_rate,
+        average_descendant_success_rate,
+        average_descendant_feedback_score,
+        evidence,
     }
 }
 
@@ -1145,7 +1360,9 @@ fn apply_managed_skill_patch(
     let previous_routing_hints = extract_routing_hints_from_raw(&raw);
     let block = guardrail_block(guardrails);
     let with_guardrails = replace_or_insert_guardrail_block(&raw, &block);
-    let updated = replace_or_insert_routing_block(&with_guardrails, routing_hints);
+    let routed = replace_or_insert_routing_block(&with_guardrails, routing_hints);
+    let updated =
+        stamp_last_improved_lineage(&routed, PI_SKILLS_DOCTOR_NAME, PI_SKILLS_DOCTOR_REVISION)?;
     if updated == raw {
         return Ok(None);
     }
@@ -1200,10 +1417,12 @@ fn rollback_managed_skill_patch(
     let current_guardrails = extract_guardrails_from_raw(&raw);
     let current_routing_hints = extract_routing_hints_from_raw(&raw);
     let restored_guardrails = restore_guardrail_block(&raw, &source_amendment.previous_guardrails);
-    let updated = restore_routing_block(
+    let restored = restore_routing_block(
         &restored_guardrails,
         &source_amendment.previous_routing_hints,
     );
+    let updated =
+        stamp_last_improved_lineage(&restored, PI_SKILLS_DOCTOR_NAME, PI_SKILLS_DOCTOR_REVISION)?;
     if updated == raw {
         return Ok(None);
     }
@@ -1382,6 +1601,67 @@ fn extract_routing_hints_from_raw(raw: &str) -> SkillRoutingHints {
     SkillRoutingHints::from_sections(&sections)
 }
 
+fn stamp_last_improved_lineage(raw: &str, skill_name: &str, revision: &str) -> Result<String> {
+    let parsed = parse_frontmatter(raw);
+    let mut frontmatter = parsed.frontmatter;
+    let metadata = frontmatter
+        .remove("metadata")
+        .unwrap_or_else(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let mut metadata_map = match metadata {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        _ => serde_yaml::Mapping::new(),
+    };
+
+    let provenance_key = serde_yaml::Value::String("provenance".to_string());
+    let mut provenance_map = metadata_map
+        .remove(&provenance_key)
+        .and_then(|value| value.as_mapping().cloned())
+        .unwrap_or_default();
+    provenance_map.insert(
+        serde_yaml::Value::String("last-improved-by-skill".to_string()),
+        serde_yaml::Value::String(skill_name.to_string()),
+    );
+    provenance_map.insert(
+        serde_yaml::Value::String("last-improved-by-revision".to_string()),
+        serde_yaml::Value::String(revision.to_string()),
+    );
+    metadata_map.insert(provenance_key, serde_yaml::Value::Mapping(provenance_map));
+    frontmatter.insert(
+        "metadata".to_string(),
+        serde_yaml::Value::Mapping(metadata_map),
+    );
+    render_skill_raw_with_frontmatter(&frontmatter, &parsed.body)
+}
+
+fn render_skill_raw_with_frontmatter(
+    frontmatter: &HashMap<String, serde_yaml::Value>,
+    body: &str,
+) -> Result<String> {
+    let mut keys = frontmatter.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut mapping = serde_yaml::Mapping::new();
+    for key in keys {
+        if let Some(value) = frontmatter.get(&key) {
+            mapping.insert(serde_yaml::Value::String(key), value.clone());
+        }
+    }
+    let mut yaml = serde_yaml::to_string(&mapping)
+        .map_err(|err| Error::session(format!("serialize skill frontmatter: {err}")))?;
+    if let Some(stripped) = yaml.strip_prefix("---\n") {
+        yaml = stripped.to_string();
+    }
+    let yaml = yaml.trim_end();
+    let body = body.trim_start_matches('\n');
+    if yaml.is_empty() {
+        return Ok(body.to_string());
+    }
+    if body.is_empty() {
+        Ok(format!("---\n{yaml}\n---\n"))
+    } else {
+        Ok(format!("---\n{yaml}\n---\n{body}"))
+    }
+}
+
 fn merge_section_items(base: &[String], managed: &[String]) -> Vec<String> {
     let mut items = base
         .iter()
@@ -1517,6 +1797,42 @@ fn render_skill_doctor_report(report: &SkillDoctorReport) -> Result<String> {
             }
             if !evaluation_parts.is_empty() {
                 writeln!(out, "  evaluation: {}", evaluation_parts.join(" | "))
+                    .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            }
+        }
+    }
+
+    if !report.producers.is_empty() {
+        writeln!(out, "Producer effectiveness: {}", report.producers.len())
+            .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+        for producer in &report.producers {
+            writeln!(
+                out,
+                "  {} ({:?}): descendants={} effective={:.0}% observed={} pending={} needs_amendment={} regressed={}",
+                producer.producer_skill_name,
+                producer.role,
+                producer.descendant_skill_count,
+                producer.effective_descendant_rate * 100.0,
+                producer.observed_descendant_skill_count,
+                producer.pending_descendant_skill_count,
+                producer.needs_amendment_descendant_skill_count,
+                producer.regressed_descendant_skill_count,
+            )
+            .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            if let Some(revision) = &producer.producer_revision {
+                writeln!(out, "    revision: {revision}")
+                    .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            }
+            if let Some(rate) = producer.average_descendant_success_rate {
+                writeln!(out, "    avg descendant success: {:.0}%", rate * 100.0)
+                    .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            }
+            if let Some(score) = producer.average_descendant_feedback_score {
+                writeln!(out, "    avg descendant feedback: {score:.1}/5")
+                    .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
+            }
+            if !producer.evidence.is_empty() {
+                writeln!(out, "    evidence: {}", producer.evidence.join("; "))
                     .map_err(|err| Error::session(format!("render skills doctor report: {err}")))?;
             }
         }
@@ -1924,6 +2240,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentEvent;
     use crate::model::{ContentBlock, TextContent};
+    use crate::skills::{SkillLineage, parse_skill_lineage};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1974,6 +2291,7 @@ mod tests {
             source: "project".to_string(),
             disable_model_invocation: false,
             sections: SkillSections::default(),
+            lineage: SkillLineage::default(),
         }];
         let mut tracker = SkillRunTracker::new(
             dir.path().to_path_buf(),
@@ -2288,6 +2606,7 @@ mod tests {
             source: "project".to_string(),
             disable_model_invocation: false,
             sections: SkillSections::default(),
+            lineage: SkillLineage::default(),
         }];
         let mut tracker =
             SkillRunTracker::new(dir.path().to_path_buf(), "summarize this", &skills, None);
@@ -2332,6 +2651,7 @@ mod tests {
             source: "project".to_string(),
             disable_model_invocation: false,
             sections: SkillSections::default(),
+            lineage: SkillLineage::default(),
         }];
         let mut tracker =
             SkillRunTracker::new(dir.path().to_path_buf(), "summarize this", &skills, None);
@@ -2904,6 +3224,241 @@ mod tests {
     }
 
     #[test]
+    fn doctor_rolls_child_outcomes_up_to_creator_report() {
+        let dir = tempdir().expect("tempdir");
+        let healthy_skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("deploy-readiness")
+            .join("SKILL.md");
+        fs::create_dir_all(healthy_skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &healthy_skill_path,
+            "---\nname: deploy-readiness\ndescription: check release readiness\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    intended-outcome: catch release blockers before deploy\n    baseline: manual checklist review\n---\nReady\n",
+        )
+        .expect("write healthy skill");
+        let failing_skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("release-notes")
+            .join("SKILL.md");
+        fs::create_dir_all(failing_skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &failing_skill_path,
+            "---\nname: release-notes\ndescription: draft release notes\nmetadata:\n  provenance:\n    created-by-skill: skill-creator\n    created-by-revision: rev-a\n    intended-outcome: produce accurate notes\n    baseline: manual note drafting\n---\nDraft\n",
+        )
+        .expect("write failing skill");
+
+        let healthy_digest = file_digest(&healthy_skill_path);
+        let failing_digest = file_digest(&failing_skill_path);
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: healthy_skill_path.clone(),
+                    skill_digest: healthy_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "check this release candidate".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: healthy_skill_path.clone(),
+                    skill_digest: healthy_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "audit this release branch".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "deploy-readiness".to_string(),
+                    skill_path: healthy_skill_path.clone(),
+                    skill_digest: healthy_digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "run release readiness".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:15:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "release-notes".to_string(),
+                    skill_path: failing_skill_path.clone(),
+                    skill_digest: failing_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "draft release notes".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "write".to_string(),
+                        signature: "missing release summary".to_string(),
+                        message: "missing release summary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "release-notes".to_string(),
+                    skill_path: failing_skill_path.clone(),
+                    skill_digest: failing_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "draft notes again".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "write".to_string(),
+                        signature: "missing release summary".to_string(),
+                        message: "missing release summary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "release-notes".to_string(),
+                    skill_path: failing_skill_path.clone(),
+                    skill_digest: failing_digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "draft notes once more".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "write".to_string(),
+                        signature: "missing release summary".to_string(),
+                        message: "missing release summary".to_string(),
+                    }],
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write observations");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
+        let producer = report
+            .producers
+            .iter()
+            .find(|producer| {
+                producer.producer_skill_name == "skill-creator"
+                    && producer.role == SkillProducerRole::Creator
+            })
+            .expect("creator report");
+        assert_eq!(producer.producer_revision.as_deref(), Some("rev-a"));
+        assert_eq!(producer.descendant_skill_count, 2);
+        assert_eq!(producer.observed_descendant_skill_count, 2);
+        assert_eq!(producer.effective_descendant_skill_count, 1);
+        assert_eq!(producer.needs_amendment_descendant_skill_count, 1);
+        assert_eq!(producer.regressed_descendant_skill_count, 0);
+    }
+
+    #[test]
+    fn doctor_fix_stamps_last_improved_lineage() {
+        let dir = tempdir().expect("tempdir");
+        let skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("bug-triage")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            "---\nname: bug-triage\ndescription: triage bugs\n---\nUse bash\n",
+        )
+        .expect("write skill");
+        let digest = file_digest(&skill_path);
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "fix first".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "cargo: command not found".to_string(),
+                        message: "cargo: command not found".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "fix second".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "cargo: command not found".to_string(),
+                        message: "cargo: command not found".to_string(),
+                    }],
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 1,
+                    recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
+                    session_id: None,
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: skill_path.clone(),
+                    skill_digest: digest,
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "fix third".to_string(),
+                    outcome: SkillRunOutcome::ToolFailure,
+                    tool_failures: vec![SkillToolFailure {
+                        tool_name: "bash".to_string(),
+                        signature: "cargo: command not found".to_string(),
+                        message: "cargo: command not found".to_string(),
+                    }],
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write failing observations");
+
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
+        assert_eq!(report.applied_amendments.len(), 1);
+        let raw = fs::read_to_string(&skill_path).expect("read amended skill");
+        let parsed = parse_frontmatter(&raw);
+        let lineage = parse_skill_lineage(&parsed.frontmatter);
+        assert_eq!(
+            lineage.last_improved_by_skill.as_deref(),
+            Some(PI_SKILLS_DOCTOR_NAME)
+        );
+        assert_eq!(
+            lineage.last_improved_by_revision.as_deref(),
+            Some(PI_SKILLS_DOCTOR_REVISION)
+        );
+    }
+
+    #[test]
     fn doctor_fix_rolls_back_regressed_managed_patch() {
         let dir = tempdir().expect("tempdir");
         let skill_path = dir
@@ -3062,11 +3617,17 @@ mod tests {
             .find(|skill| skill.skill_name == "summarize")
             .expect("rollback skill report");
         assert_eq!(rollback_skill.status, SkillHealthStatus::PendingData);
-        assert_eq!(rollback_skill.current_digest, original_digest);
+        assert_eq!(rollback_skill.current_digest, file_digest(&skill_path));
+        assert_ne!(rollback_skill.current_digest, amended_digest);
         assert_eq!(rollback_report.applied_amendments.len(), 1);
+        let rolled_back = fs::read_to_string(&skill_path).expect("read rolled back skill");
+        assert!(!rolled_back.contains(GUARDRAIL_BLOCK_BEGIN));
+        assert!(!rolled_back.contains(ROUTING_BLOCK_BEGIN));
+        let parsed = parse_frontmatter(&rolled_back);
+        let lineage = parse_skill_lineage(&parsed.frontmatter);
         assert_eq!(
-            fs::read_to_string(&skill_path).expect("read rolled back skill"),
-            "---\nname: summarize\ndescription: summarize text\n---\nReturn concise summaries.\n"
+            lineage.last_improved_by_skill.as_deref(),
+            Some(PI_SKILLS_DOCTOR_NAME)
         );
     }
 }
