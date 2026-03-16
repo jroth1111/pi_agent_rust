@@ -8,6 +8,7 @@ use url::Url;
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
+use crate::runtime::policy::evaluate_network_request_policy;
 
 use super::{DEFAULT_WEB_TIMEOUT_SECS, DEFAULT_WEBSEARCH_LIMIT, Tool, ToolOutput, ToolUpdate};
 
@@ -245,6 +246,15 @@ async fn execute_bing_search(query: &str, limit: usize) -> Result<(Vec<WebSearch
         .query_pairs_mut()
         .append_pair("q", query)
         .append_pair("format", "rss");
+    let policy = evaluate_network_request_policy("websearch", &search_url);
+    if policy.verdict.is_denied() {
+        let reason = policy
+            .reasons
+            .first()
+            .map(|entry| entry.message.clone())
+            .unwrap_or_else(|| format!("websearch cannot access {}", search_url));
+        return Err(Error::tool("websearch", reason));
+    }
 
     let response = crate::http::client::Client::new()
         .get(search_url.as_str())
@@ -328,6 +338,15 @@ impl Tool for WebSearchTool {
                 let mut search_url = Url::parse("https://www.google.com/search")
                     .map_err(|e| Error::tool("websearch", format!("Failed to build URL: {e}")))?;
                 search_url.query_pairs_mut().append_pair("q", query);
+                let policy = evaluate_network_request_policy("websearch", &search_url);
+                if policy.verdict.is_denied() {
+                    let reason = policy
+                        .reasons
+                        .first()
+                        .map(|entry| entry.message.clone())
+                        .unwrap_or_else(|| format!("websearch cannot access {}", search_url));
+                    return Err(Error::tool("websearch", reason));
+                }
 
                 // Use realistic User-Agent to avoid immediate blocking
                 let response = crate::http::client::Client::new()

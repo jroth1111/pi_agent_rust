@@ -4,6 +4,9 @@ use crate::extensions::{
 use crate::runtime::types::{RunId, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::path::Path;
+use url::Url;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +47,19 @@ pub enum PolicyTarget {
         run_id: RunId,
         task_id: TaskId,
         command: String,
+    },
+    ShellCommand {
+        tool: String,
+        command: String,
+    },
+    WorkspacePath {
+        tool: String,
+        path: String,
+        workspace_root: String,
+    },
+    NetworkRequest {
+        tool: String,
+        url: String,
     },
 }
 
@@ -117,6 +133,7 @@ pub trait RuntimePolicy: Send + Sync {
 }
 
 pub const BUILTIN_BASH_POLICY_SOURCE: &str = "builtin_bash_exec_mediation";
+pub const BUILTIN_TOOL_POLICY_SOURCE: &str = "builtin_runtime_tool_policy";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommandPolicyDecision {
@@ -139,6 +156,28 @@ impl ShellCommandPolicyDecision {
 
     pub const fn is_denied(&self) -> bool {
         self.verdict.is_denied()
+    }
+}
+
+pub fn shell_policy_to_decision(decision: &ShellCommandPolicyDecision) -> PolicyDecision {
+    let reasons = decision
+        .reason
+        .clone()
+        .into_iter()
+        .map(|message| PolicyReason {
+            code: match decision.verdict {
+                PolicyVerdict::Allow => "allow",
+                PolicyVerdict::AllowWithAudit => "allow_with_audit",
+                PolicyVerdict::RequireApproval => "require_approval",
+                PolicyVerdict::Deny => "deny",
+            }
+            .to_string(),
+            message,
+        })
+        .collect();
+    PolicyDecision {
+        verdict: decision.verdict,
+        reasons,
     }
 }
 
@@ -242,6 +281,78 @@ pub fn evaluate_shell_command_policy(
         risk_tier,
         interactive_class,
         reason,
+    }
+}
+
+pub fn evaluate_workspace_path_policy(tool: &str, path: &Path, cwd: &Path) -> PolicyDecision {
+    if workspace_contains_path(path, cwd) {
+        return PolicyDecision::allow();
+    }
+
+    PolicyDecision::deny(format!(
+        "{tool} cannot access path outside workspace root: {}",
+        path.display()
+    ))
+}
+
+pub fn evaluate_network_request_policy(tool: &str, url: &Url) -> PolicyDecision {
+    if !matches!(url.scheme(), "http" | "https") {
+        return PolicyDecision::deny(format!(
+            "{tool} only supports http/https URLs, got {}",
+            url.scheme()
+        ));
+    }
+
+    let Some(host) = url.host_str() else {
+        return PolicyDecision::deny(format!("{tool} requires a host"));
+    };
+
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return PolicyDecision::deny(format!("{tool} cannot access loopback host `{host}`"));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_private_ip(ip) {
+            return PolicyDecision::deny(format!("{tool} cannot access non-public host `{host}`"));
+        }
+    }
+
+    PolicyDecision::allow()
+}
+
+fn workspace_contains_path(path: &Path, cwd: &Path) -> bool {
+    let base = canonicalize_or_normalize(cwd);
+    let candidate = canonicalize_or_normalize(path);
+    if candidate.starts_with(&base) {
+        return true;
+    }
+
+    if path.exists() {
+        return false;
+    }
+
+    path.parent().is_some_and(|parent| {
+        let parent_candidate = canonicalize_or_normalize(parent);
+        parent_candidate.starts_with(&base)
+    })
+}
+
+fn canonicalize_or_normalize(path: &Path) -> std::path::PathBuf {
+    crate::extensions::safe_canonicalize(path)
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            ip.is_private()
+                || ip.is_link_local()
+                || [a, b, c, d] == [255, 255, 255, 255]
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+        }
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
     }
 }
 
@@ -373,5 +484,22 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("interactive"))
         );
+    }
+
+    #[test]
+    fn workspace_policy_denies_escape() {
+        let decision = evaluate_workspace_path_policy(
+            "read",
+            Path::new("/tmp/outside.txt"),
+            Path::new("/Users/example/project"),
+        );
+        assert_eq!(decision.verdict, PolicyVerdict::Deny);
+    }
+
+    #[test]
+    fn network_policy_denies_loopback_host() {
+        let url = Url::parse("http://127.0.0.1:8080/health").expect("url");
+        let decision = evaluate_network_request_policy("webfetch", &url);
+        assert_eq!(decision.verdict, PolicyVerdict::Deny);
     }
 }

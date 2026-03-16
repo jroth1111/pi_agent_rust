@@ -12,10 +12,13 @@ use crate::agent_cx::AgentCx;
 use crate::config::{Config, ReliabilityEnforcementMode};
 use crate::error::{Error, Result};
 use crate::extensions::{
-    ExecMediationPolicy, ExecRiskTier, safe_canonicalize, sha256_hex_standalone, strip_unc_prefix,
+    ExecMediationPolicy, ExecRiskTier, sha256_hex_standalone, strip_unc_prefix,
 };
 use crate::model::{ContentBlock, ImageContent, TextContent};
-use crate::runtime::policy::{BUILTIN_BASH_POLICY_SOURCE, evaluate_shell_command_policy};
+use crate::runtime::policy::{
+    BUILTIN_TOOL_POLICY_SOURCE, evaluate_shell_command_policy, evaluate_workspace_path_policy,
+    shell_policy_to_decision,
+};
 use crate::sandbox::build_bash_spawn_plan;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
@@ -614,39 +617,23 @@ fn file_exists(path: &Path) -> bool {
     std::fs::metadata(path).is_ok()
 }
 
-fn canonicalize_or_normalize(path: &Path) -> PathBuf {
-    safe_canonicalize(path)
-}
-
-fn is_within_workspace(path: &Path, cwd: &Path) -> bool {
-    let base = canonicalize_or_normalize(cwd);
-    let candidate = canonicalize_or_normalize(path);
-    if candidate.starts_with(&base) {
-        return true;
-    }
-
-    // Paths for writes may not exist yet; in that case use the canonicalized parent
-    // to preserve symlink-aware workspace checks (e.g. /tmp -> /private/tmp on macOS).
-    if path.exists() {
-        return false;
-    }
-    path.parent().is_some_and(|parent| {
-        let parent_candidate = canonicalize_or_normalize(parent);
-        parent_candidate.starts_with(&base)
-    })
-}
-
 fn ensure_within_workspace(tool: &str, path: &Path, cwd: &Path) -> Result<()> {
-    if is_within_workspace(path, cwd) {
+    let decision = evaluate_workspace_path_policy(tool, path, cwd);
+    if decision.verdict.is_allowed() {
         return Ok(());
     }
-    Err(Error::tool(
-        tool,
-        format!(
-            "Path escapes the workspace root and is not allowed: {}",
-            path.display()
-        ),
-    ))
+
+    let message = decision
+        .reasons
+        .first()
+        .map(|reason| reason.message.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "Path escapes the workspace root and is not allowed: {}",
+                path.display()
+            )
+        });
+    Err(Error::tool(tool, message))
 }
 
 /// Resolve a file path for reading, including macOS screenshot name variants.
@@ -2084,50 +2071,56 @@ impl Tool for BashTool {
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let hard_mode = self.hard_mode_enabled();
         let mediation_policy = self.effective_exec_mediation_policy();
-        let policy_decision =
+        let shell_policy_decision =
             evaluate_shell_command_policy(&mediation_policy, &input.command, hard_mode);
-        let denial_reason = policy_decision
+        let denial_reason = shell_policy_decision
             .is_denied()
-            .then(|| policy_decision.reason.clone())
+            .then(|| shell_policy_decision.reason.clone())
             .flatten();
 
         let mut exec_mediation_details = serde_json::Map::new();
         exec_mediation_details.insert(
             "decision".to_string(),
-            serde_json::Value::String(policy_decision.decision_label().to_string()),
+            serde_json::Value::String(shell_policy_decision.decision_label().to_string()),
         );
         exec_mediation_details.insert(
             "policySource".to_string(),
-            serde_json::Value::String(BUILTIN_BASH_POLICY_SOURCE.to_string()),
+            serde_json::Value::String(BUILTIN_TOOL_POLICY_SOURCE.to_string()),
         );
         exec_mediation_details.insert("hardMode".to_string(), serde_json::Value::Bool(hard_mode));
         exec_mediation_details.insert(
             "commandHash".to_string(),
             serde_json::Value::String(sha256_hex_standalone(&input.command)),
         );
-        if let Some(class) = policy_decision.command_class {
+        if let Some(class) = shell_policy_decision.command_class {
             exec_mediation_details.insert(
                 "commandClass".to_string(),
                 serde_json::Value::String(class.to_string()),
             );
         }
-        if let Some(tier) = policy_decision.risk_tier {
+        if let Some(tier) = shell_policy_decision.risk_tier {
             exec_mediation_details.insert(
                 "riskTier".to_string(),
                 serde_json::Value::String(tier.to_string()),
             );
         }
-        if let Some(class) = policy_decision.interactive_class {
+        if let Some(class) = shell_policy_decision.interactive_class {
             exec_mediation_details.insert(
                 "interactiveClass".to_string(),
                 serde_json::Value::String(class.to_string()),
             );
         }
-        if let Some(reason) = policy_decision.reason.clone() {
+        if let Some(reason) = shell_policy_decision.reason.clone() {
             exec_mediation_details.insert("reason".to_string(), serde_json::Value::String(reason));
         }
 
-        if let Some(reason) = denial_reason {
+        let policy_decision = shell_policy_to_decision(&shell_policy_decision);
+        if let Some(reason) = denial_reason.or_else(|| {
+            policy_decision
+                .reasons
+                .first()
+                .map(|policy_reason| policy_reason.message.clone())
+        }) {
             let mut details_map = serde_json::Map::new();
             details_map.insert(
                 "exitCode".to_string(),
@@ -2137,6 +2130,10 @@ impl Tool for BashTool {
             details_map.insert(
                 "execMediation".to_string(),
                 serde_json::Value::Object(exec_mediation_details),
+            );
+            details_map.insert(
+                "policyVerdict".to_string(),
+                serde_json::Value::String(shell_policy_decision.decision_label().to_string()),
             );
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
@@ -2187,8 +2184,8 @@ impl Tool for BashTool {
                 serde_json::Value::String(note.clone()),
             );
         }
-        if policy_decision.decision_label() != "allow"
-            || policy_decision.interactive_class.is_some()
+        if shell_policy_decision.decision_label() != "allow"
+            || shell_policy_decision.interactive_class.is_some()
         {
             details_map.insert(
                 "execMediation".to_string(),

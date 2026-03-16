@@ -6,6 +6,7 @@ use url::Url;
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
+use crate::runtime::policy::evaluate_network_request_policy;
 
 use super::html_extract;
 use super::{
@@ -72,6 +73,18 @@ async fn fetch_url_following_redirects(
 ) -> Result<WebFetchResponse> {
     let mut current_url = url.to_string();
     for hop in 0..=max_redirects {
+        let parsed_url = Url::parse(&current_url)
+            .map_err(|e| Error::tool("webfetch", format!("Invalid URL: {e}")))?;
+        let policy = evaluate_network_request_policy("webfetch", &parsed_url);
+        if policy.verdict.is_denied() {
+            let reason = policy
+                .reasons
+                .first()
+                .map(|entry| entry.message.clone())
+                .unwrap_or_else(|| format!("webfetch cannot access {}", parsed_url));
+            return Err(Error::tool("webfetch", reason));
+        }
+
         let mut request = client.get(&current_url).header(
             "Accept",
             "text/html,application/json,text/plain;q=0.9,*/*;q=0.8",
@@ -100,6 +113,15 @@ async fn fetch_url_following_redirects(
                     .map_err(|e| {
                         Error::tool("webfetch", format!("Invalid redirect location: {e}"))
                     })?;
+                let policy = evaluate_network_request_policy("webfetch", &next);
+                if policy.verdict.is_denied() {
+                    let reason = policy
+                        .reasons
+                        .first()
+                        .map(|entry| entry.message.clone())
+                        .unwrap_or_else(|| format!("webfetch cannot access {}", next));
+                    return Err(Error::tool("webfetch", reason));
+                }
                 current_url = next.to_string();
                 continue;
             }
