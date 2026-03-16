@@ -1,6 +1,6 @@
-use crate::reliability::edge::{EdgeKind, EdgeTrigger, ReliabilityEdge};
-use crate::reliability::state::{RuntimeState, TerminalState};
-use crate::reliability::task::TaskNode;
+use crate::runtime::reliability::edge::{EdgeKind, EdgeTrigger, ReliabilityEdge};
+use crate::runtime::reliability::state::{RuntimeState, TerminalState};
+use crate::runtime::reliability::task::TaskNode;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default)]
@@ -181,9 +181,11 @@ impl DagEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::edge::{EdgeKind, EdgeTrigger, FailureClassMask, ReliabilityEdge};
-    use crate::reliability::state::{FailureClass, RuntimeState, TerminalState};
-    use crate::reliability::task::{TaskConstraintSet, TaskNode, TaskSpec, VerifyPlan};
+    use crate::runtime::reliability::edge::{
+        EdgeKind, EdgeTrigger, FailureClassMask, ReliabilityEdge,
+    };
+    use crate::runtime::reliability::state::{FailureClass, RuntimeState, TerminalState};
+    use crate::runtime::reliability::task::{TaskConstraintSet, TaskNode, TaskSpec, VerifyPlan};
     use chrono::Utc;
 
     fn task(id: &str, state: RuntimeState) -> TaskNode {
@@ -202,7 +204,7 @@ mod tests {
                 acceptance_ids: vec!["ac-1".to_string()],
                 planned_touches: vec!["src/reliability/dag.rs".to_string()],
             },
-            runtime: crate::reliability::task::TaskRuntime {
+            runtime: crate::runtime::reliability::task::TaskRuntime {
                 state,
                 attempt: 0,
                 last_transition_at: Utc::now(),

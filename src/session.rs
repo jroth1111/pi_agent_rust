@@ -13,7 +13,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, TextContent, ToolResultMessage, UserContent,
     UserMessage,
 };
-use crate::reliability::{ClosePayload, CloseResult, EvidenceRecord, StateDigest};
+use crate::runtime::reliability::{ClosePayload, CloseResult, EvidenceRecord, StateDigest};
 use crate::session_index::{SessionIndex, enqueue_session_index_snapshot_update};
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -5883,7 +5883,7 @@ mod tests {
             ClosePayload {
                 task_id: "task-1".to_string(),
                 outcome: "Implemented fix".to_string(),
-                outcome_kind: Some(crate::reliability::CloseOutcomeKind::Success),
+                outcome_kind: Some(crate::runtime::reliability::CloseOutcomeKind::Success),
                 acceptance_ids: vec!["acceptance-1".to_string()],
                 evidence_ids: vec![evidence_id.clone()],
                 trace_parent: Some("epic-1".to_string()),

@@ -3,7 +3,7 @@
 //! This module keeps session-local artifacts that the agent still uses
 //! directly: immutable task event logs, completion gates, and discovery
 //! tracking. It no longer owns the runtime lifecycle; orchestration state
-//! lives under `crate::runtime` and `crate::reliability`.
+//! lives under `crate::runtime` and `crate::runtime::reliability`.
 
 mod discovery;
 mod events;

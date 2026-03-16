@@ -1,5 +1,5 @@
-use crate::reliability::evidence::EvidenceRecord;
-use crate::reliability::task::TaskConstraintSet;
+use crate::runtime::reliability::evidence::EvidenceRecord;
+use crate::runtime::reliability::task::TaskConstraintSet;
 use crate::tools::run_bash_command;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -238,8 +238,8 @@ impl Verifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::EvidenceRecord;
-    use crate::reliability::task::{NetworkPolicy, TaskConstraintSet};
+    use crate::runtime::reliability::EvidenceRecord;
+    use crate::runtime::reliability::task::{NetworkPolicy, TaskConstraintSet};
     use std::path::Path;
 
     #[test]

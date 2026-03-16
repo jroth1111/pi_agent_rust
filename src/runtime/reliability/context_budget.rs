@@ -887,7 +887,7 @@ mod tests {
     fn parse_rust_imports_extracts_use_statements() {
         let content = r"
 use std::collections::HashMap;
-use crate::reliability::state::RuntimeState;
+use crate::runtime::reliability::state::RuntimeState;
 use super::lease::LeaseManager;
 ";
         let imports = ContextFanout::parse_rust_imports(content);
@@ -900,7 +900,7 @@ use super::lease::LeaseManager;
         assert!(
             imports
                 .iter()
-                .any(|i| i.contains("crate::reliability::state"))
+                .any(|i| i.contains("crate::runtime::reliability::state"))
         );
         assert!(imports.iter().any(|i| i.contains("super::lease")));
     }

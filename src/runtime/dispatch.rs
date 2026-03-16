@@ -1,7 +1,7 @@
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
-use crate::reliability;
 use crate::runtime::execution::{DispatchGrant, RuntimeExecutionState};
+use crate::runtime::reliability;
 use crate::runtime::scheduler;
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{LeaseRecord, RunPhase, RunSnapshot, TaskNode, TaskState};

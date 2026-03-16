@@ -10,6 +10,7 @@ pub mod events;
 pub mod execution;
 pub mod model_routing;
 pub mod policy;
+pub mod reliability;
 pub mod role_prompt;
 pub mod scheduler;
 pub mod service;
@@ -39,12 +40,13 @@ pub use policy::{
     PolicyDecision, PolicyReason, PolicyRequest, PolicySet, PolicyTarget, PolicyVerdict,
     RuntimePolicy,
 };
+pub use reliability::*;
 pub use role_prompt::{SessionRole, build_role_system_prompt};
 pub use service::{
-    RuntimeServiceHost, RuntimeStartRunRequest, accept_plan, accept_run_plan, bootstrap_run,
-    build_runtime_plan_artifact, build_runtime_task_nodes, cancel_run, dispatch_run,
-    ensure_run_id_available, next_run_id, resume_run, select_execution_tier, start_run,
-    validate_start_run_request,
+    RuntimeServiceHost, RuntimeStartRunRequest, accept_plan, accept_run_plan, append_evidence,
+    bootstrap_run, build_runtime_plan_artifact, build_runtime_task_nodes, cancel_run, dispatch_run,
+    ensure_run_id_available, next_run_id, resolve_blocker, resume_run, select_execution_tier,
+    start_run, submit_task, validate_start_run_request,
 };
 pub use state_machine::{RuntimeStateMachine, RuntimeTransition, TransitionError};
 pub use store::RuntimeStore;

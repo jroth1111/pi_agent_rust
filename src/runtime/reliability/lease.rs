@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::reliability::context_budget::ContextFanout;
-use crate::reliability::state::RuntimeState;
+use crate::runtime::reliability::context_budget::ContextFanout;
+use crate::runtime::reliability::state::RuntimeState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseGrant {
@@ -323,7 +323,7 @@ impl LeaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::state::TerminalState;
+    use crate::runtime::reliability::state::TerminalState;
     use chrono::{Duration, Utc};
     use std::sync::Arc;
 

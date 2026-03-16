@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::TaskResult;
 use super::discovery::DiscoveryPriority;
-use crate::reliability::StuckPattern;
+use crate::runtime::reliability::StuckPattern;
 
 /// Evidence attached to task completion events.
 ///

@@ -1,4 +1,4 @@
-use crate::reliability::evidence::EvidenceRecord;
+use crate::runtime::reliability::evidence::EvidenceRecord;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +176,7 @@ pub enum CloseGuardError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::EvidenceRecord;
+    use crate::runtime::reliability::EvidenceRecord;
 
     #[test]
     fn close_payload_validation_requires_acceptance_and_evidence() {

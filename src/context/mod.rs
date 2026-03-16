@@ -55,7 +55,7 @@ pub use threshold::{
     get_context_window, get_context_window_for_id, get_safe_buffer,
 };
 
-use crate::reliability::{
+use crate::runtime::reliability::{
     BudgetedContext, ContextBudgetComposer, RetrievalAdapter, RetrievalContextInput,
 };
 

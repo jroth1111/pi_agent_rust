@@ -35,35 +35,36 @@ use crate::provider_metadata::{
     canonical_provider_id, provider_metadata, provider_routing_defaults,
 };
 use crate::providers;
-use crate::reliability;
-use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
 use crate::runtime::controller::ControllerOutput as RuntimeControllerOutput;
 use crate::runtime::dispatch::{
     DispatchRunHost, ORCHESTRATION_ROLLBACK_RETRY_DELAY, build_runtime_task_report,
-    cancel_live_run_tasks, dispatch_run_until_quiescent, refresh_live_run_from_reliability,
-    refresh_run_from_reliability, run_has_live_tasks, run_requires_plan_acceptance,
+    cancel_live_run_tasks, refresh_run_from_reliability,
 };
 use crate::runtime::execution::{
-    AppendEvidenceRequest, DispatchGrant, RuntimeExecutionState, SubmitTaskRequest,
+    AppendEvidenceRequest, BlockerReport, DispatchGrant, RuntimeExecutionState, SubmitTaskRequest,
     SubmitTaskResponse, TaskContract,
 };
+use crate::runtime::reliability;
+use crate::runtime::reliability::verifier::Verifier;
 use crate::runtime::role_prompt::{SessionRole, build_role_system_prompt};
 use crate::runtime::service::{
-    RuntimeStartRunRequest, accept_plan as runtime_accept_plan,
-    bootstrap_run as runtime_bootstrap_run,
+    RuntimeServiceHost, RuntimeStartRunRequest, accept_run_plan as runtime_accept_run_plan,
+    append_evidence as runtime_append_evidence,
     build_runtime_plan_artifact as service_build_runtime_plan_artifact,
-    build_runtime_task_nodes as service_build_runtime_task_nodes,
-    ensure_run_id_available as runtime_ensure_run_id_available,
-    select_execution_tier as runtime_select_execution_tier,
+    build_runtime_task_nodes as service_build_runtime_task_nodes, cancel_run as runtime_cancel_run,
+    dispatch_run as runtime_dispatch_run,
+    ensure_run_id_available as runtime_ensure_run_id_available, resume_run as runtime_resume_run,
+    select_execution_tier as runtime_select_execution_tier, start_run as runtime_start_run,
+    submit_task as runtime_submit_task,
 };
 use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
     ModelProfile, ModelSelector, PlanArtifact, RunPhase, RunSnapshot, TaskNode,
 };
 use crate::runtime::verification::{
-    CompletedRunVerifyScope, completed_run_verify_scope, completed_scope_from_run_verify,
-    execute_run_verification, should_skip_run_verify,
+    CompletedRunVerifyScope, completed_run_verify_scope, execute_run_verification,
+    should_skip_run_verify,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -93,7 +94,7 @@ use crate::config::ReliabilityEnforcementMode;
 #[cfg(test)]
 use crate::runtime::dispatch::dispatch_run_wave;
 #[cfg(test)]
-use crate::runtime::execution::{BlockerReport, TaskPrerequisite};
+use crate::runtime::execution::TaskPrerequisite;
 #[cfg(test)]
 use crate::runtime::types::{
     AutonomyLevel, RunBudgets, RunConstraints, RunSpec, TaskConstraints, TaskSpec, VerifySpec,
@@ -245,14 +246,6 @@ where
 {
     serde_json::from_value(command_payload(parsed))
         .map_err(|err| Error::validation(format!("Invalid payload for {command_type}: {err}")))
-}
-
-fn next_run_id(candidate: Option<&str>) -> String {
-    candidate
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4().simple()))
 }
 
 async fn persist_runtime_snapshot(
@@ -474,33 +467,6 @@ fn build_runtime_task_nodes(
     default_verify_timeout_sec: u32,
 ) -> Vec<TaskNode> {
     service_build_runtime_task_nodes(&runtime_start_run_request(req), default_verify_timeout_sec)
-}
-
-async fn bootstrap_runtime_run(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    options: &RpcOptions,
-    run_id: &str,
-    req: &StartRunRequest,
-) -> Result<RuntimeControllerOutput> {
-    let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
-    runtime_bootstrap_run(
-        run_id,
-        &runtime_start_run_request(req),
-        model_profile,
-        std::env::current_dir().map_err(|err| Error::Io(Box::new(err)))?,
-        options.config.reliability_verify_timeout_sec_default(),
-    )
-}
-
-async fn accept_runtime_plan(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    options: &RpcOptions,
-    snapshot: RunSnapshot,
-) -> Result<RuntimeControllerOutput> {
-    let model_profile = runtime_model_profile_for_run(cx, session, options).await?;
-    runtime_accept_plan(snapshot, model_profile)
 }
 
 async fn append_dispatch_grants_session_entries(
@@ -1175,21 +1141,11 @@ async fn execute_task_verification(
     }
 }
 
-#[allow(dead_code)]
-async fn append_evidence_record(
+async fn persist_runtime_evidence_record(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
-    req: AppendEvidenceRequest,
-) -> Result<reliability::EvidenceRecord> {
-    let evidence = {
-        let mut rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        rel.append_evidence(req)?
-    };
-
+    evidence: &reliability::EvidenceRecord,
+) -> Result<()> {
     let mut guard = session
         .lock(cx)
         .await
@@ -1203,66 +1159,69 @@ async fn append_evidence_record(
         inner_session.append_verification_evidence_entry(evidence.clone());
     }
     guard.persist_session().await?;
-    Ok(evidence)
+    Ok(())
 }
 
-#[allow(dead_code)]
-async fn submit_task_and_sync(
+async fn persist_runtime_submit_task_result(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
-    runtime_store: &RuntimeStore,
-    req: SubmitTaskRequest,
-) -> Result<SubmitTaskResponse> {
-    let req_for_report = req.clone();
-    let result = {
-        let mut rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        rel.submit_task(req)?
-    };
-
+    result: &SubmitTaskResponse,
+) -> Result<()> {
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
     {
-        let mut guard = session
+        let mut inner_session = guard
+            .session
             .lock(cx)
             .await
-            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        {
-            let mut inner_session = guard
-                .session
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-            inner_session
-                .append_close_decision_entry(result.close_payload.clone(), result.close.clone());
-            inner_session.append_task_transition_entry(
-                result.task_id.clone(),
-                None,
-                result.state.clone(),
-                None,
-            );
-        }
-        guard.persist_session().await?;
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        inner_session
+            .append_close_decision_entry(result.close_payload.clone(), result.close.clone());
+        inner_session.append_task_transition_entry(
+            result.task_id.clone(),
+            None,
+            result.state.clone(),
+            None,
+        );
     }
+    guard.persist_session().await?;
+    Ok(())
+}
 
-    let report = {
-        let rel = reliability_state
+async fn persist_runtime_blocker_resolution(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    req: &BlockerReport,
+    state: &str,
+) -> Result<()> {
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
             .lock(cx)
             .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        build_submit_task_report(&rel, &req_for_report, &result)?
-    };
-    sync_task_runs(
-        cx,
-        session,
-        reliability_state,
-        runtime_store,
-        &result.task_id,
-        Some(report),
-    )
-    .await?;
-    Ok(result)
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        inner_session.append_task_transition_entry(
+            req.task_id.clone(),
+            None,
+            state.to_string(),
+            Some(json!({
+                "leaseId": req.lease_id,
+                "fenceToken": req.fence_token,
+                "reason": req.reason,
+                "context": req.context,
+                "resolved": req.resolved,
+                "deferTrigger": req.defer_trigger,
+            })),
+        );
+    }
+    guard.persist_session().await?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1438,14 +1397,14 @@ async fn finalize_captured_dispatch_execution(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
+    host: &impl RuntimeServiceHost,
     repo_root: &Path,
     run_id: &str,
     capture: CapturedDispatchExecution,
 ) -> Result<RunSnapshot> {
-    let evidence = match append_evidence_record(
+    let evidence = match runtime_append_evidence(
         cx,
-        session,
-        reliability_state,
+        host,
         AppendEvidenceRequest {
             task_id: capture.contract.task_id.clone(),
             command: capture.verification.command.clone(),
@@ -1508,11 +1467,9 @@ async fn finalize_captured_dispatch_execution(
             evidence_ids: vec![evidence.evidence_id.clone()],
             trace_parent: capture.contract.parent_goal_trace_id.clone(),
         });
-    if let Err(err) = submit_task_and_sync(
+    if let Err(err) = runtime_submit_task(
         cx,
-        session,
-        reliability_state,
-        runtime_store,
+        host,
         SubmitTaskRequest {
             task_id: capture.grant.task_id.clone(),
             lease_id: capture.grant.lease_id.clone(),
@@ -1553,6 +1510,7 @@ async fn execute_inline_dispatch_grant_with_worker(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
+    host: &impl RuntimeServiceHost,
     repo_root: &Path,
     run_id: &str,
     grant: &DispatchGrant,
@@ -1584,6 +1542,7 @@ async fn execute_inline_dispatch_grant_with_worker(
         session,
         reliability_state,
         runtime_store,
+        host,
         repo_root,
         run_id,
         capture,
@@ -1596,6 +1555,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
+    host: &impl RuntimeServiceHost,
     repo_root: &Path,
     run: RunSnapshot,
     grants: &[DispatchGrant],
@@ -1641,6 +1601,7 @@ async fn execute_dispatch_grants_sequentially_with_replay_base(
             session,
             reliability_state,
             runtime_store,
+            host,
             repo_root,
             &updated_run.spec.run_id,
             capture,
@@ -1660,6 +1621,7 @@ async fn finalize_captured_dispatches(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
+    host: &impl RuntimeServiceHost,
     repo_root: &Path,
     run: RunSnapshot,
     captures: Vec<CapturedDispatchExecution>,
@@ -1671,6 +1633,7 @@ async fn finalize_captured_dispatches(
             session,
             reliability_state,
             runtime_store,
+            host,
             repo_root,
             &updated_run.spec.run_id,
             capture,
@@ -1685,6 +1648,7 @@ async fn execute_dispatch_grants_with_worker(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
+    host: &impl RuntimeServiceHost,
     repo_root: &Path,
     run: RunSnapshot,
     grants: &[DispatchGrant],
@@ -1740,6 +1704,7 @@ async fn execute_dispatch_grants_with_worker(
                         session,
                         reliability_state,
                         runtime_store,
+                        host,
                         repo_root,
                         run,
                         &success_grants,
@@ -1752,6 +1717,7 @@ async fn execute_dispatch_grants_with_worker(
                         session,
                         reliability_state,
                         runtime_store,
+                        host,
                         repo_root,
                         run,
                         captures,
@@ -1770,6 +1736,7 @@ async fn execute_dispatch_grants_with_worker(
                 session,
                 reliability_state,
                 runtime_store,
+                host,
                 repo_root,
                 run,
                 grants,
@@ -1783,6 +1750,7 @@ async fn execute_dispatch_grants_with_worker(
             session,
             reliability_state,
             runtime_store,
+            host,
             repo_root,
             run,
             captures,
@@ -1797,6 +1765,7 @@ async fn execute_dispatch_grants_with_worker(
             session,
             reliability_state,
             runtime_store,
+            host,
             repo_root,
             &updated_run.spec.run_id,
             grant,
@@ -1812,7 +1781,7 @@ async fn execute_inline_run_dispatch(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: &RuntimeStore,
-    config: &Config,
+    options: &RpcOptions,
     run: RunSnapshot,
     grants: &[DispatchGrant],
 ) -> Result<RunSnapshot> {
@@ -1824,12 +1793,20 @@ async fn execute_inline_run_dispatch(
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
         guard.agent.provider()
     };
-    let worker = RpcSessionInlineWorker::new(provider, config.clone());
+    let worker = RpcSessionInlineWorker::new(provider, options.config.clone());
+    let dispatch_host = RpcDispatchHost::new(
+        cx.clone(),
+        Arc::clone(session),
+        Arc::clone(reliability_state),
+        runtime_store.clone(),
+        options.clone(),
+    );
     execute_dispatch_grants_with_worker(
         cx,
         session,
         reliability_state,
         runtime_store,
+        &dispatch_host,
         repo_root.as_path(),
         run,
         grants,
@@ -1843,7 +1820,25 @@ struct RpcDispatchHost {
     session: Arc<Mutex<AgentSession>>,
     reliability_state: Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: RuntimeStore,
-    config: Config,
+    options: RpcOptions,
+}
+
+impl RpcDispatchHost {
+    fn new(
+        cx: AgentCx,
+        session: Arc<Mutex<AgentSession>>,
+        reliability_state: Arc<Mutex<RuntimeExecutionState>>,
+        runtime_store: RuntimeStore,
+        options: RpcOptions,
+    ) -> Self {
+        Self {
+            cx,
+            session,
+            reliability_state,
+            runtime_store,
+            options,
+        }
+    }
 }
 
 #[async_trait]
@@ -1868,9 +1863,76 @@ impl DispatchRunHost for RpcDispatchHost {
             &self.session,
             &self.reliability_state,
             &self.runtime_store,
-            &self.config,
+            &self.options,
             run,
             grants,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl RuntimeServiceHost for RpcDispatchHost {
+    fn runtime_store(&self) -> &RuntimeStore {
+        &self.runtime_store
+    }
+
+    fn reliability_state(&self) -> &Arc<Mutex<RuntimeExecutionState>> {
+        &self.reliability_state
+    }
+
+    async fn current_model_profile(&self, cx: &AgentCx) -> Result<ModelProfile> {
+        runtime_model_profile_for_run(cx, &self.session, &self.options).await
+    }
+
+    async fn workspace_root(&self, cx: &AgentCx) -> Result<PathBuf> {
+        session_workspace_root(cx, &self.session).await
+    }
+
+    async fn persist_output(&self, cx: &AgentCx, output: &RuntimeControllerOutput) -> Result<()> {
+        persist_runtime_output(cx, &self.session, &self.runtime_store, output).await
+    }
+
+    async fn persist_snapshot(&self, cx: &AgentCx, snapshot: &RunSnapshot) -> Result<()> {
+        persist_runtime_snapshot(cx, &self.session, &self.runtime_store, snapshot).await
+    }
+
+    async fn persist_evidence_record(
+        &self,
+        cx: &AgentCx,
+        evidence: &reliability::EvidenceRecord,
+    ) -> Result<()> {
+        persist_runtime_evidence_record(cx, &self.session, evidence).await
+    }
+
+    async fn persist_submit_task_result(
+        &self,
+        cx: &AgentCx,
+        result: &SubmitTaskResponse,
+    ) -> Result<()> {
+        persist_runtime_submit_task_result(cx, &self.session, result).await
+    }
+
+    async fn persist_blocker_resolution(
+        &self,
+        cx: &AgentCx,
+        req: &BlockerReport,
+        state: &str,
+    ) -> Result<()> {
+        persist_runtime_blocker_resolution(cx, &self.session, req, state).await
+    }
+
+    async fn cancel_live_run_tasks_and_sync(
+        &self,
+        cx: &AgentCx,
+        run: &mut RunSnapshot,
+    ) -> Result<()> {
+        cancel_live_run_tasks_and_sync(
+            cx,
+            &self.session,
+            &self.reliability_state,
+            &self.runtime_store,
+            run,
         )
         .await
     }
@@ -2674,50 +2736,24 @@ pub async fn run(
                             continue;
                         }
                     };
-                if req.tasks.is_empty() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "Run must include at least one task".to_string(),
-                    ));
-                    continue;
-                }
-                if req.objective.trim().is_empty() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "Run objective cannot be empty".to_string(),
-                    ));
-                    continue;
-                }
-                if req.run_verify_command.trim().is_empty() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "runVerifyCommand cannot be empty".to_string(),
-                    ));
-                    continue;
-                }
-                if matches!(req.run_verify_timeout_sec, Some(0)) {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "runVerifyTimeoutSec must be at least 1 when provided".to_string(),
-                    ));
-                    continue;
-                }
-                if matches!(req.max_parallelism, Some(0)) {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "maxParallelism must be at least 1 when provided".to_string(),
-                    ));
-                    continue;
-                }
-
-                let run_id = next_run_id(req.run_id.as_deref());
+                let dispatch_host = RpcDispatchHost::new(
+                    cx.clone(),
+                    Arc::clone(&session),
+                    Arc::clone(&reliability_state),
+                    runtime_store.clone(),
+                    options.clone(),
+                );
+                let run = match runtime_start_run(
+                    &cx,
+                    &dispatch_host,
+                    &runtime_start_run_request(&req),
+                    req.run_id.as_deref(),
+                    options.config.reliability_verify_timeout_sec_default(),
+                )
+                .await
                 {
-                    if let Err(err) = ensure_run_id_available(&runtime_store, &run_id) {
+                    Ok(run) => run,
+                    Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.start_run",
@@ -2725,71 +2761,13 @@ pub async fn run(
                         ));
                         continue;
                     }
-                }
-                let result = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    for contract in &req.tasks {
-                        rel.get_or_create_task(contract)?;
-                    }
-                    for contract in &req.tasks {
-                        rel.reconcile_prerequisites(contract)?;
-                    }
-                    rel.refresh_dependency_states();
-                    Ok::<(), Error>(())
                 };
-                if let Err(err) = result {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.start_run",
-                        &err,
-                    ));
-                    continue;
-                }
 
-                let runtime_bootstrap =
-                    match bootstrap_runtime_run(&cx, &session, &options, &run_id, &req).await {
-                        Ok(output) => output,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.start_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                if let Err(err) =
-                    persist_runtime_output(&cx, &session, &runtime_store, &runtime_bootstrap).await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.start_run",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                {
-                    let run = runtime_bootstrap.snapshot;
-                    if let Err(err) =
-                        persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
-                    {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.start_run",
-                            &err,
-                        ));
-                        continue;
-                    }
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "orchestration.start_run",
-                        Some(json!({ "run": run })),
-                    ));
-                }
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "orchestration.start_run",
+                    Some(json!({ "run": run })),
+                ));
             }
 
             "orchestration.get_run" => {
@@ -2833,70 +2811,29 @@ pub async fn run(
                             continue;
                         }
                     };
-
-                let run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.accept_plan",
-                        &err,
-                    ));
-                    continue;
-                };
-
-                if run.plan.is_none() {
-                    let err = Error::session(format!(
-                        "orchestration run {} does not have a materialized plan",
-                        req.run_id
-                    ));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.accept_plan",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                let output = if run.plan_accepted {
-                    RuntimeControllerOutput {
-                        snapshot: run,
-                        events: Vec::new(),
-                        transitions: Vec::new(),
-                        routed_phases: Vec::new(),
-                        policy_decisions: Vec::new(),
-                    }
-                } else {
-                    match accept_runtime_plan(&cx, &session, &options, run).await {
-                        Ok(output) => output,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.accept_plan",
-                                &err,
-                            ));
-                            continue;
-                        }
+                let dispatch_host = RpcDispatchHost::new(
+                    cx.clone(),
+                    Arc::clone(&session),
+                    Arc::clone(&reliability_state),
+                    runtime_store.clone(),
+                    options.clone(),
+                );
+                let run = match runtime_accept_run_plan(&cx, &dispatch_host, &req.run_id).await {
+                    Ok(run) => run,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.accept_plan",
+                            &err,
+                        ));
+                        continue;
                     }
                 };
-
-                if let Err(err) =
-                    persist_runtime_output(&cx, &session, &runtime_store, &output).await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.accept_plan",
-                        &err,
-                    ));
-                    continue;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
                     "orchestration.accept_plan",
-                    Some(json!({ "run": output.snapshot })),
+                    Some(json!({ "run": run })),
                 ));
             }
 
@@ -2920,48 +2857,20 @@ pub async fn run(
                     .unwrap_or("run");
                 let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
 
-                let run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                };
-
-                if run_requires_plan_acceptance(&run) {
-                    let err = Error::validation(format!(
-                        "Run {} is still in planning; accept the plan before dispatching",
-                        run.spec.run_id
-                    ));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                let dispatch_host = RpcDispatchHost {
-                    cx: cx.clone(),
-                    session: Arc::clone(&session),
-                    reliability_state: Arc::clone(&reliability_state),
-                    runtime_store: runtime_store.clone(),
-                    config: options.config.clone(),
-                };
-                let (run, grants) = match Box::pin(dispatch_run_until_quiescent(
+                let dispatch_host = RpcDispatchHost::new(
+                    cx.clone(),
+                    Arc::clone(&session),
+                    Arc::clone(&reliability_state),
+                    runtime_store.clone(),
+                    options.clone(),
+                );
+                let (run, grants) = match runtime_dispatch_run(
                     &cx,
-                    &reliability_state,
-                    &runtime_store,
                     &dispatch_host,
-                    run,
+                    &req.run_id,
                     agent_id_prefix,
                     lease_ttl_sec,
-                ))
+                )
                 .await
                 {
                     Ok(result) => result,
@@ -2974,17 +2883,6 @@ pub async fn run(
                         continue;
                     }
                 };
-                if let Err(err) =
-                    persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                }
-
                 let _ = out_tx.send(response_ok(
                     id,
                     "orchestration.dispatch_run",
@@ -3006,35 +2904,16 @@ pub async fn run(
                         }
                     };
 
-                let mut run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.cancel_run",
-                        &err,
-                    ));
-                    continue;
-                };
-                let has_live_tasks = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    run_has_live_tasks(&rel, &run)
-                };
-                if has_live_tasks {
-                    if let Err(err) = cancel_live_run_tasks_and_sync(
-                        &cx,
-                        &session,
-                        &reliability_state,
-                        &runtime_store,
-                        &mut run,
-                    )
-                    .await
-                    {
+                let dispatch_host = RpcDispatchHost::new(
+                    cx.clone(),
+                    Arc::clone(&session),
+                    Arc::clone(&reliability_state),
+                    runtime_store.clone(),
+                    options.clone(),
+                );
+                let run = match runtime_cancel_run(&cx, &dispatch_host, &req.run_id).await {
+                    Ok(run) => run,
+                    Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.cancel_run",
@@ -3042,22 +2921,7 @@ pub async fn run(
                         ));
                         continue;
                     }
-                } else {
-                    run.phase = RunPhase::Canceled;
-                    run.dispatch.active_wave = None;
-                    run.dispatch.active_subrun_id = None;
-                    run.touch();
-                }
-                if let Err(err) =
-                    persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.cancel_run",
-                        &err,
-                    ));
-                    continue;
-                }
+                };
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -3080,90 +2944,24 @@ pub async fn run(
                         }
                     };
 
-                let mut run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.resume_run",
-                        &err,
-                    ));
-                    continue;
+                let dispatch_host = RpcDispatchHost::new(
+                    cx.clone(),
+                    Arc::clone(&session),
+                    Arc::clone(&reliability_state),
+                    runtime_store.clone(),
+                    options.clone(),
+                );
+                let run = match runtime_resume_run(&cx, &dispatch_host, &req.run_id).await {
+                    Ok(run) => run,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.resume_run",
+                            &err,
+                        ));
+                        continue;
+                    }
                 };
-                if matches!(run.phase, RunPhase::Canceled | RunPhase::Failed) {
-                    run.phase = RunPhase::Dispatching;
-                    run.touch();
-                }
-                if let Some(status) = run
-                    .dispatch
-                    .latest_run_verify
-                    .as_ref()
-                    .filter(|status| !status.ok)
-                {
-                    let scope = completed_scope_from_run_verify(status);
-                    let cwd = session_workspace_root(&cx, &session).await?;
-                    execute_run_verification(&cwd, &mut run, &scope).await;
-                }
-                let has_live_tasks = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    refresh_live_run_from_reliability(&mut rel, &mut run)
-                };
-                if has_live_tasks
-                    && !matches!(
-                        run.phase,
-                        RunPhase::Canceled
-                            | RunPhase::Failed
-                            | RunPhase::Completed
-                            | RunPhase::AwaitingHuman
-                    )
-                {
-                    let dispatch_host = RpcDispatchHost {
-                        cx: cx.clone(),
-                        session: Arc::clone(&session),
-                        reliability_state: Arc::clone(&reliability_state),
-                        runtime_store: runtime_store.clone(),
-                        config: options.config.clone(),
-                    };
-                    let (updated_run, _) = match Box::pin(dispatch_run_until_quiescent(
-                        &cx,
-                        &reliability_state,
-                        &runtime_store,
-                        &dispatch_host,
-                        run,
-                        "resume",
-                        3600,
-                    ))
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.resume_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                    run = updated_run;
-                } else {
-                    run.touch();
-                }
-                if let Err(err) =
-                    persist_runtime_snapshot(&cx, &session, &runtime_store, &run).await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.resume_run",
-                        &err,
-                    ));
-                    continue;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -6222,7 +6020,7 @@ mod tests {
         ThinkingLevel, Usage, UserContent, UserMessage,
     };
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
-    use crate::reliability::ClosePayload;
+    use crate::runtime::reliability::ClosePayload;
     use crate::session::Session;
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;

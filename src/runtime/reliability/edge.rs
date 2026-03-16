@@ -1,4 +1,4 @@
-use crate::reliability::state::FailureClass;
+use crate::runtime::reliability::state::FailureClass;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

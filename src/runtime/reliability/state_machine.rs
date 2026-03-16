@@ -1,5 +1,5 @@
-use crate::reliability::state::{FailureClass, RuntimeState, TerminalState};
-use crate::reliability::task::TaskRuntime;
+use crate::runtime::reliability::state::{FailureClass, RuntimeState, TerminalState};
+use crate::runtime::reliability::task::TaskRuntime;
 use chrono::Utc;
 
 #[derive(Debug, Clone)]
@@ -243,7 +243,7 @@ fn validate_lease_fence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::task::TaskRuntime;
+    use crate::runtime::reliability::task::TaskRuntime;
     use chrono::Duration;
 
     #[test]

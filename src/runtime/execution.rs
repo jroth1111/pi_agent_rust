@@ -1,7 +1,7 @@
 use crate::config::{Config, ReliabilityEnforcementMode};
 use crate::error::{Error, Result};
-use crate::reliability;
-use crate::reliability::ArtifactStore;
+use crate::runtime::reliability;
+use crate::runtime::reliability::ArtifactStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -1,6 +1,6 @@
-use crate::reliability::state::{FailureClass, RuntimeState};
-use crate::reliability::state_machine::{TransitionEvent, apply_transition};
-use crate::reliability::task::TaskNode;
+use crate::runtime::reliability::state::{FailureClass, RuntimeState};
+use crate::runtime::reliability::state_machine::{TransitionEvent, apply_transition};
+use crate::runtime::reliability::task::TaskNode;
 use chrono::{Duration, Utc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +20,7 @@ impl RecoveryManager {
         verify_run_id: Option<String>,
         failure_artifact: Option<String>,
         handoff_summary: String,
-    ) -> Result<RecoveryAction, crate::reliability::TransitionError> {
+    ) -> Result<RecoveryAction, crate::runtime::reliability::TransitionError> {
         let event = TransitionEvent::VerifyFail {
             class,
             verify_run_id,
@@ -76,8 +76,8 @@ impl RecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::state::RuntimeState;
-    use crate::reliability::task::{TaskConstraintSet, TaskRuntime, TaskSpec, VerifyPlan};
+    use crate::runtime::reliability::state::RuntimeState;
+    use crate::runtime::reliability::task::{TaskConstraintSet, TaskRuntime, TaskSpec, VerifyPlan};
 
     fn task_node(id: &str, max_attempts: u8) -> TaskNode {
         TaskNode {

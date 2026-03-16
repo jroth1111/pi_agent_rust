@@ -44,7 +44,7 @@ use crate::prompt_assembly::{
 use crate::prompt_plan::PromptAssemblyPlan;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 #[allow(unused_imports)]
-use crate::reliability::{
+use crate::runtime::reliability::{
     ArtifactStore, Attempt, AttemptStats, CloseOutcomeKind, ClosePayload, CloseResult,
     EvidenceRecord, FsArtifactStore, LeaseManager, RetryAgent, RetryConfig, ReviewSubmission,
     ReviewerScorer, StateDigest, StuckDetector, TokenUsage, VerificationOutcome,
@@ -2265,7 +2265,7 @@ struct ReliabilityTraceSnapshot {
     saw_execute: bool,
     evidence: Vec<EvidenceRecord>,
     phase_violations: Vec<String>,
-    stuck_patterns: Vec<crate::reliability::StuckPattern>,
+    stuck_patterns: Vec<crate::runtime::reliability::StuckPattern>,
     discoveries: Vec<crate::state::Discovery>,
     discovery_summary: Option<crate::state::DiscoverySummary>,
     task_events: TaskEventLog,
@@ -7048,7 +7048,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthCredential;
     use crate::provider::{InputType, Model, ModelCost};
-    use crate::reliability::{ArtifactQuery, ArtifactStore, FsArtifactStore};
+    use crate::runtime::reliability::{ArtifactQuery, ArtifactStore, FsArtifactStore};
     use async_trait::async_trait;
     use futures::Stream;
     use std::collections::HashMap;
@@ -8055,7 +8055,10 @@ mod tests {
         );
         assert_eq!(evidence.env_id.as_deref(), Some("provider/model"));
         assert_eq!(evidence.exit_code, 0);
-        assert_eq!(evidence.status, crate::reliability::EvidenceStatus::Passed);
+        assert_eq!(
+            evidence.status,
+            crate::runtime::reliability::EvidenceStatus::Passed
+        );
         assert_eq!(evidence.artifact_ids.len(), 1);
 
         let mut query = ArtifactQuery::new("task-artifacts");
