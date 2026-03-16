@@ -1417,7 +1417,7 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 handle_skill_doctor(cwd, SkillDoctorFormat::parse(&format)?, fix)?;
             }
             cli::SkillCommands::Feedback {
-                skill,
+                skill_id,
                 rating,
                 notes,
                 session_id,
@@ -1425,7 +1425,7 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
             } => {
                 handle_skill_feedback(
                     cwd,
-                    &skill,
+                    &skill_id,
                     rating,
                     notes.as_deref(),
                     session_id.as_deref(),

@@ -845,7 +845,7 @@ mod tests {
             "pi",
             "skills",
             "feedback",
-            "bug-triage",
+            "bug-triage-id",
             "--rating",
             "2",
             "--notes",
@@ -859,14 +859,14 @@ mod tests {
             Some(Commands::Skills {
                 command:
                     SkillCommands::Feedback {
-                        skill,
+                        skill_id,
                         rating,
                         notes,
                         session_id,
                         format,
                     },
             }) => {
-                assert_eq!(skill, "bug-triage");
+                assert_eq!(skill_id, "bug-triage-id");
                 assert_eq!(rating, 2);
                 assert_eq!(notes.as_deref(), Some("wrong format"));
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
@@ -1882,8 +1882,8 @@ pub enum SkillCommands {
     },
     /// Record explicit user feedback for a skill revision
     Feedback {
-        /// Skill name
-        skill: String,
+        /// Immutable skill-id
+        skill_id: String,
         /// Feedback rating from 1 (bad) to 5 (good)
         #[arg(long)]
         rating: u8,

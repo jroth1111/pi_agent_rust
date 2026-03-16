@@ -542,7 +542,7 @@ pub fn persist_skill_tracker(
 
 pub fn handle_skill_feedback(
     cwd: &Path,
-    skill_name: &str,
+    skill_id: &str,
     rating: u8,
     notes: Option<&str>,
     session_id: Option<&str>,
@@ -555,7 +555,7 @@ pub fn handle_skill_feedback(
     }
 
     let observations = load_observations(cwd)?;
-    let target = resolve_skill_feedback_target(cwd, skill_name, session_id, &observations)?;
+    let target = resolve_skill_feedback_target(cwd, skill_id, session_id, &observations)?;
     let feedback = SkillFeedback {
         version: 2,
         recorded_at_utc: timestamp_now(),
@@ -1676,8 +1676,7 @@ fn rollback_managed_skill_patch(
     cwd: &Path,
 ) -> Result<Option<SkillAmendment>> {
     let Some(source_amendment) = amendments.iter().rev().find(|amendment| {
-        amendment.skill_id == expected_skill_id
-            && amendment.new_digest == current_digest
+        amendment.skill_id == expected_skill_id && amendment.new_digest == current_digest
     }) else {
         return Ok(None);
     };
@@ -2456,14 +2455,13 @@ fn skill_id_from_raw(raw: &str, path: &Path) -> String {
 
 fn resolve_skill_feedback_target(
     cwd: &Path,
-    skill_name: &str,
+    skill_id: &str,
     session_id: Option<&str>,
     observations: &[SkillObservation],
 ) -> Result<SkillFeedbackTarget> {
     if let Some(session_id) = normalize_optional_text(session_id) {
         if let Some(observation) = observations.iter().rev().find(|entry| {
-            entry.skill_name == skill_name
-                && entry.session_id.as_deref() == Some(session_id.as_str())
+            entry.skill_id == skill_id && entry.session_id.as_deref() == Some(session_id.as_str())
         }) {
             return Ok(SkillFeedbackTarget {
                 skill_id: normalize_record_skill_id(&observation.skill_id, &observation.skill_path),
@@ -2484,7 +2482,7 @@ fn resolve_skill_feedback_target(
     if let Some(skill) = loaded
         .skills
         .into_iter()
-        .find(|skill| skill.name == skill_name)
+        .find(|skill| skill.skill_id == skill_id)
     {
         return Ok(SkillFeedbackTarget {
             skill_id: skill.skill_id,
@@ -2498,7 +2496,7 @@ fn resolve_skill_feedback_target(
     if let Some(observation) = observations
         .iter()
         .rev()
-        .find(|entry| entry.skill_name == skill_name)
+        .find(|entry| entry.skill_id == skill_id)
     {
         return Ok(SkillFeedbackTarget {
             skill_id: normalize_record_skill_id(&observation.skill_id, &observation.skill_path),
@@ -2510,7 +2508,7 @@ fn resolve_skill_feedback_target(
     }
 
     Err(Error::validation(format!(
-        "Unknown skill `{skill_name}`; no loaded skill or recorded observation matched."
+        "Unknown skill-id `{skill_id}`; no loaded skill or recorded observation matched."
     )))
 }
 
@@ -3087,7 +3085,7 @@ mod tests {
 
         let feedback = handle_skill_feedback(
             dir.path(),
-            "summarize",
+            &test_skill_id("summarize"),
             1,
             Some("wrong output"),
             Some("sess-1"),
@@ -3099,6 +3097,85 @@ mod tests {
         let stored_feedback = load_feedback(dir.path()).expect("load feedback");
         assert_eq!(stored_feedback.len(), 1);
         assert_eq!(stored_feedback[0].skill_digest, observed_digest);
+    }
+
+    #[test]
+    fn handle_skill_feedback_targets_same_name_skills_by_id() {
+        let dir = tempdir().expect("tempdir");
+        let old_skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("bug-triage-old")
+            .join("SKILL.md");
+        let new_skill_path = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("bug-triage-new")
+            .join("SKILL.md");
+        fs::create_dir_all(old_skill_path.parent().expect("parent")).expect("create old dir");
+        fs::create_dir_all(new_skill_path.parent().expect("parent")).expect("create new dir");
+        fs::write(
+            &old_skill_path,
+            "---\nname: bug-triage\nskill-id: bug-triage-old-id\ndescription: triage bugs\n---\nOld\n",
+        )
+        .expect("write old skill");
+        fs::write(
+            &new_skill_path,
+            "---\nname: bug-triage\nskill-id: bug-triage-new-id\ndescription: triage bugs\n---\nNew\n",
+        )
+        .expect("write new skill");
+        let old_digest = file_digest(&old_skill_path);
+        let new_digest = file_digest(&new_skill_path);
+        append_jsonl_records(
+            &skill_observation_ledger_path(dir.path()),
+            &[
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
+                    session_id: None,
+                    skill_id: "bug-triage-old-id".to_string(),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: old_skill_path.clone(),
+                    skill_digest: old_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "old run".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+                SkillObservation {
+                    version: 2,
+                    recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
+                    session_id: None,
+                    skill_id: "bug-triage-new-id".to_string(),
+                    skill_name: "bug-triage".to_string(),
+                    skill_path: new_skill_path.clone(),
+                    skill_digest: new_digest.clone(),
+                    activation_source: SkillActivationSource::SlashCommand,
+                    task_preview: "new run".to_string(),
+                    outcome: SkillRunOutcome::Success,
+                    lineage: SkillLineage::default(),
+                    tool_failures: Vec::new(),
+                    agent_error: None,
+                },
+            ],
+        )
+        .expect("write observations");
+
+        let feedback = handle_skill_feedback(
+            dir.path(),
+            "bug-triage-old-id",
+            2,
+            Some("target the old artifact only"),
+            None,
+            SkillDoctorFormat::Json,
+        )
+        .expect("record feedback");
+        assert_eq!(feedback.skill_id, "bug-triage-old-id");
+        assert_eq!(feedback.skill_digest, old_digest);
     }
 
     #[test]
@@ -3851,8 +3928,11 @@ mod tests {
             .join("deploy-readiness")
             .join("SKILL.md");
         fs::create_dir_all(new_path.parent().expect("parent")).expect("create moved dir");
-        fs::rename(old_path.parent().expect("parent"), new_path.parent().expect("parent"))
-            .expect("move skill directory");
+        fs::rename(
+            old_path.parent().expect("parent"),
+            new_path.parent().expect("parent"),
+        )
+        .expect("move skill directory");
 
         let report =
             handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false).expect("doctor");
@@ -3953,8 +4033,8 @@ mod tests {
         .expect("replace skill");
         let replacement_before = fs::read_to_string(&skill_path).expect("read replacement");
 
-        let report = handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true)
-            .expect("doctor fix");
+        let report =
+            handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, true).expect("doctor fix");
         let old_skill = report
             .skills
             .iter()

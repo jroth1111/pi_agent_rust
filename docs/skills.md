@@ -166,11 +166,11 @@ Pi now treats skills as observable components instead of static prompt files.
 Use explicit feedback when a skill technically completed but the outcome quality was poor:
 
 ```bash
-pi skills feedback bug-triage --rating 2 --notes "wrong format and missed the failing test"
-pi skills feedback bug-triage --rating 1 --session-id sess-123 --notes "used the right tools but made up evidence"
+pi skills feedback bug-triage-id --rating 2 --notes "wrong format and missed the failing test"
+pi skills feedback bug-triage-id --session-id sess-123 --rating 1 --notes "used the right tools but made up evidence"
 ```
 
-When `--session-id` is provided, Pi binds the feedback to the latest observed revision of that skill in the matching session. Otherwise it binds to the current on-disk skill revision.
+Feedback now binds by immutable `skill-id`, not by skill name. Use `pi skills doctor --format json` or text output to get the correct `skill_id` before recording feedback. When `--session-id` is provided, Pi binds the feedback to the latest observed revision of that exact `skill-id` in the matching session. Otherwise it binds to the current on-disk revision of that same `skill-id`.
 
 ### Automated Inspection And Fixing
 
