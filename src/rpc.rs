@@ -27,9 +27,9 @@ use crate::model::{
 use crate::models::ModelEntry;
 #[cfg(test)]
 use crate::orchestration::WaveStatus;
-use crate::orchestration::{
-    ExecutionTier, FlockWorkspace, RunVerifyScopeKind, RunVerifyStatus, TaskReport,
-};
+use crate::orchestration::{ExecutionTier, FlockWorkspace, TaskReport};
+#[cfg(test)]
+use crate::orchestration::{RunVerifyScopeKind, RunVerifyStatus};
 use crate::provider::Provider;
 use crate::provider_metadata::{
     canonical_provider_id, provider_metadata, provider_routing_defaults,
@@ -50,6 +50,10 @@ use crate::runtime::types::{
     AutonomyLevel, LeaseRecord, ModelProfile, ModelSelector, PlanArtifact, RunBudgets,
     RunConstraints, RunPhase, RunSnapshot, RunSpec, TaskConstraints, TaskNode, TaskSpec, TaskState,
     VerifySpec,
+};
+use crate::runtime::verification::{
+    CompletedRunVerifyScope, apply_run_verify_lifecycle, completed_run_verify_scope,
+    completed_scope_from_run_verify, execute_run_verification, should_skip_run_verify,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -2098,79 +2102,6 @@ fn task_report_blockers(state: &reliability::RuntimeState) -> Vec<String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CompletedRunVerifyScope {
-    scope_id: String,
-    scope_kind: RunVerifyScopeKind,
-    subrun_id: Option<String>,
-}
-
-fn task_terminal_success(reliability: &RpcReliabilityState, task_id: &str) -> bool {
-    reliability.tasks.get(task_id).is_some_and(|task| {
-        matches!(
-            task.runtime.state,
-            reliability::RuntimeState::Terminal(
-                reliability::TerminalState::Succeeded { .. }
-                    | reliability::TerminalState::Superseded { .. }
-            )
-        )
-    })
-}
-
-fn run_terminal_success(reliability: &RpcReliabilityState, run: &RunSnapshot) -> bool {
-    let task_ids = run.task_ids();
-    !task_ids.is_empty()
-        && task_ids
-            .iter()
-            .all(|task_id| task_terminal_success(reliability, task_id))
-}
-
-fn completed_run_verify_scope(
-    reliability: &RpcReliabilityState,
-    run: &RunSnapshot,
-) -> Option<CompletedRunVerifyScope> {
-    if run.run_verify_command().trim().is_empty() || !run_terminal_success(reliability, run) {
-        return None;
-    }
-    Some(CompletedRunVerifyScope {
-        scope_id: run.spec.run_id.clone(),
-        scope_kind: RunVerifyScopeKind::Run,
-        subrun_id: None,
-    })
-}
-
-fn should_skip_run_verify(run: &RunSnapshot, scope: &CompletedRunVerifyScope) -> bool {
-    run.dispatch
-        .latest_run_verify
-        .as_ref()
-        .is_some_and(|status| {
-            status.scope_id == scope.scope_id
-                && status.scope_kind == scope.scope_kind
-                && status.subrun_id == scope.subrun_id
-        })
-}
-
-fn completed_scope_from_run_verify(status: &RunVerifyStatus) -> CompletedRunVerifyScope {
-    CompletedRunVerifyScope {
-        scope_id: status.scope_id.clone(),
-        scope_kind: status.scope_kind,
-        subrun_id: status.subrun_id.clone(),
-    }
-}
-
-fn apply_run_verify_lifecycle(run: &mut RunSnapshot) {
-    if !matches!(run.phase, RunPhase::Canceled)
-        && run
-            .dispatch
-            .latest_run_verify
-            .as_ref()
-            .is_some_and(|status| !status.ok)
-    {
-        run.phase = RunPhase::Failed;
-        run.touch();
-    }
-}
-
 fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunSnapshot) -> bool {
     let task_ids = run.task_ids();
     !task_ids.is_empty()
@@ -3704,9 +3635,9 @@ fn refresh_task_runs_with_verify_scopes(
         if let Some(report) = report.filter(|report| run.tasks.contains_key(&report.task_id)) {
             run.upsert_task_report(report.clone());
         }
-        let verify_scope = completed_run_verify_scope(reliability, &run)
-            .filter(|scope| !should_skip_run_verify(&run, scope));
         refresh_run_from_reliability(reliability, &mut run);
+        let verify_scope =
+            completed_run_verify_scope(&run).filter(|scope| !should_skip_run_verify(&run, scope));
         updated_runs.push((run, verify_scope));
     }
 
@@ -3723,78 +3654,6 @@ fn refresh_task_runs(
         .into_iter()
         .map(|(run, _)| run)
         .collect()
-}
-
-fn run_verify_scope_summary(
-    scope: &CompletedRunVerifyScope,
-    ok: bool,
-    details: impl AsRef<str>,
-) -> String {
-    let scope_label = match scope.scope_kind {
-        RunVerifyScopeKind::Run => "run",
-        RunVerifyScopeKind::Wave => "wave",
-        RunVerifyScopeKind::Subrun => "subrun",
-    };
-    let prefix = if ok {
-        "run verification passed"
-    } else {
-        "run verification failed"
-    };
-    format!(
-        "{prefix} for {scope_label} {}: {}",
-        scope.scope_id,
-        details.as_ref().trim()
-    )
-}
-
-async fn execute_run_verification(
-    cwd: &Path,
-    run: &mut RunSnapshot,
-    scope: &CompletedRunVerifyScope,
-) {
-    let timeout_sec = run.spec.run_verify_timeout_sec.unwrap_or(60);
-    let verify_status =
-        match Verifier::execute_verify_command(cwd, run.run_verify_command(), timeout_sec).await {
-            Ok(execution) => {
-                let outcome = Verifier::classify_execution(&execution);
-                let details = if outcome.ok {
-                    format!(
-                        "exit_code={}, duration_ms={}",
-                        execution.exit_code, execution.duration_ms
-                    )
-                } else {
-                    outcome.violations.join("; ")
-                };
-                RunVerifyStatus {
-                    scope_id: scope.scope_id.clone(),
-                    scope_kind: scope.scope_kind,
-                    subrun_id: scope.subrun_id.clone(),
-                    command: execution.command,
-                    timeout_sec: execution.timeout_sec,
-                    exit_code: execution.exit_code,
-                    ok: outcome.ok,
-                    summary: run_verify_scope_summary(scope, outcome.ok, details),
-                    duration_ms: execution.duration_ms,
-                    generated_at: chrono::Utc::now(),
-                }
-            }
-            Err(err) => RunVerifyStatus {
-                scope_id: scope.scope_id.clone(),
-                scope_kind: scope.scope_kind,
-                subrun_id: scope.subrun_id.clone(),
-                command: run.run_verify_command().to_string(),
-                timeout_sec,
-                exit_code: -1,
-                ok: false,
-                summary: run_verify_scope_summary(scope, false, err.to_string()),
-                duration_ms: 0,
-                generated_at: chrono::Utc::now(),
-            },
-        };
-
-    run.dispatch.latest_run_verify = Some(verify_status);
-    apply_run_verify_lifecycle(run);
-    run.touch();
 }
 
 async fn sync_task_runs(
@@ -10354,8 +10213,9 @@ mod tests {
             started_at: chrono::Utc::now(),
             completed_at: None,
         });
+        refresh_run_from_reliability(&reliability, &mut run);
 
-        let scope = completed_run_verify_scope(&reliability, &run).expect("completed run scope");
+        let scope = completed_run_verify_scope(&run).expect("completed run scope");
         assert_eq!(scope.scope_id, run.spec.run_id);
         assert_eq!(scope.scope_kind, RunVerifyScopeKind::Run);
         assert_eq!(scope.subrun_id, None);
@@ -10439,9 +10299,10 @@ mod tests {
             started_at: chrono::Utc::now(),
             completed_at: None,
         });
+        refresh_run_from_reliability(&reliability, &mut run);
 
         assert!(
-            completed_run_verify_scope(&reliability, &run).is_none(),
+            completed_run_verify_scope(&run).is_none(),
             "run verify should wait until all run tasks succeed"
         );
     }
@@ -10540,7 +10401,7 @@ mod tests {
         });
 
         assert!(
-            completed_run_verify_scope(&reliability, &run).is_none(),
+            completed_run_verify_scope(&run).is_none(),
             "hierarchical run verify should wait until all run tasks succeed"
         );
     }

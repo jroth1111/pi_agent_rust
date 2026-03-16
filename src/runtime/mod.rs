@@ -12,6 +12,7 @@ pub mod scheduler;
 pub mod state_machine;
 pub mod store;
 pub mod types;
+pub mod verification;
 
 pub use controller::{ControllerError, ControllerOutput, RuntimeCommand, RuntimeController};
 pub use events::{RuntimeEvent, RuntimeEventKind};
@@ -30,4 +31,8 @@ pub use types::{
     ModelSelector, PlanArtifact, PlanId, RunBudgets, RunConstraints, RunDispatchState, RunId,
     RunPhase, RunSnapshot, RunSpec, RunSummary, RunVerifyScopeKind, RunVerifyStatus, SubrunPlan,
     TaskId, TaskNode, TaskReport, TaskRuntime, TaskSpec, TaskState, VerifySpec, WaveStatus,
+};
+pub use verification::{
+    CompletedRunVerifyScope, apply_run_verify_lifecycle, completed_run_verify_scope,
+    completed_scope_from_run_verify, execute_run_verification, should_skip_run_verify,
 };
