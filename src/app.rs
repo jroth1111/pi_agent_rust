@@ -3,7 +3,6 @@
 //! This module exists to make core CLI logic testable without invoking the full
 //! interactive agent loop.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -18,6 +17,7 @@ use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextConte
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::provider::{StreamOptions, ThinkingBudgets};
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
+use crate::repo_policy::{build_repo_policy_digest, load_project_context_files};
 use crate::session::Session;
 use crate::tools::process_file_arguments;
 
@@ -54,12 +54,6 @@ pub enum StartupError {
     NoModelsAvailable { models_path: PathBuf },
     #[error("No API key found for provider {provider}. Set env var or use --api-key.")]
     MissingApiKey { provider: String },
-}
-
-#[derive(Debug, Clone)]
-struct ContextFile {
-    path: String,
-    content: String,
 }
 
 struct RestoreResult {
@@ -157,12 +151,9 @@ pub fn build_system_prompt(
         prompt.push_str(&append_prompt);
     }
 
-    if !context_files.is_empty() {
-        prompt.push_str("\n\n# Project Context\n\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
-        for file in &context_files {
-            let _ = write!(prompt, "## {}\n\n{}\n\n", file.path, file.content);
-        }
+    if let Some(repo_policy) = build_repo_policy_digest(&context_files) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&repo_policy.rendered);
     }
 
     if let Some(skills_prompt) = skills_prompt {
@@ -297,56 +288,6 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     format!(
         "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
     )
-}
-
-fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile> {
-    let mut context_files = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Some(global) = load_context_file_from_dir(global_dir) {
-        seen.insert(global.path.clone());
-        context_files.push(global);
-    }
-
-    let mut ancestor_files = Vec::new();
-    let mut current = cwd.to_path_buf();
-
-    loop {
-        if let Some(context) = load_context_file_from_dir(&current) {
-            if seen.insert(context.path.clone()) {
-                ancestor_files.push(context);
-            }
-        }
-
-        if !current.pop() {
-            break;
-        }
-    }
-
-    ancestor_files.reverse();
-    context_files.extend(ancestor_files);
-    context_files
-}
-
-fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
-    let candidates = ["AGENTS.md", "CLAUDE.md"];
-    for filename in candidates {
-        let path = dir.join(filename);
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    return Some(ContextFile {
-                        path: path.display().to_string(),
-                        content,
-                    });
-                }
-                Err(err) => {
-                    eprintln!("Warning: Could not read {}: {err}", path.display());
-                }
-            }
-        }
-    }
-    None
 }
 
 fn format_current_datetime() -> String {
@@ -1063,6 +1004,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthStorage;
     use crate::provider::{InputType, Model, ModelCost};
+    use crate::repo_policy::load_project_context_files;
 
     fn test_model_entry(id: &str, provider: &str, reasoning: bool) -> ModelEntry {
         ModelEntry {
@@ -1130,6 +1072,39 @@ mod tests {
         let selected = default_model_from_available(&available);
         assert_eq!(selected.model.provider, "vercel");
         assert_eq!(selected.model.id, "anthropic/claude-opus-4.5");
+    }
+
+    #[test]
+    fn build_system_prompt_uses_repo_policy_digest() {
+        let root = tempdir().expect("tempdir");
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        std::fs::write(
+            cwd.join("AGENTS.md"),
+            "Always keep changes scoped.\nUse tests.",
+        )
+        .expect("write policy");
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let prompt =
+            build_system_prompt(&cli, &cwd, &["read"], None, root.path(), root.path(), true);
+
+        assert!(prompt.contains("# Repo Policy Digest"));
+        assert!(!prompt.contains("# Project Context"));
+    }
+
+    #[test]
+    fn load_project_context_files_reads_nested_policy_files() {
+        let root = tempdir().expect("tempdir");
+        let cwd = root.path().join("project").join("nested");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let project_root = cwd.parent().expect("project root");
+        std::fs::write(root.path().join("AGENTS.md"), "global").expect("write global");
+        std::fs::write(project_root.join("CLAUDE.md"), "local").expect("write local");
+
+        let files = load_project_context_files(&cwd, root.path());
+
+        assert_eq!(files.len(), 2);
     }
 
     #[test]

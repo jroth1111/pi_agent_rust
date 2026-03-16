@@ -154,6 +154,7 @@ pub mod provider;
 pub mod provider_metadata;
 pub mod providers;
 pub mod reliability;
+pub mod repo_policy;
 pub mod resources;
 pub mod rpc;
 pub mod runtime;
