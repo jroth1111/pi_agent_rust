@@ -38,6 +38,10 @@ use crate::model::{
     UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry};
+use crate::prompt_assembly::{
+    PromptAssemblyInputs, assemble_prompt_plan, context_from_prompt_plan,
+};
+use crate::prompt_plan::PromptAssemblyPlan;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 #[allow(unused_imports)]
 use crate::reliability::{
@@ -560,11 +564,9 @@ impl Agent {
         defs
     }
 
-    /// Build context for a completion request.
-    fn build_context(&mut self) -> Context<'_> {
-        let messages: Cow<'_, [Message]> = if self.config.block_images {
+    fn provider_visible_messages(&self) -> Cow<'_, [Message]> {
+        if self.config.block_images {
             let mut msgs = self.messages.clone();
-            // Filter out hidden custom messages.
             msgs.retain(|m| match m {
                 Message::Custom(c) => c.display,
                 _ => true,
@@ -577,47 +579,40 @@ impl Agent {
                     "Filtered image content from outbound provider context (images.block_images=true)"
                 );
             }
+            return Cow::Owned(msgs);
+        }
+
+        let has_hidden = self.messages.iter().any(|m| match m {
+            Message::Custom(c) => !c.display,
+            _ => false,
+        });
+
+        if has_hidden {
+            let mut msgs = self.messages.clone();
+            msgs.retain(|m| match m {
+                Message::Custom(c) => c.display,
+                _ => true,
+            });
             Cow::Owned(msgs)
         } else {
-            // Check if we need to filter hidden custom messages to avoid cloning if not needed.
-            let has_hidden = self.messages.iter().any(|m| match m {
-                Message::Custom(c) => !c.display,
-                _ => false,
-            });
-
-            if has_hidden {
-                let mut msgs = self.messages.clone();
-                msgs.retain(|m| match m {
-                    Message::Custom(c) => c.display,
-                    _ => true,
-                });
-                Cow::Owned(msgs)
-            } else {
-                Cow::Borrowed(self.messages.as_slice())
-            }
-        };
-
-        // Borrow cached tool defs if available; otherwise build + cache + borrow.
-        if self.cached_tool_defs.is_none() {
-            let defs: Vec<ToolDef> = self
-                .tools
-                .tools()
-                .iter()
-                .map(|t| ToolDef {
-                    name: t.name().to_string(),
-                    description: t.description().to_string(),
-                    parameters: t.parameters(),
-                })
-                .collect();
-            self.cached_tool_defs = Some(defs);
+            Cow::Borrowed(self.messages.as_slice())
         }
-        let tools = Cow::Borrowed(self.cached_tool_defs.as_deref().unwrap());
+    }
 
-        Context {
-            system_prompt: self.config.system_prompt.as_deref().map(Cow::Borrowed),
-            messages,
+    fn build_prompt_plan(&mut self) -> PromptAssemblyPlan {
+        let messages = self.provider_visible_messages().into_owned();
+        let tools = self.build_tool_defs();
+        assemble_prompt_plan(PromptAssemblyInputs::from_history(
+            self.config.system_prompt.clone(),
             tools,
-        }
+            messages,
+        ))
+    }
+
+    /// Build context for a completion request.
+    fn build_context(&mut self) -> Context<'static> {
+        let plan = self.build_prompt_plan();
+        context_from_prompt_plan(&plan)
     }
 
     /// Run the agent with a user message.
@@ -7359,6 +7354,66 @@ mod tests {
         let context = agent.build_context();
         assert_eq!(context.messages.len(), 1);
         assert_eq!(image_count_in_message(&context.messages[0]), 1);
+    }
+
+    #[test]
+    fn build_prompt_plan_tracks_static_prefix_and_history_tokens() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&["read"], Path::new("."), None),
+            AgentConfig {
+                system_prompt: Some("Follow the task manifest.".to_string()),
+                max_tool_iterations: 50,
+                stream_options: StreamOptions::default(),
+                block_images: false,
+            },
+        );
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Text("inspect src/agent.rs".to_string()),
+            timestamp: 0,
+        }));
+
+        let plan = agent.build_prompt_plan();
+
+        assert!(
+            plan.sections
+                .iter()
+                .any(|section| section.kind == crate::prompt_plan::PromptSectionKind::StaticPrefix)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|section| section.kind
+                    == crate::prompt_plan::PromptSectionKind::FallbackHistory)
+        );
+        assert!(plan.token_breakdown.static_prefix > 0);
+        assert!(plan.token_breakdown.fallback_history > 0);
+        assert_eq!(plan.messages.len(), 1);
+    }
+
+    #[test]
+    fn build_prompt_plan_omits_hidden_custom_messages() {
+        let mut agent = Agent::new(
+            Arc::new(SilentProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.add_message(Message::User(UserMessage {
+            content: UserContent::Text("visible".to_string()),
+            timestamp: 0,
+        }));
+        agent.add_message(Message::Custom(CustomMessage {
+            content: "internal".to_string(),
+            custom_type: "note".to_string(),
+            display: false,
+            details: None,
+            timestamp: 1,
+        }));
+
+        let plan = agent.build_prompt_plan();
+
+        assert_eq!(plan.messages.len(), 1);
+        assert!(matches!(plan.messages[0], Message::User(_)));
     }
 
     #[test]

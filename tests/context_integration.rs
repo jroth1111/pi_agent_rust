@@ -13,7 +13,11 @@ use pi::context::{
     find_turn_boundary, group_into_turns,
 };
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
+use pi::prompt_assembly::{PromptAssemblyInputs, assemble_prompt_plan};
+use pi::prompt_plan::PromptSectionKind;
+use pi::provider::ToolDef;
 use pi::session::SessionMessage;
+use serde_json::json;
 
 // =============================================================================
 // Test Helpers
@@ -108,6 +112,29 @@ fn processor_chain_with_pruner_preserves_turn_structure() {
     // Verify turns are still intact
     let turns = group_into_turns(&processed);
     assert_eq!(turns.len(), 5, "Should still have 5 turns after processing");
+}
+
+#[test]
+fn prompt_assembly_plan_preserves_section_ordering() {
+    let plan = assemble_prompt_plan(PromptAssemblyInputs {
+        system_prompt: Some("system guidance".to_string()),
+        tools: vec![ToolDef {
+            name: "read".to_string(),
+            description: "Read file contents".to_string(),
+            parameters: json!({"type": "object"}),
+        }],
+        repo_policy: Some("prefer scoped changes".to_string()),
+        task_manifest: Some("task: improve prompt efficiency".to_string()),
+        retrieval_bundle: None,
+        evidence: None,
+        fallback_history: vec![],
+        fresh_turn: vec![],
+    });
+
+    let kinds: Vec<_> = plan.sections.iter().map(|section| section.kind).collect();
+    assert_eq!(kinds[0], PromptSectionKind::StaticPrefix);
+    assert_eq!(kinds[1], PromptSectionKind::RepoPolicy);
+    assert_eq!(kinds[2], PromptSectionKind::TaskManifest);
 }
 
 #[test]

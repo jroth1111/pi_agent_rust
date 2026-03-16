@@ -148,6 +148,8 @@ pub mod permissions;
 #[cfg(feature = "wasm-host")]
 pub mod pi_wasm;
 pub mod policy;
+pub mod prompt_assembly;
+pub mod prompt_plan;
 pub mod provider;
 pub mod provider_metadata;
 pub mod providers;
