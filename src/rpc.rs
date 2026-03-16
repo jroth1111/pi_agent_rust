@@ -25,17 +25,14 @@ use crate::model::{
     UserMessage,
 };
 use crate::models::ModelEntry;
-#[cfg(test)]
-use crate::orchestration::WaveStatus;
-use crate::orchestration::{ExecutionTier, FlockWorkspace, TaskReport};
-#[cfg(test)]
-use crate::orchestration::{RunVerifyScopeKind, RunVerifyStatus};
 use crate::provider::Provider;
 use crate::provider_metadata::{
     canonical_provider_id, provider_metadata, provider_routing_defaults,
 };
 use crate::providers;
 use crate::resources::ResourceLoader;
+#[cfg(test)]
+use crate::runtime::WaveStatus;
 use crate::runtime::controller::ControllerOutput as RuntimeControllerOutput;
 use crate::runtime::dispatch::{
     DispatchRunHost, ORCHESTRATION_ROLLBACK_RETRY_DELAY, build_runtime_task_report,
@@ -54,7 +51,8 @@ use crate::runtime::service::{
     build_runtime_plan_artifact as service_build_runtime_plan_artifact,
     build_runtime_task_nodes as service_build_runtime_task_nodes, cancel_run as runtime_cancel_run,
     dispatch_run as runtime_dispatch_run,
-    ensure_run_id_available as runtime_ensure_run_id_available, resume_run as runtime_resume_run,
+    ensure_run_id_available as runtime_ensure_run_id_available,
+    refresh_task_runs as runtime_refresh_task_runs, resume_run as runtime_resume_run,
     select_execution_tier as runtime_select_execution_tier, start_run as runtime_start_run,
     submit_task as runtime_submit_task,
 };
@@ -62,9 +60,11 @@ use crate::runtime::store::RuntimeStore;
 use crate::runtime::types::{
     ModelProfile, ModelSelector, PlanArtifact, RunPhase, RunSnapshot, TaskNode,
 };
-use crate::runtime::verification::{
-    CompletedRunVerifyScope, completed_run_verify_scope, execute_run_verification,
-    should_skip_run_verify,
+use crate::runtime::{ExecutionTier, FlockWorkspace, TaskReport};
+#[cfg(test)]
+use crate::runtime::{RunVerifyScopeKind, RunVerifyStatus};
+use crate::runtime::{
+    completed_run_verify_scope, execute_run_verification, should_skip_run_verify,
 };
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -89,12 +89,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+const FROZEN_RUNTIME_MODEL_PROFILE_PREFIX: &str = "runtime_profile:";
+
 #[cfg(test)]
 use crate::config::ReliabilityEnforcementMode;
+#[cfg(test)]
+use crate::runtime::CompletedRunVerifyScope;
 #[cfg(test)]
 use crate::runtime::dispatch::dispatch_run_wave;
 #[cfg(test)]
 use crate::runtime::execution::TaskPrerequisite;
+#[cfg(test)]
+use crate::runtime::service::build_submit_task_report as runtime_build_submit_task_report;
 #[cfg(test)]
 use crate::runtime::types::{
     AutonomyLevel, RunBudgets, RunConstraints, RunSpec, TaskConstraints, TaskSpec, VerifySpec,
@@ -285,6 +291,29 @@ async fn persist_runtime_output(
     persist_runtime_snapshot(cx, session, runtime_store, &output.snapshot).await
 }
 
+fn freeze_runtime_model_profile(snapshot: &mut RunSnapshot, profile: &ModelProfile) -> Result<()> {
+    snapshot.spec.model_profile = format!(
+        "{FROZEN_RUNTIME_MODEL_PROFILE_PREFIX}{}",
+        serde_json::to_string(profile)
+            .map_err(|err| Error::session(format!("serialize runtime model profile: {err}")))?
+    );
+    Ok(())
+}
+
+fn thaw_runtime_model_profile(snapshot: &RunSnapshot) -> Option<ModelProfile> {
+    snapshot
+        .spec
+        .model_profile
+        .strip_prefix(FROZEN_RUNTIME_MODEL_PROFILE_PREFIX)
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+
+fn is_runtime_auto_model(entry: &ModelEntry) -> bool {
+    let provider = canonical_provider_id(&entry.model.provider).unwrap_or(&entry.model.provider);
+    provider.eq_ignore_ascii_case("openrouter")
+        && entry.model.id.eq_ignore_ascii_case("openrouter/auto")
+}
+
 fn runtime_model_selector(
     entry: &ModelEntry,
     thinking_level: Option<crate::model::ThinkingLevel>,
@@ -330,8 +359,20 @@ async fn runtime_model_profile_for_run(
         )
     };
 
+    let current_entry = current_entry.filter(|entry| !is_runtime_auto_model(entry));
+
     let default_entry = current_entry
         .clone()
+        .or_else(|| {
+            options
+                .scoped_models
+                .first()
+                .map(|scoped| scoped.model.clone())
+        })
+        .filter(|entry| !is_runtime_auto_model(entry))
+        .or_else(|| options.available_models.first().cloned())
+        .filter(|entry| !is_runtime_auto_model(entry))
+        .or(current_entry.clone())
         .or_else(|| {
             options
                 .scoped_models
@@ -355,6 +396,7 @@ async fn runtime_model_profile_for_run(
                 .find(|scoped| scoped.model.model.reasoning)
                 .map(|scoped| scoped.model.clone())
         })
+        .filter(|entry| !is_runtime_auto_model(entry))
         .or_else(|| {
             options
                 .available_models
@@ -362,12 +404,13 @@ async fn runtime_model_profile_for_run(
                 .find(|entry| entry.model.reasoning)
                 .cloned()
         })
+        .filter(|entry| !is_runtime_auto_model(entry))
         .unwrap_or_else(|| default_entry.clone());
 
     let background_entry = options
         .available_models
         .iter()
-        .find(|entry| !entry.model.reasoning)
+        .find(|entry| !entry.model.reasoning && !is_runtime_auto_model(entry))
         .cloned()
         .unwrap_or_else(|| default_entry.clone());
 
@@ -381,6 +424,24 @@ async fn runtime_model_profile_for_run(
         summarizer: runtime_model_selector(&background_entry, None),
         background: runtime_model_selector(&background_entry, None),
     })
+}
+
+async fn orchestration_model_profile_for_dispatch_host(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    runtime_store: &RuntimeStore,
+    options: &RpcOptions,
+    run_id: Option<&str>,
+) -> Result<ModelProfile> {
+    if let Some(run_id) = run_id {
+        if let Ok(run) = runtime_store.load_snapshot(run_id) {
+            if let Some(profile) = thaw_runtime_model_profile(&run) {
+                return Ok(profile);
+            }
+        }
+    }
+
+    runtime_model_profile_for_run(cx, session, options).await
 }
 
 fn runtime_selected_model_entry(
@@ -1800,6 +1861,7 @@ async fn execute_inline_run_dispatch(
         Arc::clone(reliability_state),
         runtime_store.clone(),
         options.clone(),
+        thaw_runtime_model_profile(&run),
     );
     execute_dispatch_grants_with_worker(
         cx,
@@ -1821,6 +1883,7 @@ struct RpcDispatchHost {
     reliability_state: Arc<Mutex<RuntimeExecutionState>>,
     runtime_store: RuntimeStore,
     options: RpcOptions,
+    model_profile: Option<ModelProfile>,
 }
 
 impl RpcDispatchHost {
@@ -1830,6 +1893,7 @@ impl RpcDispatchHost {
         reliability_state: Arc<Mutex<RuntimeExecutionState>>,
         runtime_store: RuntimeStore,
         options: RpcOptions,
+        model_profile: Option<ModelProfile>,
     ) -> Self {
         Self {
             cx,
@@ -1837,6 +1901,7 @@ impl RpcDispatchHost {
             reliability_state,
             runtime_store,
             options,
+            model_profile,
         }
     }
 }
@@ -1882,6 +1947,9 @@ impl RuntimeServiceHost for RpcDispatchHost {
     }
 
     async fn current_model_profile(&self, cx: &AgentCx) -> Result<ModelProfile> {
+        if let Some(profile) = &self.model_profile {
+            return Ok(profile.clone());
+        }
         runtime_model_profile_for_run(cx, &self.session, &self.options).await
     }
 
@@ -1890,11 +1958,19 @@ impl RuntimeServiceHost for RpcDispatchHost {
     }
 
     async fn persist_output(&self, cx: &AgentCx, output: &RuntimeControllerOutput) -> Result<()> {
-        persist_runtime_output(cx, &self.session, &self.runtime_store, output).await
+        let mut output = output.clone();
+        if let Some(profile) = &self.model_profile {
+            freeze_runtime_model_profile(&mut output.snapshot, profile)?;
+        }
+        persist_runtime_output(cx, &self.session, &self.runtime_store, &output).await
     }
 
     async fn persist_snapshot(&self, cx: &AgentCx, snapshot: &RunSnapshot) -> Result<()> {
-        persist_runtime_snapshot(cx, &self.session, &self.runtime_store, snapshot).await
+        let mut snapshot = snapshot.clone();
+        if let Some(profile) = &self.model_profile {
+            freeze_runtime_model_profile(&mut snapshot, profile)?;
+        }
+        persist_runtime_snapshot(cx, &self.session, &self.runtime_store, &snapshot).await
     }
 
     async fn persist_evidence_record(
@@ -1959,112 +2035,6 @@ async fn session_workspace_root(
     })
 }
 
-fn build_submit_task_report(
-    reliability: &RuntimeExecutionState,
-    req: &SubmitTaskRequest,
-    result: &SubmitTaskResponse,
-) -> Result<TaskReport> {
-    let task = reliability.tasks.get(&result.task_id).ok_or_else(|| {
-        Error::validation(format!("Unknown reliability task: {}", result.task_id))
-    })?;
-
-    let evidence = reliability
-        .evidence_by_task
-        .get(&result.task_id)
-        .cloned()
-        .unwrap_or_default();
-    let verify_exit_code = evidence
-        .last()
-        .map(|record| record.exit_code)
-        .unwrap_or_else(|| {
-            if req.verify_timed_out {
-                124
-            } else {
-                i32::from(!req.verify_passed.unwrap_or(result.close.approved))
-            }
-        });
-
-    let attempt = match &task.runtime.state {
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded { .. }) => {
-            task.runtime.attempt.saturating_add(1).max(1)
-        }
-        _ => task.runtime.attempt.max(1),
-    };
-    let summary = if result.close.approved {
-        result.close_payload.outcome.clone()
-    } else if result.close.violations.is_empty() {
-        format!("task {} closed without approval", result.task_id)
-    } else {
-        result.close.violations.join("; ")
-    };
-
-    let verify_command = match &task.spec.verify {
-        reliability::VerifyPlan::Standard { command, .. } => command.clone(),
-    };
-
-    Ok(TaskReport {
-        task_id: result.task_id.clone(),
-        attempt,
-        summary,
-        changed_files: req.changed_files.clone(),
-        patch_digest: req.patch_digest.clone(),
-        evidence_ids: result.close_payload.evidence_ids.clone(),
-        acceptance_ids: if result.close_payload.acceptance_ids.is_empty() {
-            task.spec.acceptance_ids.clone()
-        } else {
-            result.close_payload.acceptance_ids.clone()
-        },
-        verify_command,
-        verify_exit_code,
-        failure_class: runtime_failure_class_label(&task.runtime.state).or_else(|| {
-            req.failure_class
-                .map(|class| failure_class_label(class).to_string())
-        }),
-        blockers: task_report_blockers(&task.runtime.state),
-        workspace_snapshot: task.spec.input_snapshot.clone(),
-        generated_at: chrono::Utc::now(),
-    })
-}
-
-fn refresh_task_runs_with_verify_scopes(
-    reliability: &RuntimeExecutionState,
-    runtime_store: &RuntimeStore,
-    task_id: &str,
-    report: Option<&TaskReport>,
-) -> Vec<(RunSnapshot, Option<CompletedRunVerifyScope>)> {
-    let run_ids = runtime_store
-        .find_run_ids_by_task(task_id)
-        .unwrap_or_default();
-    let mut updated_runs = Vec::new();
-
-    for run_id in run_ids {
-        let Ok(mut run) = runtime_store.load_snapshot(&run_id) else {
-            continue;
-        };
-        if let Some(report) = report.filter(|report| run.tasks.contains_key(&report.task_id)) {
-            run.upsert_task_report(report.clone());
-        }
-        refresh_run_from_reliability(reliability, &mut run);
-        let verify_scope =
-            completed_run_verify_scope(&run).filter(|scope| !should_skip_run_verify(&run, scope));
-        updated_runs.push((run, verify_scope));
-    }
-
-    updated_runs
-}
-
-fn refresh_task_runs(
-    reliability: &RuntimeExecutionState,
-    runtime_store: &RuntimeStore,
-    task_id: &str,
-    report: Option<TaskReport>,
-) -> Vec<RunSnapshot> {
-    refresh_task_runs_with_verify_scopes(reliability, runtime_store, task_id, report.as_ref())
-        .into_iter()
-        .map(|(run, _)| run)
-        .collect()
-}
-
 async fn sync_task_runs(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -2078,13 +2048,15 @@ async fn sync_task_runs(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        refresh_task_runs_with_verify_scopes(&reliability, runtime_store, task_id, report.as_ref())
+        runtime_refresh_task_runs(&reliability, runtime_store, task_id, report)
     };
 
     let cwd = session_workspace_root(cx, session).await?;
     let mut updated_runs = Vec::with_capacity(refreshed_runs.len());
-    for (mut run, verify_scope) in refreshed_runs {
-        if let Some(scope) = verify_scope {
+    for mut run in refreshed_runs {
+        if let Some(scope) =
+            completed_run_verify_scope(&run).filter(|scope| !should_skip_run_verify(&run, scope))
+        {
             execute_run_verification(&cwd, &mut run, &scope).await;
         }
         persist_runtime_snapshot(cx, session, runtime_store, &run).await?;
@@ -2736,12 +2708,32 @@ pub async fn run(
                             continue;
                         }
                     };
+                let model_profile = match orchestration_model_profile_for_dispatch_host(
+                    &cx,
+                    &session,
+                    &runtime_store,
+                    &options,
+                    None,
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.start_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
                 let dispatch_host = RpcDispatchHost::new(
                     cx.clone(),
                     Arc::clone(&session),
                     Arc::clone(&reliability_state),
                     runtime_store.clone(),
                     options.clone(),
+                    Some(model_profile),
                 );
                 let run = match runtime_start_run(
                     &cx,
@@ -2811,12 +2803,32 @@ pub async fn run(
                             continue;
                         }
                     };
+                let model_profile = match orchestration_model_profile_for_dispatch_host(
+                    &cx,
+                    &session,
+                    &runtime_store,
+                    &options,
+                    Some(&req.run_id),
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.accept_plan",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
                 let dispatch_host = RpcDispatchHost::new(
                     cx.clone(),
                     Arc::clone(&session),
                     Arc::clone(&reliability_state),
                     runtime_store.clone(),
                     options.clone(),
+                    Some(model_profile),
                 );
                 let run = match runtime_accept_run_plan(&cx, &dispatch_host, &req.run_id).await {
                     Ok(run) => run,
@@ -2857,12 +2869,32 @@ pub async fn run(
                     .unwrap_or("run");
                 let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
 
+                let model_profile = match orchestration_model_profile_for_dispatch_host(
+                    &cx,
+                    &session,
+                    &runtime_store,
+                    &options,
+                    Some(&req.run_id),
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.dispatch_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
                 let dispatch_host = RpcDispatchHost::new(
                     cx.clone(),
                     Arc::clone(&session),
                     Arc::clone(&reliability_state),
                     runtime_store.clone(),
                     options.clone(),
+                    Some(model_profile),
                 );
                 let (run, grants) = match runtime_dispatch_run(
                     &cx,
@@ -2904,12 +2936,32 @@ pub async fn run(
                         }
                     };
 
+                let model_profile = match orchestration_model_profile_for_dispatch_host(
+                    &cx,
+                    &session,
+                    &runtime_store,
+                    &options,
+                    Some(&req.run_id),
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.cancel_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
                 let dispatch_host = RpcDispatchHost::new(
                     cx.clone(),
                     Arc::clone(&session),
                     Arc::clone(&reliability_state),
                     runtime_store.clone(),
                     options.clone(),
+                    Some(model_profile),
                 );
                 let run = match runtime_cancel_run(&cx, &dispatch_host, &req.run_id).await {
                     Ok(run) => run,
@@ -2944,12 +2996,32 @@ pub async fn run(
                         }
                     };
 
+                let model_profile = match orchestration_model_profile_for_dispatch_host(
+                    &cx,
+                    &session,
+                    &runtime_store,
+                    &options,
+                    Some(&req.run_id),
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.resume_run",
+                            &err,
+                        ));
+                        continue;
+                    }
+                };
                 let dispatch_host = RpcDispatchHost::new(
                     cx.clone(),
                     Arc::clone(&session),
                     Arc::clone(&reliability_state),
                     runtime_store.clone(),
                     options.clone(),
+                    Some(model_profile),
                 );
                 let run = match runtime_resume_run(&cx, &dispatch_host, &req.run_id).await {
                     Ok(run) => run,
@@ -6410,6 +6482,22 @@ mod tests {
         )))
     }
 
+    fn build_test_dispatch_host(
+        cx: &AgentCx,
+        session: Arc<Mutex<AgentSession>>,
+        reliability_state: Arc<Mutex<RuntimeExecutionState>>,
+        runtime_store: RuntimeStore,
+    ) -> RpcDispatchHost {
+        RpcDispatchHost::new(
+            cx.clone(),
+            session,
+            reliability_state,
+            runtime_store,
+            rpc_options_with_models(vec![dummy_entry("test-model", true)]),
+            None,
+        )
+    }
+
     struct FixtureInlineWorker {
         target: String,
         contents: String,
@@ -7294,7 +7382,8 @@ mod tests {
             }),
         };
         let result = reliability.submit_task(req.clone()).expect("submit");
-        let report = build_submit_task_report(&reliability, &req, &result).expect("task report");
+        let report =
+            runtime_build_submit_task_report(&reliability, &req, &result).expect("task report");
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let runtime_store = RuntimeStore::new(temp_dir.path().join("runtime"));
@@ -7304,7 +7393,7 @@ mod tests {
             .save_snapshot(&run)
             .expect("save run snapshot");
 
-        let updated = refresh_task_runs(
+        let updated = runtime_refresh_task_runs(
             &reliability,
             &runtime_store,
             &contract.task_id,
@@ -7334,6 +7423,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract = reliability_contract("task-inline-exec", Vec::new());
@@ -7373,6 +7468,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-inline-exec",
                 &grant,
@@ -7426,6 +7522,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract = reliability_contract("task-inline-fail", Vec::new());
@@ -7465,6 +7567,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-inline-fail",
                 &grant,
@@ -7504,6 +7607,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract = reliability_contract("task-inline-worker-fail", Vec::new());
@@ -7541,6 +7650,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-inline-worker-fail",
                 &grant,
@@ -7617,6 +7727,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract = reliability_contract("task-inline-create", Vec::new());
@@ -7656,6 +7772,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-inline-create",
                 &grant,
@@ -7717,6 +7834,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract_a = reliability_contract("task-parallel-a", Vec::new());
@@ -7774,6 +7897,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 run,
                 &grants,
@@ -7819,6 +7943,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract_a = reliability_contract("task-partial-a", Vec::new());
@@ -7868,6 +7998,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 run,
                 &grants,
@@ -7945,6 +8076,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract_a = reliability_contract("task-overlap-a", Vec::new());
@@ -7997,6 +8134,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 run,
                 &grants,
@@ -8033,6 +8171,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let mut contract_a = reliability_contract("task-overlap-a", Vec::new());
@@ -8084,6 +8228,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-sequential-rebase",
                 &grant_a,
@@ -8112,6 +8257,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-sequential-rebase",
                 &grant_b,
@@ -8140,6 +8286,12 @@ mod tests {
             true,
             true,
         )));
+        let dispatch_host = build_test_dispatch_host(
+            &cx,
+            Arc::clone(&session),
+            Arc::clone(&reliability_state),
+            runtime_store.clone(),
+        );
 
         run_async(async {
             let contract_a = TaskContract {
@@ -8201,6 +8353,7 @@ mod tests {
                 &session,
                 &reliability_state,
                 &runtime_store,
+                &dispatch_host,
                 &repo_path,
                 "run-chain-wave",
                 &first_grant,
@@ -8281,7 +8434,7 @@ mod tests {
             .save_snapshot(&run)
             .expect("save run snapshot");
 
-        let updated = refresh_task_runs(
+        let updated = runtime_refresh_task_runs(
             &reliability,
             &runtime_store,
             &contract.task_id,
@@ -10358,6 +10511,72 @@ mod tests {
             runtime_selected_model_entry(&session, &options).expect("resolve ad hoc model");
         assert_eq!(resolved.model.provider, "openai");
         assert_eq!(resolved.model.id, "gpt-4.1");
+    }
+
+    #[test]
+    fn frozen_runtime_model_profile_round_trips() {
+        let profile = ModelProfile {
+            planner: ModelSelector {
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                thinking_level: Some("high".to_string()),
+            },
+            executor: ModelSelector {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet".to_string(),
+                thinking_level: None,
+            },
+            verifier: ModelSelector {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet".to_string(),
+                thinking_level: None,
+            },
+            summarizer: ModelSelector {
+                provider: "openai".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                thinking_level: None,
+            },
+            background: ModelSelector {
+                provider: "openai".to_string(),
+                model: "gpt-4.1-mini".to_string(),
+                thinking_level: None,
+            },
+        };
+        let mut run = test_run_snapshot("run-freeze", "Freeze profile", ExecutionTier::Inline);
+
+        freeze_runtime_model_profile(&mut run, &profile).expect("freeze");
+
+        let thawed = thaw_runtime_model_profile(&run).expect("thaw");
+        assert_eq!(thawed, profile);
+    }
+
+    #[test]
+    fn runtime_auto_model_is_not_used_as_orchestration_executor() {
+        let auto = runtime_provider_model_entry("openrouter", "openrouter/auto").expect("auto");
+        let executor = dummy_entry("claude-opus-4-6", true);
+        let background = dummy_entry("gpt-4o-mini", false);
+        let options = rpc_options_with_models(vec![executor.clone(), background.clone(), auto]);
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("openrouter".to_string());
+        session.header.model_id = Some("openrouter/auto".to_string());
+
+        let cx = AgentCx::for_testing();
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(Mutex::new(AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(session)),
+            false,
+            ResolvedCompactionSettings::default(),
+        )));
+
+        let profile = run_async(runtime_model_profile_for_run(&cx, &session, &options))
+            .expect("runtime profile");
+        assert_eq!(profile.executor.model, executor.model.id);
+        assert_ne!(profile.executor.model, "openrouter/auto");
+        assert_eq!(profile.background.model, background.model.id);
     }
 
     #[test]
