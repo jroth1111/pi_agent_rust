@@ -1,7 +1,7 @@
 use super::loader::{LoadSkillsOptions, load_skills};
 use super::schema::{
-    ExplicitSkillInvocation, Skill, SkillLineage, SkillSections, parse_frontmatter,
-    parse_skill_sections, strip_frontmatter,
+    ExplicitSkillInvocation, Skill, SkillLineage, SkillSections, legacy_skill_id,
+    parse_frontmatter, parse_skill_sections, strip_frontmatter,
 };
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -69,6 +69,8 @@ pub struct SkillObservation {
     pub recorded_at_utc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub skill_id: String,
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub skill_digest: String,
@@ -128,6 +130,8 @@ impl SkillRoutingHints {
 pub struct SkillAmendment {
     pub version: u8,
     pub applied_at_utc: String,
+    #[serde(default)]
+    pub skill_id: String,
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub previous_digest: String,
@@ -149,6 +153,8 @@ pub struct SkillFeedback {
     pub recorded_at_utc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub skill_id: String,
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub skill_digest: String,
@@ -292,6 +298,7 @@ impl SkillDoctorFormat {
 
 #[derive(Debug, Clone)]
 struct TrackedSkill {
+    skill_id: String,
     name: String,
     path: PathBuf,
     digest: String,
@@ -306,6 +313,7 @@ struct ActivatedSkill {
 
 #[derive(Debug, Clone)]
 struct SkillFeedbackTarget {
+    skill_id: String,
     name: String,
     path: PathBuf,
     digest: String,
@@ -353,6 +361,7 @@ impl SkillRunTracker {
             skills_by_path.insert(
                 canonical,
                 TrackedSkill {
+                    skill_id: skill.skill_id.clone(),
                     name: skill.name.clone(),
                     path: skill.file_path.clone(),
                     digest: file_digest(&skill.file_path),
@@ -456,6 +465,7 @@ impl SkillRunTracker {
             .get(&canonical)
             .cloned()
             .unwrap_or_else(|| TrackedSkill {
+                skill_id: legacy_skill_id(path),
                 name: skill_name.to_string(),
                 path: path.to_path_buf(),
                 digest: file_digest(path),
@@ -471,9 +481,10 @@ impl SkillRunTracker {
         self.activations
             .values()
             .map(|activation| SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: timestamp_now(),
                 session_id: self.session_id.clone(),
+                skill_id: activation.skill.skill_id.clone(),
                 skill_name: activation.skill.name.clone(),
                 skill_path: activation.skill.path.clone(),
                 skill_digest: activation.skill.digest.clone(),
@@ -527,9 +538,10 @@ pub fn handle_skill_feedback(
     let observations = load_observations(cwd)?;
     let target = resolve_skill_feedback_target(cwd, skill_name, session_id, &observations)?;
     let feedback = SkillFeedback {
-        version: 1,
+        version: 2,
         recorded_at_utc: timestamp_now(),
         session_id: normalize_optional_text(session_id),
+        skill_id: target.skill_id,
         skill_name: target.name,
         skill_path: target.path,
         skill_digest: target.digest,
@@ -1418,6 +1430,7 @@ fn apply_managed_skill_patch(
         ))
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
+    let skill_id = skill_id_from_raw(&raw, skill_path);
     let previous_guardrails = extract_guardrails_from_raw(&raw);
     let previous_routing_hints = extract_routing_hints_from_raw(&raw);
     let block = guardrail_block(guardrails);
@@ -1437,8 +1450,9 @@ fn apply_managed_skill_patch(
     })?;
     let new_digest = sha256_hex_standalone(&updated);
     let amendment = SkillAmendment {
-        version: 1,
+        version: 2,
         applied_at_utc: timestamp_now(),
+        skill_id,
         skill_name: skill_name.to_string(),
         skill_path: skill_path.to_path_buf(),
         previous_digest,
@@ -1476,6 +1490,7 @@ fn rollback_managed_skill_patch(
         ))
     })?;
     let previous_digest = sha256_hex_standalone(&raw);
+    let skill_id = skill_id_from_raw(&raw, skill_path);
     let current_guardrails = extract_guardrails_from_raw(&raw);
     let current_routing_hints = extract_routing_hints_from_raw(&raw);
     let restored_guardrails = restore_guardrail_block(&raw, &source_amendment.previous_guardrails);
@@ -1502,8 +1517,9 @@ fn rollback_managed_skill_patch(
     )];
     rollback_evidence.extend(evidence.iter().cloned());
     let amendment = SkillAmendment {
-        version: 1,
+        version: 2,
         applied_at_utc: timestamp_now(),
+        skill_id,
         skill_name: skill_name.to_string(),
         skill_path: skill_path.to_path_buf(),
         previous_digest,
@@ -1992,15 +2008,27 @@ fn append_jsonl_records<T: Serialize>(path: &Path, records: &[T]) -> Result<()> 
 }
 
 fn load_observations(cwd: &Path) -> Result<Vec<SkillObservation>> {
-    load_jsonl_records(&skill_observation_ledger_path(cwd))
+    let mut entries: Vec<SkillObservation> = load_jsonl_records(&skill_observation_ledger_path(cwd))?;
+    for entry in &mut entries {
+        entry.skill_id = normalize_record_skill_id(&entry.skill_id, &entry.skill_path);
+    }
+    Ok(entries)
 }
 
 fn load_feedback(cwd: &Path) -> Result<Vec<SkillFeedback>> {
-    load_jsonl_records(&skill_feedback_ledger_path(cwd))
+    let mut entries: Vec<SkillFeedback> = load_jsonl_records(&skill_feedback_ledger_path(cwd))?;
+    for entry in &mut entries {
+        entry.skill_id = normalize_record_skill_id(&entry.skill_id, &entry.skill_path);
+    }
+    Ok(entries)
 }
 
 fn load_amendments(cwd: &Path) -> Result<Vec<SkillAmendment>> {
-    load_jsonl_records(&skill_amendment_ledger_path(cwd))
+    let mut entries: Vec<SkillAmendment> = load_jsonl_records(&skill_amendment_ledger_path(cwd))?;
+    for entry in &mut entries {
+        entry.skill_id = normalize_record_skill_id(&entry.skill_id, &entry.skill_path);
+    }
+    Ok(entries)
 }
 
 fn skill_observation_ledger_path(cwd: &Path) -> PathBuf {
@@ -2189,6 +2217,27 @@ fn normalize_signature(message: &str) -> String {
     truncate_preview(&compact)
 }
 
+fn normalize_record_skill_id(skill_id: &str, path: &Path) -> String {
+    let trimmed = skill_id.trim();
+    if trimmed.is_empty() {
+        legacy_skill_id(path)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn skill_id_from_raw(raw: &str, path: &Path) -> String {
+    let parsed = parse_frontmatter(raw);
+    parsed
+        .frontmatter
+        .get("skill-id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| legacy_skill_id(path))
+}
+
 fn resolve_skill_feedback_target(
     cwd: &Path,
     skill_name: &str,
@@ -2201,6 +2250,7 @@ fn resolve_skill_feedback_target(
                 && entry.session_id.as_deref() == Some(session_id.as_str())
         }) {
             return Ok(SkillFeedbackTarget {
+                skill_id: normalize_record_skill_id(&observation.skill_id, &observation.skill_path),
                 name: observation.skill_name.clone(),
                 path: observation.skill_path.clone(),
                 digest: observation.skill_digest.clone(),
@@ -2221,6 +2271,7 @@ fn resolve_skill_feedback_target(
         .find(|skill| skill.name == skill_name)
     {
         return Ok(SkillFeedbackTarget {
+            skill_id: skill.skill_id,
             name: skill.name,
             digest: file_digest(&skill.file_path),
             path: skill.file_path,
@@ -2234,6 +2285,7 @@ fn resolve_skill_feedback_target(
         .find(|entry| entry.skill_name == skill_name)
     {
         return Ok(SkillFeedbackTarget {
+            skill_id: normalize_record_skill_id(&observation.skill_id, &observation.skill_path),
             name: observation.skill_name.clone(),
             path: observation.skill_path.clone(),
             digest: observation.skill_digest.clone(),
@@ -2327,9 +2379,10 @@ mod tests {
         notes: &str,
     ) -> SkillFeedback {
         SkillFeedback {
-            version: 1,
+            version: 2,
             recorded_at_utc: recorded_at_utc.to_string(),
             session_id: session_id.map(ToString::to_string),
+            skill_id: test_skill_id(skill_name),
             skill_name: skill_name.to_string(),
             skill_path: skill_path.to_path_buf(),
             skill_digest: skill_digest.to_string(),
@@ -2337,6 +2390,10 @@ mod tests {
             rating,
             notes: notes.to_string(),
         }
+    }
+
+    fn test_skill_id(skill_name: &str) -> String {
+        format!("{skill_name}-id")
     }
 
     #[test]
@@ -2350,6 +2407,7 @@ mod tests {
         )
         .expect("write skill");
         let skills = vec![Skill {
+            skill_id: test_skill_id("bug-triage"),
             name: "bug-triage".to_string(),
             description: "triage bugs".to_string(),
             file_path: skill_path.clone(),
@@ -2385,9 +2443,10 @@ mod tests {
     fn doctor_recommends_bash_guardrail_for_repeated_failures() {
         let entries = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: PathBuf::from("/tmp/SKILL.md"),
                 skill_digest: "abc".to_string(),
@@ -2403,9 +2462,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: PathBuf::from("/tmp/SKILL.md"),
                 skill_digest: "abc".to_string(),
@@ -2421,9 +2481,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: PathBuf::from("/tmp/SKILL.md"),
                 skill_digest: "abc".to_string(),
@@ -2503,9 +2564,10 @@ mod tests {
     fn doctor_recommends_routing_hints_for_misrouted_skill() {
         let observations = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: PathBuf::from("/tmp/SKILL.md"),
                 skill_digest: "abc".to_string(),
@@ -2517,9 +2579,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: PathBuf::from("/tmp/SKILL.md"),
                 skill_digest: "abc".to_string(),
@@ -2531,9 +2594,10 @@ mod tests {
                 agent_error: Some("Wrong task".to_string()),
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: PathBuf::from("/tmp/SKILL.md"),
                 skill_digest: "abc".to_string(),
@@ -2671,6 +2735,7 @@ mod tests {
         )
         .expect("write skill");
         let skills = vec![Skill {
+            skill_id: test_skill_id("summarize"),
             name: "summarize".to_string(),
             description: "summarize text".to_string(),
             file_path: skill_path.clone(),
@@ -2716,6 +2781,7 @@ mod tests {
         )
         .expect("write skill");
         let skills = vec![Skill {
+            skill_id: test_skill_id("summarize"),
             name: "summarize".to_string(),
             description: "summarize text".to_string(),
             file_path: skill_path.clone(),
@@ -2772,9 +2838,10 @@ mod tests {
         append_jsonl_records(
             &skill_observation_ledger_path(dir.path()),
             &[SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: Some("sess-1".to_string()),
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: observed_digest.clone(),
@@ -2831,9 +2898,10 @@ mod tests {
 
         let failing_entries = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -2849,9 +2917,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -2867,9 +2936,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -2915,9 +2985,10 @@ mod tests {
         let amended_digest = file_digest(&skill_path);
         let successful_entries = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -2929,9 +3000,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -2943,9 +3015,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("bug-triage"),
                 skill_name: "bug-triage".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest,
@@ -2995,9 +3068,10 @@ mod tests {
 
         let observations = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3009,9 +3083,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3023,9 +3098,10 @@ mod tests {
                 agent_error: Some("Wrong task".to_string()),
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3133,9 +3209,10 @@ mod tests {
 
         let successful_entries = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3147,9 +3224,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3161,9 +3239,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3226,9 +3305,10 @@ mod tests {
         let amended_digest = file_digest(&skill_path);
         let amended_observations = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -3240,9 +3320,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -3254,9 +3335,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("code-review"),
                 skill_name: "code-review".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -3345,9 +3427,10 @@ mod tests {
             &skill_observation_ledger_path(dir.path()),
             &[
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
                     skill_name: "deploy-readiness".to_string(),
                     skill_path: healthy_skill_path.clone(),
                     skill_digest: healthy_digest.clone(),
@@ -3359,9 +3442,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
                     skill_name: "deploy-readiness".to_string(),
                     skill_path: healthy_skill_path.clone(),
                     skill_digest: healthy_digest.clone(),
@@ -3373,9 +3457,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
                     skill_name: "deploy-readiness".to_string(),
                     skill_path: healthy_skill_path.clone(),
                     skill_digest: healthy_digest,
@@ -3387,9 +3472,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:15:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("release-notes"),
                     skill_name: "release-notes".to_string(),
                     skill_path: failing_skill_path.clone(),
                     skill_digest: failing_digest.clone(),
@@ -3405,9 +3491,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("release-notes"),
                     skill_name: "release-notes".to_string(),
                     skill_path: failing_skill_path.clone(),
                     skill_digest: failing_digest.clone(),
@@ -3423,9 +3510,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("release-notes"),
                     skill_name: "release-notes".to_string(),
                     skill_path: failing_skill_path.clone(),
                     skill_digest: failing_digest,
@@ -3485,9 +3573,10 @@ mod tests {
             &skill_observation_ledger_path(dir.path()),
             &[
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
                     skill_name: "deploy-readiness".to_string(),
                     skill_path: skill_path.clone(),
                     skill_digest: digest.clone(),
@@ -3499,9 +3588,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
                     skill_name: "deploy-readiness".to_string(),
                     skill_path: skill_path.clone(),
                     skill_digest: digest.clone(),
@@ -3513,9 +3603,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("deploy-readiness"),
                     skill_name: "deploy-readiness".to_string(),
                     skill_path: skill_path.clone(),
                     skill_digest: digest,
@@ -3563,9 +3654,10 @@ mod tests {
             &skill_observation_ledger_path(dir.path()),
             &[
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("bug-triage"),
                     skill_name: "bug-triage".to_string(),
                     skill_path: skill_path.clone(),
                     skill_digest: digest.clone(),
@@ -3581,9 +3673,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("bug-triage"),
                     skill_name: "bug-triage".to_string(),
                     skill_path: skill_path.clone(),
                     skill_digest: digest.clone(),
@@ -3599,9 +3692,10 @@ mod tests {
                     agent_error: None,
                 },
                 SkillObservation {
-                    version: 1,
+                    version: 2,
                     recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                     session_id: None,
+                    skill_id: test_skill_id("bug-triage"),
                     skill_name: "bug-triage".to_string(),
                     skill_path: skill_path.clone(),
                     skill_digest: digest,
@@ -3659,9 +3753,10 @@ mod tests {
         let original_digest = file_digest(&skill_path);
         let healthy_entries = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:00:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3673,9 +3768,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:05:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3687,9 +3783,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:10:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: original_digest.clone(),
@@ -3729,9 +3826,10 @@ mod tests {
 
         let regressed_entries = vec![
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:20:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -3747,9 +3845,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:25:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),
@@ -3765,9 +3864,10 @@ mod tests {
                 agent_error: None,
             },
             SkillObservation {
-                version: 1,
+                version: 2,
                 recorded_at_utc: "2026-03-15T10:30:00Z".to_string(),
                 session_id: None,
+                skill_id: test_skill_id("summarize"),
                 skill_name: "summarize".to_string(),
                 skill_path: skill_path.clone(),
                 skill_digest: amended_digest.clone(),

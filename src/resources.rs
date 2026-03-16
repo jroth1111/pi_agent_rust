@@ -1224,6 +1224,7 @@ mod tests {
     fn test_format_skills_for_prompt() {
         let skills = vec![
             Skill {
+                skill_id: "skill-a-id".to_string(),
                 name: "a".to_string(),
                 description: "desc".to_string(),
                 file_path: PathBuf::from("/tmp/a/SKILL.md"),
@@ -1234,6 +1235,7 @@ mod tests {
                 lineage: SkillLineage::default(),
             },
             Skill {
+                skill_id: "skill-b-id".to_string(),
                 name: "b".to_string(),
                 description: "desc".to_string(),
                 file_path: PathBuf::from("/tmp/b/SKILL.md"),
@@ -1621,6 +1623,7 @@ still frontmatter",
         .expect("write skill");
 
         let skills = vec![Skill {
+            skill_id: "test-skill-id".to_string(),
             name: "test-skill".to_string(),
             description: "A test".to_string(),
             file_path: skill_file,

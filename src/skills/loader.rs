@@ -7,9 +7,9 @@ use crate::resources::{CollisionInfo, DiagnosticKind, ResourceDiagnostic};
 
 use super::resolver::is_under_path;
 use super::schema::{
-    Skill, frontmatter_bool, frontmatter_string, infer_skill_name, parse_frontmatter,
-    parse_skill_lineage, parse_skill_sections, validate_description, validate_frontmatter_fields,
-    validate_name,
+    Skill, frontmatter_bool, frontmatter_string, infer_skill_name, legacy_skill_id,
+    parse_frontmatter, parse_skill_lineage, parse_skill_sections, validate_description,
+    validate_frontmatter_fields, validate_name, validate_skill_id,
 };
 
 #[derive(Debug, Clone)]
@@ -322,9 +322,27 @@ pub(crate) fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFile
 
     let disable_model_invocation =
         frontmatter_bool(frontmatter, "disable-model-invocation").unwrap_or(false);
+    let skill_id = frontmatter_string(frontmatter, "skill-id").unwrap_or_else(|| {
+        diagnostics.push(ResourceDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: "missing `skill-id`; derived legacy identity from path".to_string(),
+            path: path.to_path_buf(),
+            collision: None,
+        });
+        legacy_skill_id(path)
+    });
+    for error in validate_skill_id(&skill_id) {
+        diagnostics.push(ResourceDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: error,
+            path: path.to_path_buf(),
+            collision: None,
+        });
+    }
 
     LoadSkillFileResult {
         skill: Some(Skill {
+            skill_id,
             name,
             description,
             file_path: path.to_path_buf(),

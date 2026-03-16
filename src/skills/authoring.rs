@@ -2,7 +2,9 @@ use super::improvement::SkillDoctorFormat;
 use super::loader::{LoadSkillsOptions, load_skills};
 #[cfg(test)]
 use super::schema::SkillSections;
-use super::schema::{Skill, SkillLineage, infer_skill_name, validate_description, validate_name};
+use super::schema::{
+    Skill, SkillLineage, infer_skill_name, new_skill_id, validate_description, validate_name,
+};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::resources::{DiagnosticKind, ResourceDiagnostic};
@@ -19,6 +21,7 @@ const TODO_MARKER: &str = "TODO:";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillInitReceipt {
+    pub skill_id: String,
     pub skill_name: String,
     pub skill_path: PathBuf,
     pub scope: String,
@@ -268,7 +271,9 @@ fn create_skill_scaffold(
         ))
     })?;
 
+    let skill_id = new_skill_id();
     let body = render_skill_template(
+        &skill_id,
         name,
         description,
         use_when,
@@ -286,6 +291,7 @@ fn create_skill_scaffold(
     })?;
 
     Ok(SkillInitReceipt {
+        skill_id,
         skill_name: name.to_string(),
         skill_path,
         scope: scope_name(global).to_string(),
@@ -484,6 +490,7 @@ fn skill_name_for_diagnostic(path: &Path) -> String {
 }
 
 fn render_skill_template(
+    skill_id: &str,
     name: &str,
     description: &str,
     use_when: &str,
@@ -495,7 +502,7 @@ fn render_skill_template(
 ) -> String {
     let full_description = build_skill_description(description, use_when, not_for);
     let title = humanize_skill_name(name);
-    let frontmatter = render_skill_frontmatter(name, &full_description, lineage);
+    let frontmatter = render_skill_frontmatter(skill_id, name, &full_description, lineage);
 
     format!(
         "{}# {}\n\n## Purpose\n{}\n\n## Use When\n- {}\n\n## Not For\n- {}\n\n## Trigger Examples\n{}\n\n## Anti-Trigger Examples\n{}\n\n## Inputs\n- {} List required inputs, optional inputs, and missing-input behavior.\n\n## Output Contract\n- {} Describe the exact response shape, files, and verification evidence this skill must produce.\n\n## Success Criteria\n- Reach at least 80% successful observed runs across 3 runs.\n- Reach at least 3.5/5 average feedback across 2 ratings.\n{}\n\n## Instructions\n1. Restate the task and confirm the needed inputs.\n2. Follow the output contract exactly.\n3. Verify the result before responding.\n4. State blockers explicitly instead of guessing.\n",
@@ -512,10 +519,16 @@ fn render_skill_template(
     )
 }
 
-fn render_skill_frontmatter(name: &str, description: &str, lineage: &SkillLineage) -> String {
+fn render_skill_frontmatter(
+    skill_id: &str,
+    name: &str,
+    description: &str,
+    lineage: &SkillLineage,
+) -> String {
     let mut out = String::new();
     writeln!(out, "---").expect("write frontmatter");
     writeln!(out, "name: {name}").expect("write frontmatter");
+    writeln!(out, "skill-id: {}", yaml_quote(skill_id)).expect("write frontmatter");
     writeln!(out, "description: {}", yaml_quote(description)).expect("write frontmatter");
     if let Some(metadata) = render_lineage_metadata(lineage) {
         write!(out, "{metadata}").expect("write frontmatter");
@@ -582,6 +595,8 @@ fn render_skill_init_receipt(receipt: &SkillInitReceipt) -> Result<String> {
     )
     .map_err(|err| Error::session(format!("render skill init receipt: {err}")))?;
     writeln!(out, "  path: {}", receipt.skill_path.display())
+        .map_err(|err| Error::session(format!("render skill init receipt: {err}")))?;
+    writeln!(out, "  skill_id: {}", receipt.skill_id)
         .map_err(|err| Error::session(format!("render skill init receipt: {err}")))?;
     writeln!(
         out,
@@ -761,6 +776,8 @@ mod tests {
         .unwrap();
 
         let content = fs::read_to_string(&receipt.skill_path).unwrap();
+        assert!(!receipt.skill_id.is_empty());
+        assert!(content.contains("skill-id:"));
         assert!(content.contains("created-by-skill: \"skill-creator\""));
         assert!(content.contains("intended-outcome: \"produce a deploy-readiness skill that catches blockers before release\""));
         assert!(content.contains("## Trigger Examples"));
@@ -1015,6 +1032,7 @@ mod tests {
     #[test]
     fn lint_finds_single_trigger_example_as_too_short() {
         let report = lint_skill(Skill {
+            skill_id: "single-trigger-id".to_string(),
             name: "single-trigger".to_string(),
             description: "Review deploy readiness. Use when the user wants a release audit. Not for production incident response.".to_string(),
             file_path: PathBuf::from("/tmp/single-trigger/SKILL.md"),
@@ -1048,6 +1066,7 @@ mod tests {
     #[test]
     fn lint_treats_blank_examples_as_missing() {
         let report = lint_skill(Skill {
+            skill_id: "blank-trigger-id".to_string(),
             name: "blank-trigger".to_string(),
             description: "Review deploy readiness. Use when the user wants a release audit. Not for production incident response.".to_string(),
             file_path: PathBuf::from("/tmp/blank-trigger/SKILL.md"),

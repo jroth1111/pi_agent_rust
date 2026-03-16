@@ -1,15 +1,18 @@
+use crate::extensions::sha256_hex_standalone;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
+use uuid::Uuid;
 
 pub const MAX_SKILL_NAME_LEN: usize = 64;
 pub const MAX_SKILL_DESC_LEN: usize = 1024;
 
-pub const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
+pub const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
     "name",
+    "skill-id",
     "description",
     "license",
     "compatibility",
@@ -65,6 +68,7 @@ impl SkillLineage {
 
 #[derive(Debug, Clone)]
 pub struct Skill {
+    pub skill_id: String,
     pub name: String,
     pub description: String,
     pub file_path: PathBuf,
@@ -73,6 +77,32 @@ pub struct Skill {
     pub disable_model_invocation: bool,
     pub sections: SkillSections,
     pub lineage: SkillLineage,
+}
+
+pub fn validate_skill_id(skill_id: &str) -> Vec<String> {
+    let trimmed = skill_id.trim();
+    if trimmed.is_empty() {
+        return vec!["skill-id is required".to_string()];
+    }
+    if trimmed.starts_with("legacy:") {
+        return Vec::new();
+    }
+    match Uuid::parse_str(trimmed) {
+        Ok(_) => Vec::new(),
+        Err(_) => vec![format!("skill-id is not a valid UUID: {trimmed}")],
+    }
+}
+
+pub fn new_skill_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn legacy_skill_id(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    format!(
+        "legacy:{}",
+        sha256_hex_standalone(&canonical.display().to_string())
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -974,6 +1004,7 @@ mod tests {
         .unwrap();
 
         let skills = vec![Skill {
+            skill_id: "my-skill-id".to_string(),
             name: "my-skill".to_string(),
             description: "test".to_string(),
             file_path: skill_file.clone(),
@@ -1002,6 +1033,7 @@ mod tests {
         .unwrap();
 
         let skills = vec![Skill {
+            skill_id: "my-skill-id".to_string(),
             name: "my-skill".to_string(),
             description: "test".to_string(),
             file_path: skill_file.clone(),
@@ -1026,6 +1058,7 @@ mod tests {
     #[test]
     fn format_skills_for_prompt_filters_disabled() {
         let skills = vec![Skill {
+            skill_id: "hidden-id".to_string(),
             name: "hidden".to_string(),
             description: "Hidden skill".to_string(),
             file_path: PathBuf::from("/tmp/hidden/SKILL.md"),
@@ -1042,6 +1075,7 @@ mod tests {
     fn format_skills_for_prompt_multiple() {
         let skills = vec![
             Skill {
+                skill_id: "skill-a-id".to_string(),
                 name: "skill-a".to_string(),
                 description: "First skill".to_string(),
                 file_path: PathBuf::from("/tmp/skill-a/SKILL.md"),
@@ -1058,6 +1092,7 @@ mod tests {
                 lineage: SkillLineage::default(),
             },
             Skill {
+                skill_id: "skill-b-id".to_string(),
                 name: "skill-b".to_string(),
                 description: "Second skill".to_string(),
                 file_path: PathBuf::from("/tmp/skill-b/SKILL.md"),
