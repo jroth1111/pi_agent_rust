@@ -11,8 +11,7 @@ pub mod flock;
 mod tests;
 
 pub use crate::runtime::{
-    ExecutionTier, RunLifecycle, RunVerifyScopeKind, RunVerifyStatus, SubrunPlan, TaskReport,
-    WaveStatus,
+    ExecutionTier, RunVerifyScopeKind, RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus,
 };
 pub use coordinator::{
     ConflictResolution, FileConflict, FlockCoordinator, MergeResult, MergeStrategy,

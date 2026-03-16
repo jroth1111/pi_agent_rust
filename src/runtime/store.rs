@@ -83,6 +83,35 @@ impl RuntimeStore {
         self.snapshot_path(run_id).exists()
     }
 
+    pub fn list_run_ids(&self) -> Result<Vec<String>> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut run_ids = fs::read_dir(&self.root)
+            .map_err(|err| Error::Io(Box::new(err)))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                name.strip_suffix(".snapshot.json").map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        run_ids.sort();
+        Ok(run_ids)
+    }
+
+    pub fn find_run_ids_by_task(&self, task_id: &str) -> Result<Vec<String>> {
+        let mut run_ids = Vec::new();
+        for run_id in self.list_run_ids()? {
+            let snapshot = self.load_snapshot(&run_id)?;
+            if snapshot.tasks.contains_key(task_id) {
+                run_ids.push(run_id);
+            }
+        }
+        Ok(run_ids)
+    }
+
     fn snapshot_path(&self, run_id: &str) -> PathBuf {
         self.root.join(format!("{run_id}.snapshot.json"))
     }
@@ -96,7 +125,10 @@ impl RuntimeStore {
 mod tests {
     use super::*;
     use crate::runtime::events::RuntimeEventKind;
-    use crate::runtime::types::{RunBudgets, RunConstraints, RunSpec};
+    use crate::runtime::types::{
+        AutonomyLevel, RunBudgets, RunConstraints, RunSpec, TaskConstraints, TaskNode, TaskSpec,
+        VerifySpec,
+    };
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -131,5 +163,64 @@ mod tests {
         let events = store.load_events("run-1").expect("load events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].label(), "run_created");
+    }
+
+    #[test]
+    fn store_finds_runs_by_task_id_from_snapshots() {
+        let dir = tempdir().expect("tempdir");
+        let store = RuntimeStore::new(dir.path().to_path_buf());
+
+        let mut run_a = sample_snapshot();
+        run_a.spec.run_id = "run-a".to_string();
+        run_a.tasks.insert(
+            "task-a".to_string(),
+            TaskNode::new(TaskSpec {
+                task_id: "task-a".to_string(),
+                title: "Task A".to_string(),
+                objective: "Do task a".to_string(),
+                parent_goal_trace_id: None,
+                planned_touches: Vec::new(),
+                input_snapshot: None,
+                max_attempts: 1,
+                enforce_symbol_drift_check: false,
+                verify: VerifySpec {
+                    command: "cargo test".to_string(),
+                    timeout_sec: 60,
+                    acceptance_ids: Vec::new(),
+                },
+                autonomy: AutonomyLevel::Guarded,
+                constraints: TaskConstraints::default(),
+            }),
+        );
+        store.save_snapshot(&run_a).expect("save run a");
+
+        let mut run_b = sample_snapshot();
+        run_b.spec.run_id = "run-b".to_string();
+        run_b.tasks.insert(
+            "task-b".to_string(),
+            TaskNode::new(TaskSpec {
+                task_id: "task-b".to_string(),
+                title: "Task B".to_string(),
+                objective: "Do task b".to_string(),
+                parent_goal_trace_id: None,
+                planned_touches: Vec::new(),
+                input_snapshot: None,
+                max_attempts: 1,
+                enforce_symbol_drift_check: false,
+                verify: VerifySpec {
+                    command: "cargo test".to_string(),
+                    timeout_sec: 60,
+                    acceptance_ids: Vec::new(),
+                },
+                autonomy: AutonomyLevel::Guarded,
+                constraints: TaskConstraints::default(),
+            }),
+        );
+        store.save_snapshot(&run_b).expect("save run b");
+
+        let run_ids = store
+            .find_run_ids_by_task("task-b")
+            .expect("find run ids by task");
+        assert_eq!(run_ids, vec!["run-b".to_string()]);
     }
 }
