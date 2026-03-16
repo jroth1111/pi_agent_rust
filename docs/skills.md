@@ -17,6 +17,7 @@ A skill is defined in a `SKILL.md` file with YAML frontmatter.
 ```markdown
 ---
 name: "sql-expert"
+skill-id: "11111111-1111-1111-1111-111111111111"
 description: "Expert at writing and optimizing SQL queries"
 disable-model-invocation: false
 ---
@@ -31,6 +32,7 @@ You are an expert SQL developer. When writing queries:
 | Field | Description |
 |-------|-------------|
 | `name` | Skill ID (must match directory name if in a subdir; mismatches emit a warning). |
+| `skill-id` | Immutable artifact identity. Required for new scaffolds and used to separate recreated skills from older runtime history. |
 | `description` | **Required.** Short description used for selection; empty descriptions are skipped. |
 | `disable-model-invocation` | If `true`, the skill is not shown to the model in the system prompt. |
 
@@ -112,6 +114,8 @@ The scaffold keeps `SKILL.md` as the source artifact, but now requires concrete 
 That follows the same principle as `skill-creator`: do not scaffold a skill until the activation boundary and success threshold are explicit.
 
 Every scaffold now stamps creator provenance into `metadata.provenance`. By default the creator is `pi-skills-init`, and you can override it with `--created-by-skill`, `--created-by-revision`, and `--session-id` when an external meta-skill authored the child skill.
+
+Every scaffold also stamps an immutable `skill-id` UUID into frontmatter. That ID, not the skill name, is now the unit of health and producer attribution.
 
 Once those are provided, Pi generates an explicit structure:
 
@@ -199,6 +203,14 @@ The doctor also rolls descendant outcomes up to upstream producers:
 
 - `creator` rollups show whether a skill-authoring workflow is producing healthy child skills
 - `improver` rollups show whether a repair loop is leaving descendant skills healthier after intervention
+
+Producer rollups are now ledger-first and dual-attributed:
+
+- a descendant skill contributes to both its `creator` and its latest `improver` when both provenance links exist
+- recreated skills with the same `name` remain separate because rollups key on immutable `skill-id`
+- deleted, renamed, or otherwise orphaned descendants still count in producer effectiveness instead of disappearing with the filesystem
+
+Ledger parsing now fails loudly. If a skill observation, feedback, or amendment row is malformed, `pi skills doctor` returns an error rather than silently dropping evidence and changing the score.
 
 That means the creation and self-healing loops are no longer judged only on artifact quality. They are judged on the runtime quality of the skills they produced or modified.
 

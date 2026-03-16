@@ -623,7 +623,11 @@ pub fn handle_skill_doctor(
         let skill_name = entries
             .last()
             .map(|entry| entry.skill_name.clone())
-            .or_else(|| feedback_entries.last().map(|entry| entry.skill_name.clone()))
+            .or_else(|| {
+                feedback_entries
+                    .last()
+                    .map(|entry| entry.skill_name.clone())
+            })
             .unwrap_or_else(|| skill_id.clone());
         skills.push(build_skill_health_report(
             &skill_id,
@@ -943,8 +947,10 @@ fn build_skill_producer_report(
         .count();
     let unobserved_descendant_skill_count =
         descendant_skill_count - observed_descendant_skill_count;
-    let orphaned_descendant_skill_count =
-        descendants.iter().filter(|descendant| descendant.orphaned).count();
+    let orphaned_descendant_skill_count = descendants
+        .iter()
+        .filter(|descendant| descendant.orphaned)
+        .count();
     let mut effective_descendant_skill_count = 0usize;
     let mut pending_descendant_skill_count = 0usize;
     let mut needs_amendment_descendant_skill_count = 0usize;
@@ -2158,7 +2164,8 @@ fn append_jsonl_records<T: Serialize>(path: &Path, records: &[T]) -> Result<()> 
 }
 
 fn load_observations(cwd: &Path) -> Result<Vec<SkillObservation>> {
-    let mut entries: Vec<SkillObservation> = load_jsonl_records(&skill_observation_ledger_path(cwd))?;
+    let mut entries: Vec<SkillObservation> =
+        load_jsonl_records(&skill_observation_ledger_path(cwd))?;
     for entry in &mut entries {
         entry.skill_id = normalize_record_skill_id(&entry.skill_id, &entry.skill_path);
     }
@@ -2203,16 +2210,21 @@ fn load_jsonl_records<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
         .map_err(|err| Error::config(format!("failed to open {}: {err}", path.display())))?;
     let reader = BufReader::new(file);
     let mut records = Vec::new();
-    for line in reader.lines() {
+    for (index, line) in reader.lines().enumerate() {
         let line =
             line.map_err(|err| Error::config(format!("failed to read {}: {err}", path.display())))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(record) = serde_json::from_str::<T>(trimmed) {
-            records.push(record);
-        }
+        let record = serde_json::from_str::<T>(trimmed).map_err(|err| {
+            Error::session(format!(
+                "failed to parse {} line {}: {err}",
+                path.display(),
+                index + 1
+            ))
+        })?;
+        records.push(record);
     }
     Ok(records)
 }
@@ -4053,10 +4065,27 @@ mod tests {
         assert_eq!(producer.descendant_skill_count, 1);
         assert_eq!(producer.observed_descendant_skill_count, 1);
         assert_eq!(producer.orphaned_descendant_skill_count, 1);
-        assert!(producer
-            .evidence
-            .iter()
-            .any(|entry| entry.contains("release-notes (release-notes-id)")));
+        assert!(
+            producer
+                .evidence
+                .iter()
+                .any(|entry| entry.contains("release-notes (release-notes-id)"))
+        );
+    }
+
+    #[test]
+    fn doctor_fails_loudly_on_malformed_observation_ledger() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".pi")).expect("create pi dir");
+        fs::write(
+            skill_observation_ledger_path(dir.path()),
+            "{\"broken\": true\n",
+        )
+        .expect("write malformed ledger");
+
+        let error = handle_skill_doctor(dir.path(), SkillDoctorFormat::Json, false)
+            .expect_err("doctor should fail on malformed ledger");
+        assert!(error.to_string().contains("failed to parse"));
     }
 
     #[test]
