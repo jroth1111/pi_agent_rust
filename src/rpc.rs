@@ -1513,10 +1513,6 @@ fn recompute_runtime_task_counts(snapshot: &mut RunSnapshot) {
     snapshot.summary.task_counts = task_counts;
 }
 
-fn load_runtime_snapshot(runtime_store: &RuntimeStore, run_id: &str) -> Option<RunSnapshot> {
-    runtime_store.load_snapshot(run_id).ok()
-}
-
 fn runtime_model_selector(
     entry: &ModelEntry,
     thinking_level: Option<crate::model::ThinkingLevel>,
@@ -3069,14 +3065,6 @@ fn captured_dispatches_overlap(captures: &[CapturedDispatchExecution]) -> bool {
     false
 }
 
-async fn current_run_snapshot(
-    _cx: &AgentCx,
-    runtime_store: &RuntimeStore,
-    run_id: &str,
-) -> Result<RunSnapshot> {
-    runtime_store.load_snapshot(run_id)
-}
-
 async fn finalize_captured_dispatch_execution(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -3188,7 +3176,7 @@ async fn finalize_captured_dispatch_execution(
         return Err(err);
     }
 
-    current_run_snapshot(cx, runtime_store, run_id).await
+    runtime_store.load_snapshot(run_id)
 }
 
 #[allow(dead_code)]
@@ -3403,7 +3391,7 @@ async fn execute_dispatch_grants_with_worker(
                     .await?
                 }
             } else {
-                current_run_snapshot(cx, runtime_store, &run.spec.run_id).await?
+                runtime_store.load_snapshot(&run.spec.run_id)?
             };
             return Ok(updated_run);
         }
@@ -3572,7 +3560,7 @@ async fn dispatch_run_until_quiescent(
         {
             Ok(updated_run) => updated_run,
             Err(err) if grants.len() == 1 => {
-                let recovered_run = current_run_snapshot(cx, runtime_store, &run_id).await?;
+                let recovered_run = runtime_store.load_snapshot(&run_id)?;
                 if matches!(
                     recovered_run.phase,
                     RunPhase::Dispatching | RunPhase::Running
@@ -4612,7 +4600,7 @@ pub async fn run(
                         }
                     };
 
-                if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
+                if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
                     let _ = out_tx.send(response_ok(
                         id,
                         "orchestration.get_run",
@@ -4640,7 +4628,7 @@ pub async fn run(
                         }
                     };
 
-                let run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
+                let run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
                     run
                 } else {
                     let err =
@@ -4726,7 +4714,7 @@ pub async fn run(
                     .unwrap_or("run");
                 let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
 
-                let run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id) {
+                let run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
                     run
                 } else {
                     let err =
@@ -4806,8 +4794,7 @@ pub async fn run(
                         }
                     };
 
-                let mut run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id)
-                {
+                let mut run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
                     run
                 } else {
                     let err =
@@ -4881,8 +4868,7 @@ pub async fn run(
                         }
                     };
 
-                let mut run = if let Some(run) = load_runtime_snapshot(&runtime_store, &req.run_id)
-                {
+                let mut run = if let Ok(run) = runtime_store.load_snapshot(&req.run_id) {
                     run
                 } else {
                     let err =
@@ -9548,8 +9534,8 @@ mod tests {
             .expect_err("worker failure should surface");
             assert!(err.to_string().contains("fixture worker exploded"));
 
-            let run = current_run_snapshot(&cx, &runtime_store, "run-inline-worker-fail")
-                .await
+            let run = runtime_store
+                .load_snapshot("run-inline-worker-fail")
                 .expect("load updated run");
             let report = run
                 .dispatch
@@ -9882,8 +9868,8 @@ mod tests {
             assert!(lib_contents.contains("task_partial_a"));
             assert!(!extra_contents.contains("task_partial_b"));
 
-            let updated_run = current_run_snapshot(&cx, &runtime_store, "run-partial-wave")
-                .await
+            let updated_run = runtime_store
+                .load_snapshot("run-partial-wave")
                 .expect("load updated run");
             assert_eq!(updated_run.phase, RunPhase::Recovering);
             assert_eq!(
@@ -10207,8 +10193,8 @@ mod tests {
             .await
             .expect("execute first wave");
 
-            let mut run = current_run_snapshot(&cx, &runtime_store, "run-chain-wave")
-                .await
+            let mut run = runtime_store
+                .load_snapshot("run-chain-wave")
                 .expect("load updated run");
             let second_grants = {
                 let mut rel = reliability_state.lock(&cx).await.expect("lock reliability");
