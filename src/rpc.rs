@@ -30,7 +30,9 @@ use crate::orchestration::{
     TaskReport, WaveStatus,
 };
 use crate::provider::Provider;
-use crate::provider_metadata::{canonical_provider_id, provider_metadata};
+use crate::provider_metadata::{
+    canonical_provider_id, provider_metadata, provider_routing_defaults,
+};
 use crate::providers;
 use crate::reliability;
 use crate::reliability::ArtifactStore;
@@ -98,11 +100,6 @@ pub struct RpcScopedModel {
     pub model: ModelEntry,
     pub thinking_level: Option<crate::model::ThinkingLevel>,
 }
-
-pub type EvidenceRecord = reliability::EvidenceRecord;
-pub type ClosePayload = reliability::ClosePayload;
-pub type StateDigest = reliability::StateDigest;
-pub type ArtifactQuery = reliability::ArtifactQuery;
 
 const fn default_prerequisite_trigger() -> reliability::EdgeTrigger {
     reliability::EdgeTrigger::OnSuccess
@@ -207,7 +204,7 @@ struct SubmitTaskRequest {
     #[serde(default)]
     pub symbol_drift_violations: Vec<String>,
     #[serde(default)]
-    pub close: Option<ClosePayload>,
+    pub close: Option<reliability::ClosePayload>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,15 +212,8 @@ struct SubmitTaskRequest {
 struct SubmitTaskResponse {
     task_id: String,
     state: String,
-    close_payload: ClosePayload,
+    close_payload: reliability::ClosePayload,
     close: reliability::CloseResult,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StateDigestRequest {
-    #[serde(default)]
-    task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,8 +264,8 @@ struct RpcReliabilityState {
     max_touched_files: u16,
     allow_open_ended_defer: bool,
     tasks: HashMap<String, reliability::TaskNode>,
-    evidence_by_task: HashMap<String, Vec<EvidenceRecord>>,
-    latest_digest_by_task: HashMap<String, StateDigest>,
+    evidence_by_task: HashMap<String, Vec<reliability::EvidenceRecord>>,
+    latest_digest_by_task: HashMap<String, reliability::StateDigest>,
     edges: Vec<reliability::ReliabilityEdge>,
     symbol_drift_required_by_task: HashMap<String, bool>,
     parent_goal_trace_by_task: HashMap<String, String>,
@@ -395,7 +385,7 @@ impl RpcReliabilityState {
     fn validate_close_trace_chain(
         &self,
         task_id: &str,
-        close_payload: &ClosePayload,
+        close_payload: &reliability::ClosePayload,
     ) -> Result<()> {
         let trace_parent = close_payload
             .trace_parent
@@ -811,7 +801,10 @@ impl RpcReliabilityState {
         Ok(())
     }
 
-    fn append_evidence(&mut self, req: AppendEvidenceRequest) -> Result<EvidenceRecord> {
+    fn append_evidence(
+        &mut self,
+        req: AppendEvidenceRequest,
+    ) -> Result<reliability::EvidenceRecord> {
         self.ensure_enabled()?;
 
         let mut artifact_ids = req.artifact_ids;
@@ -830,7 +823,7 @@ impl RpcReliabilityState {
             artifact_ids.push(id);
         }
 
-        let evidence = EvidenceRecord::from_command_output_with_env(
+        let evidence = reliability::EvidenceRecord::from_command_output_with_env(
             req.task_id.clone(),
             req.command,
             req.exit_code,
@@ -867,7 +860,7 @@ impl RpcReliabilityState {
             .get(&task_id)
             .cloned()
             .unwrap_or_default();
-        let has_pass = evidence.iter().any(EvidenceRecord::is_success);
+        let has_pass = evidence.iter().any(reliability::EvidenceRecord::is_success);
         let verify_passed = verify_passed.unwrap_or(has_pass);
         let mode_blocks = self.mode_blocks();
         let lease_id_for_release = lease_id.clone();
@@ -988,7 +981,7 @@ impl RpcReliabilityState {
         }
 
         let strict_close_trace_chain = mode_blocks && (verify_passed || close.is_some());
-        let mut close_payload = close.unwrap_or_else(|| ClosePayload {
+        let mut close_payload = close.unwrap_or_else(|| reliability::ClosePayload {
             task_id: task_id.clone(),
             outcome: "submitted via rpc".to_string(),
             outcome_kind: Some(reliability::CloseOutcomeKind::Success),
@@ -1137,7 +1130,7 @@ impl RpcReliabilityState {
         Ok(Self::state_label(&task.runtime.state).to_string())
     }
 
-    fn query_artifact(&self, query: ArtifactQuery) -> Result<Vec<String>> {
+    fn query_artifact(&self, query: reliability::ArtifactQuery) -> Result<Vec<String>> {
         self.ensure_enabled()?;
         self.artifacts
             .list(&query)
@@ -1157,7 +1150,7 @@ impl RpcReliabilityState {
         self.tasks.keys().next().cloned()
     }
 
-    fn get_state_digest(&mut self, task_id: &str) -> Result<StateDigest> {
+    fn get_state_digest(&mut self, task_id: &str) -> Result<reliability::StateDigest> {
         self.ensure_enabled()?;
         self.refresh_dependency_states();
         let Some(task) = self.tasks.get(task_id) else {
@@ -1166,7 +1159,7 @@ impl RpcReliabilityState {
             )));
         };
 
-        let mut digest = StateDigest::new(
+        let mut digest = reliability::StateDigest::new(
             task.spec.objective.clone(),
             Self::state_label(&task.runtime.state),
         );
@@ -1278,20 +1271,6 @@ fn normalize_command_type(command_type: &str) -> &str {
         "set-follow-up-mode" | "setFollowUpMode" => "set_follow_up_mode",
         "set-auto-compaction" | "setAutoCompaction" => "set_auto_compaction",
         "set-auto-retry" | "setAutoRetry" => "set_auto_retry",
-        "reliability.requestDispatch" | "reliability_request_dispatch" => {
-            "reliability.request_dispatch"
-        }
-        "reliability.appendEvidence" | "reliability_append_evidence" => {
-            "reliability.append_evidence"
-        }
-        "reliability.submitTask" | "reliability_submit_task" => "reliability.submit_task",
-        "reliability.resolveBlocker" | "reliability_resolve_blocker" => {
-            "reliability.resolve_blocker"
-        }
-        "reliability.queryArtifact" | "reliability_query_artifact" => "reliability.query_artifact",
-        "reliability.getStateDigest" | "reliability_get_state_digest" => {
-            "reliability.get_state_digest"
-        }
         _ => command_type,
     }
 }
@@ -1504,6 +1483,10 @@ async fn runtime_model_profile_for_run(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        let provider_entry = runtime_provider_model_entry(
+            guard.agent.provider().name(),
+            guard.agent.provider().model_id(),
+        );
         let inner_session = guard
             .session
             .lock(cx)
@@ -1514,7 +1497,10 @@ async fn runtime_model_profile_for_run(
             .thinking_level
             .as_deref()
             .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
-        (runtime_selected_model_entry(&inner_session, options), thinking)
+        (
+            runtime_selected_model_entry(&inner_session, options).or(provider_entry),
+            thinking,
+        )
     };
 
     let default_entry = current_entry
@@ -1577,7 +1563,61 @@ fn runtime_selected_model_entry(
     current_model_entry(session, options).cloned().or_else(|| {
         let provider = session.header.provider.as_deref()?;
         let model_id = session.header.model_id.as_deref()?;
-        crate::models::ad_hoc_model_entry(provider, model_id)
+        runtime_provider_model_entry(provider, model_id)
+    })
+}
+
+fn runtime_provider_model_entry(provider: &str, model_id: &str) -> Option<ModelEntry> {
+    let provider = provider.trim();
+    let model_id = model_id.trim();
+    if provider.is_empty() || model_id.is_empty() {
+        return None;
+    }
+
+    if let Some(entry) = crate::models::ad_hoc_model_entry(provider, model_id) {
+        return Some(entry);
+    }
+
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    let defaults = provider_routing_defaults(canonical_provider);
+    let display_name = provider_metadata(canonical_provider)
+        .and_then(|metadata| metadata.display_name)
+        .unwrap_or(canonical_provider);
+
+    Some(ModelEntry {
+        model: crate::provider::Model {
+            id: model_id.to_string(),
+            name: format!("{display_name} {model_id}"),
+            api: defaults
+                .map(|routing| routing.api)
+                .unwrap_or("unknown")
+                .to_string(),
+            provider: canonical_provider.to_string(),
+            base_url: defaults
+                .map(|routing| routing.base_url)
+                .unwrap_or_default()
+                .to_string(),
+            reasoning: defaults.map(|routing| routing.reasoning).unwrap_or(true),
+            input: defaults
+                .map(|routing| routing.input.to_vec())
+                .unwrap_or_else(|| vec![crate::provider::InputType::Text]),
+            cost: crate::provider::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: defaults
+                .map(|routing| routing.context_window)
+                .unwrap_or(128_000),
+            max_tokens: defaults.map(|routing| routing.max_tokens).unwrap_or(16_384),
+            headers: HashMap::new(),
+        },
+        api_key: None,
+        headers: HashMap::new(),
+        auth_header: defaults.map(|routing| routing.auth_header).unwrap_or(false),
+        compat: None,
+        oauth_config: None,
     })
 }
 
@@ -3090,7 +3130,7 @@ async fn append_evidence_record(
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     req: AppendEvidenceRequest,
-) -> Result<EvidenceRecord> {
+) -> Result<reliability::EvidenceRecord> {
     let evidence = {
         let mut rel = reliability_state
             .lock(cx)
@@ -3420,18 +3460,21 @@ async fn finalize_captured_dispatch_execution(
     }
 
     let trimmed_summary = capture.summary.trim();
-    let close = capture.verification.passed.then(|| ClosePayload {
-        task_id: capture.contract.task_id.clone(),
-        outcome: if trimmed_summary.is_empty() {
-            format!("Completed {}", capture.contract.objective)
-        } else {
-            trimmed_summary.to_string()
-        },
-        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
-        acceptance_ids: capture.contract.acceptance_ids.clone(),
-        evidence_ids: vec![evidence.evidence_id.clone()],
-        trace_parent: capture.contract.parent_goal_trace_id.clone(),
-    });
+    let close = capture
+        .verification
+        .passed
+        .then(|| reliability::ClosePayload {
+            task_id: capture.contract.task_id.clone(),
+            outcome: if trimmed_summary.is_empty() {
+                format!("Completed {}", capture.contract.objective)
+            } else {
+                trimmed_summary.to_string()
+            },
+            outcome_kind: Some(reliability::CloseOutcomeKind::Success),
+            acceptance_ids: capture.contract.acceptance_ids.clone(),
+            evidence_ids: vec![evidence.evidence_id.clone()],
+            trace_parent: capture.contract.parent_goal_trace_id.clone(),
+        });
     if let Err(err) = submit_task_and_sync(
         cx,
         session,
@@ -5328,491 +5371,6 @@ pub async fn run(
                     id,
                     "orchestration.resume_run",
                     Some(json!({ "run": run })),
-                ));
-            }
-
-            "reliability.request_dispatch" => {
-                let payload = command_payload(&parsed);
-                let contract = payload
-                    .get("contract")
-                    .cloned()
-                    .unwrap_or_else(|| payload.clone());
-                let contract: TaskContract = match serde_json::from_value(contract) {
-                    Ok(contract) => contract,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "reliability.request_dispatch",
-                            format!("Invalid contract payload: {err}"),
-                        ));
-                        continue;
-                    }
-                };
-                let agent_id = payload
-                    .get("agentId")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("rpc");
-                let lease_ttl_sec = payload
-                    .get("leaseTtlSec")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(3600);
-
-                let grant = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.request_dispatch(&contract, agent_id, lease_ttl_sec)
-                };
-                let grant = match grant {
-                    Ok(grant) => grant,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.request_dispatch",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_task_created_entry(
-                            contract.task_id.clone(),
-                            contract.objective,
-                            Some(agent_id.to_string()),
-                        );
-                        inner_session.append_task_transition_entry(
-                            contract.task_id,
-                            None,
-                            grant.state.clone(),
-                            Some(json!({
-                                "leaseId": grant.lease_id,
-                                "fenceToken": grant.fence_token,
-                            })),
-                        );
-                    }
-                    guard.persist_session().await?;
-                }
-
-                if let Err(err) = sync_task_runs(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &runtime_store,
-                    &grant.task_id,
-                    None,
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "reliability.request_dispatch",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.request_dispatch",
-                    Some(json!({ "grant": grant })),
-                ));
-            }
-
-            "reliability.append_evidence" => {
-                let req: AppendEvidenceRequest =
-                    match parse_command_payload(&parsed, "reliability.append_evidence") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.append_evidence",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let evidence = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.append_evidence(req)
-                };
-                let evidence = match evidence {
-                    Ok(evidence) => evidence,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.append_evidence",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_verification_evidence_entry(evidence.clone());
-                    }
-                    guard.persist_session().await?;
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.append_evidence",
-                    Some(json!({ "evidence": evidence })),
-                ));
-            }
-
-            "reliability.submit_task" => {
-                let req: SubmitTaskRequest =
-                    match parse_command_payload(&parsed, "reliability.submit_task") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.submit_task",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let req_for_report = req.clone();
-                let result = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.submit_task(req)
-                };
-                let result = match result {
-                    Ok(result) => result,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.submit_task",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_close_decision_entry(
-                            result.close_payload.clone(),
-                            result.close.clone(),
-                        );
-                        inner_session.append_task_transition_entry(
-                            result.task_id.clone(),
-                            None,
-                            result.state.clone(),
-                            None,
-                        );
-                    }
-                    guard.persist_session().await?;
-                }
-
-                let report = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    build_submit_task_report(&rel, &req_for_report, &result)
-                };
-                let report = match report {
-                    Ok(report) => report,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.submit_task",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                if let Err(err) = sync_task_runs(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &runtime_store,
-                    &result.task_id,
-                    Some(report),
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "reliability.submit_task",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.submit_task",
-                    Some(json!({ "result": result })),
-                ));
-            }
-
-            "reliability.resolve_blocker" => {
-                let report: BlockerReport =
-                    match parse_command_payload(&parsed, "reliability.resolve_blocker") {
-                        Ok(report) => report,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.resolve_blocker",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let task_id_for_note = report.task_id.clone();
-                let raised = !report.resolved;
-                let state = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.resolve_blocker(report)
-                };
-                let state = match state {
-                    Ok(state) => state,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.resolve_blocker",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        if raised {
-                            inner_session.append_human_blocker_raised_entry(
-                                task_id_for_note.clone(),
-                                "raised via rpc.resolve_blocker".to_string(),
-                                format!("state={state}"),
-                            );
-                        } else {
-                            inner_session.append_human_blocker_resolved_entry(
-                                task_id_for_note.clone(),
-                                format!("state={state}"),
-                            );
-                        }
-                    }
-                    guard.persist_session().await?;
-                }
-
-                let report = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    let summary = if raised {
-                        format!("Human blocker raised: state={state}")
-                    } else {
-                        format!("Blocker resolved: state={state}")
-                    };
-                    build_runtime_task_report(&rel, &task_id_for_note, summary)
-                };
-                if let Err(err) = sync_task_runs(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &runtime_store,
-                    &task_id_for_note,
-                    report,
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "reliability.resolve_blocker",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.resolve_blocker",
-                    Some(json!({ "state": state })),
-                ));
-            }
-
-            "reliability.query_artifact" => {
-                let payload = command_payload(&parsed);
-                if let Some(artifact_id) = payload.get("artifactId").and_then(Value::as_str) {
-                    let content = {
-                        let rel = reliability_state.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("reliability lock failed: {err}"))
-                        })?;
-                        rel.load_artifact_text(artifact_id)
-                    };
-                    match content {
-                        Ok(content) => {
-                            let _ = out_tx.send(response_ok(
-                                id,
-                                "reliability.query_artifact",
-                                Some(json!({
-                                    "artifactId": artifact_id,
-                                    "content": content,
-                                })),
-                            ));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.query_artifact",
-                                &err,
-                            ));
-                        }
-                    }
-                    continue;
-                }
-
-                let query: ArtifactQuery =
-                    match parse_command_payload(&parsed, "reliability.query_artifact") {
-                        Ok(query) => query,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.query_artifact",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let ids = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.query_artifact(query)
-                };
-                match ids {
-                    Ok(ids) => {
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "reliability.query_artifact",
-                            Some(json!({ "artifactIds": ids })),
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.query_artifact",
-                            &err,
-                        ));
-                    }
-                }
-            }
-
-            "reliability.get_state_digest" => {
-                let req: StateDigestRequest =
-                    match parse_command_payload(&parsed, "reliability.get_state_digest") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.get_state_digest",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let digest = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    let task_id = if let Some(task_id) = req.task_id.clone() {
-                        task_id
-                    } else if let Some(task_id) = rel.first_task_id() {
-                        task_id
-                    } else {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "reliability.get_state_digest",
-                            "No reliability tasks available".to_string(),
-                        ));
-                        continue;
-                    };
-                    rel.get_state_digest(&task_id)
-                };
-                let digest = match digest {
-                    Ok(digest) => digest,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.get_state_digest",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_state_digest_entry(digest.clone());
-                    }
-                    guard.persist_session().await?;
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.get_state_digest",
-                    Some(json!({ "digest": digest })),
                 ));
             }
 
@@ -8866,6 +8424,7 @@ mod tests {
         ThinkingLevel, Usage, UserContent, UserMessage,
     };
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
+    use crate::reliability::ClosePayload;
     use crate::session::Session;
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;
@@ -13332,6 +12891,17 @@ mod tests {
             runtime_selected_model_entry(&session, &options).expect("resolve ad hoc model");
         assert_eq!(resolved.model.provider, "openai");
         assert_eq!(resolved.model.id, "gpt-4.1");
+    }
+
+    #[test]
+    fn runtime_provider_model_entry_synthesizes_unknown_provider_metadata() {
+        let resolved =
+            runtime_provider_model_entry("test-provider", "test-model").expect("synthetic model");
+        assert_eq!(resolved.model.provider, "test-provider");
+        assert_eq!(resolved.model.id, "test-model");
+        assert_eq!(resolved.model.api, "unknown");
+        assert_eq!(resolved.model.input, vec![crate::provider::InputType::Text]);
+        assert!(resolved.model.reasoning);
     }
 
     fn sample_start_run_request() -> StartRunRequest {

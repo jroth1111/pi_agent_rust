@@ -863,7 +863,6 @@ fn rpc_orchestration_dispatch_run_executes_inline_run() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
         assert_eq!(run_phase(&start), "planning");
         let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
         assert_ok(&accept, "orchestration.accept_plan");
@@ -961,7 +960,6 @@ fn rpc_orchestration_dispatch_run_applies_created_file_changes() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
         assert_eq!(run_phase(&start), "planning");
         let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
         assert_ok(&accept, "orchestration.accept_plan");
@@ -1302,7 +1300,6 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
         assert_eq!(run_phase(&start), "planning");
         let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
         assert_ok(&accept, "orchestration.accept_plan");
@@ -1367,122 +1364,8 @@ fn rpc_orchestration_resume_reruns_failed_run_verification() {
 }
 
 #[test]
-fn rpc_orchestration_resume_run_redispatches_due_recoverable_task() {
-    let harness =
-        TestHarness::new("rpc_orchestration_resume_run_redispatches_due_recoverable_task");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .build()
-        .expect("build test runtime");
-    let handle = runtime.handle();
-    let run_id = format!("run-e2e-recoverable-{}", uuid::Uuid::new_v4().simple());
-    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-recoverable");
-
-    runtime.block_on(async move {
-        let _repo_guard = repo_guard;
-        let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
-        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
-        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
-        let out_rx = Arc::new(Mutex::new(out_rx));
-
-        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-        let task_contract = json!({
-            "taskId": "task-e2e-recoverable",
-            "objective": "Complete recoverable task after defer",
-            "verifyCommand": "true",
-            "inputSnapshot": head,
-            "acceptanceIds": ["ac-recoverable"],
-            "plannedTouches": ["Cargo.toml"]
-        });
-
-        let start_cmd = json!({
-            "id": "1",
-            "type": "orchestration.start_run",
-            "runId": run_id,
-            "objective": "Exercise orchestration recoverable resume",
-            "tasks": [task_contract.clone()],
-            "runVerifyCommand": "true"
-        })
-        .to_string();
-        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
-        assert_ok(&start, "orchestration.start_run");
-        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
-        assert_eq!(run_phase(&start), "planning");
-        let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
-        assert_ok(&accept, "orchestration.accept_plan");
-        assert_eq!(run_phase(&accept), "dispatching");
-
-        let request_dispatch_cmd = json!({
-            "id": "2",
-            "type": "reliability.request_dispatch",
-            "contract": task_contract,
-            "agentId": "manual-recoverable",
-            "leaseTtlSec": 120
-        })
-        .to_string();
-        let dispatch = send_recv(
-            &in_tx,
-            &out_rx,
-            &request_dispatch_cmd,
-            "reliability.request_dispatch",
-        )
-        .await;
-        assert_ok(&dispatch, "reliability.request_dispatch");
-
-        let defer_until = chrono::Utc::now() + chrono::Duration::milliseconds(250);
-        let resolve_blocker_cmd = json!({
-            "id": "3",
-            "type": "reliability.resolve_blocker",
-            "taskId": "task-e2e-recoverable",
-            "leaseId": dispatch["data"]["grant"]["leaseId"],
-            "fenceToken": dispatch["data"]["grant"]["fenceToken"],
-            "reason": "defer",
-            "context": "retry after a short delay",
-            "deferTrigger": {
-                "trigger": "until",
-                "until": defer_until.to_rfc3339()
-            },
-            "resolved": false
-        })
-        .to_string();
-        let blocked = send_recv(
-            &in_tx,
-            &out_rx,
-            &resolve_blocker_cmd,
-            "reliability.resolve_blocker",
-        )
-        .await;
-        assert_ok(&blocked, "reliability.resolve_blocker");
-        assert_eq!(blocked["data"]["state"], "recoverable");
-
-        std::thread::sleep(Duration::from_millis(350));
-
-        let resume_cmd = json!({
-            "id": "4",
-            "type": "orchestration.resume_run",
-            "runId": run_id
-        })
-        .to_string();
-        let resumed = send_recv(&in_tx, &out_rx, &resume_cmd, "orchestration.resume_run").await;
-        assert_ok(&resumed, "orchestration.resume_run");
-        assert_eq!(run_phase(&resumed), "completed");
-        assert_eq!(
-            run_dispatch(&resumed)["taskReports"]["task-e2e-recoverable"]["verifyExitCode"],
-            0
-        );
-
-        drop(in_tx);
-        let result = server.await;
-        assert!(result.is_ok(), "rpc server error: {result:?}");
-    });
-}
-
-#[test]
-fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
-    let harness = TestHarness::new(
-        "rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports",
-    );
+fn rpc_orchestration_cancel_run_from_dispatching_phase() {
+    let harness = TestHarness::new("rpc_orchestration_cancel_run_from_dispatching_phase");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("build test runtime");
@@ -1520,32 +1403,13 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         .to_string();
         let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
         assert_ok(&start, "orchestration.start_run");
-        assert_eq!(run_dispatch(&start)["selectedTier"], "inline");
         assert_eq!(run_phase(&start), "planning");
         let accept = accept_orchestration_plan(&in_tx, &out_rx, &run_id).await;
         assert_ok(&accept, "orchestration.accept_plan");
         assert_eq!(run_phase(&accept), "dispatching");
 
-        let request_dispatch_cmd = json!({
-            "id": "2",
-            "type": "reliability.request_dispatch",
-            "contract": task_contract,
-            "agentId": "manual-cancel",
-            "leaseTtlSec": 120
-        })
-        .to_string();
-        let dispatch = send_recv(
-            &in_tx,
-            &out_rx,
-            &request_dispatch_cmd,
-            "reliability.request_dispatch",
-        )
-        .await;
-        assert_ok(&dispatch, "reliability.request_dispatch");
-        assert_eq!(dispatch["data"]["grant"]["state"], "leased");
-
         let cancel_cmd = json!({
-            "id": "3",
+            "id": "2",
             "type": "orchestration.cancel_run",
             "runId": run_id
         })
@@ -1554,14 +1418,9 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         assert_ok(&canceled, "orchestration.cancel_run");
         assert_eq!(run_phase(&canceled), "canceled");
         assert!(run_dispatch(&canceled)["activeWave"].is_null());
-        assert!(
-            run_dispatch(&canceled)["taskReports"]["task-e2e-cancel"]["summary"]
-                .as_str()
-                .is_some_and(|summary| summary.contains("canceled dispatch"))
-        );
 
         let get_cmd = json!({
-            "id": "4",
+            "id": "3",
             "type": "orchestration.get_run",
             "runId": run_id
         })
@@ -1570,11 +1429,6 @@ fn rpc_orchestration_cancel_run_revokes_live_dispatch_and_refreshes_reports() {
         assert_ok(&fetched, "orchestration.get_run");
         assert_eq!(run_phase(&fetched), "canceled");
         assert!(run_dispatch(&fetched)["activeWave"].is_null());
-        assert!(
-            run_dispatch(&fetched)["taskReports"]["task-e2e-cancel"]["summary"]
-                .as_str()
-                .is_some_and(|summary| summary.contains("canceled dispatch"))
-        );
 
         drop(in_tx);
         let result = server.await;
@@ -1780,20 +1634,15 @@ fn rpc_orchestration_dispatch_run_salvages_parallel_wave_progress() {
 }
 
 #[test]
-fn rpc_orchestration_dispatch_run_waits_for_due_recoverable_task() {
-    let harness = TestHarness::new("rpc_orchestration_dispatch_run_waits_for_due_recoverable_task");
+fn rpc_rejects_legacy_reliability_rpc_commands() {
+    let harness = TestHarness::new("rpc_rejects_legacy_reliability_rpc_commands");
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("build test runtime");
     let handle = runtime.handle();
-    let run_id = format!(
-        "run-e2e-dispatch-recoverable-{}",
-        uuid::Uuid::new_v4().simple()
-    );
-    let (repo_guard, repo_path, head) = setup_inline_repo("pi-e2e-dispatch-recoverable");
+    let (_repo_guard, repo_path, _head) = setup_inline_repo("pi-e2e-reject-legacy-reliability");
 
     runtime.block_on(async move {
-        let _repo_guard = repo_guard;
         let agent_session = build_noop_agent_session(Session::in_memory(), &repo_path);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -1802,86 +1651,22 @@ fn rpc_orchestration_dispatch_run_waits_for_due_recoverable_task() {
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
 
-        let task_contract = json!({
-            "taskId": "task-e2e-dispatch-recoverable",
-            "objective": "Complete deferred task inside dispatch_run",
-            "verifyCommand": "true",
-            "inputSnapshot": head,
-            "acceptanceIds": ["ac-dispatch-recoverable"],
-            "plannedTouches": ["Cargo.toml"]
-        });
-
-        let start_cmd = json!({
+        let cmd = json!({
             "id": "1",
-            "type": "orchestration.start_run",
-            "runId": run_id,
-            "objective": "Exercise orchestration deferred dispatch automation",
-            "tasks": [task_contract.clone()],
-            "runVerifyCommand": "true"
-        })
-        .to_string();
-        let start = send_recv(&in_tx, &out_rx, &start_cmd, "orchestration.start_run").await;
-        assert_ok(&start, "orchestration.start_run");
-
-        let request_dispatch_cmd = json!({
-            "id": "2",
             "type": "reliability.request_dispatch",
-            "contract": task_contract,
-            "agentId": "manual-dispatch-recoverable",
-            "leaseTtlSec": 120
+            "contract": {
+                "taskId": "task-legacy",
+                "objective": "Should be rejected"
+            }
         })
         .to_string();
-        let dispatch = send_recv(
-            &in_tx,
-            &out_rx,
-            &request_dispatch_cmd,
-            "reliability.request_dispatch",
-        )
-        .await;
-        assert_ok(&dispatch, "reliability.request_dispatch");
-
-        let defer_until = chrono::Utc::now() + chrono::Duration::milliseconds(250);
-        let resolve_blocker_cmd = json!({
-            "id": "3",
-            "type": "reliability.resolve_blocker",
-            "taskId": "task-e2e-dispatch-recoverable",
-            "leaseId": dispatch["data"]["grant"]["leaseId"],
-            "fenceToken": dispatch["data"]["grant"]["fenceToken"],
-            "reason": "defer",
-            "context": "dispatch_run should wait through this retry window",
-            "deferTrigger": {
-                "trigger": "until",
-                "until": defer_until.to_rfc3339()
-            },
-            "resolved": false
-        })
-        .to_string();
-        let blocked = send_recv(
-            &in_tx,
-            &out_rx,
-            &resolve_blocker_cmd,
-            "reliability.resolve_blocker",
-        )
-        .await;
-        assert_ok(&blocked, "reliability.resolve_blocker");
-        assert_eq!(blocked["data"]["state"], "recoverable");
-
-        let dispatch_run_cmd = json!({
-            "id": "4",
-            "type": "orchestration.dispatch_run",
-            "runId": run_id,
-            "agentIdPrefix": "worker",
-            "leaseTtlSec": 120
-        })
-        .to_string();
-        let dispatch_run =
-            send_recv(&in_tx, &out_rx, &dispatch_run_cmd, "orchestration.dispatch_run").await;
-        assert_ok(&dispatch_run, "orchestration.dispatch_run");
-        assert_eq!(run_phase(&dispatch_run), "completed");
-        assert_eq!(
-            run_dispatch(&dispatch_run)["taskReports"]["task-e2e-dispatch-recoverable"]
-                ["verifyExitCode"],
-            0
+        let resp = send_recv(&in_tx, &out_rx, &cmd, "reliability.request_dispatch").await;
+        assert_err(&resp, "reliability.request_dispatch");
+        assert!(
+            resp["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Unknown command")),
+            "unexpected error payload: {resp}"
         );
 
         drop(in_tx);
