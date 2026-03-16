@@ -1,9 +1,12 @@
 use crate::runtime::events::RuntimeEventKind;
 use crate::runtime::types::{
-    ApprovalState, ContinuationReason, LeaseRecord, RunPhase, RunSnapshot, TaskNode, TaskState,
+    ApprovalState, ContinuationReason, ExecutionTier, LeaseRecord, RunPhase, RunSnapshot,
+    SubrunPlan, TaskNode, TaskState, WaveStatus,
 };
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+const MAX_HIERARCHICAL_SUBRUN_TASKS: usize = 12;
 
 pub fn maintenance_events(snapshot: &RunSnapshot, now: DateTime<Utc>) -> Vec<RuntimeEventKind> {
     let mut task_ids = snapshot.tasks.keys().cloned().collect::<Vec<_>>();
@@ -226,6 +229,239 @@ pub fn rebuild_ready_queue(snapshot: &mut RunSnapshot) {
     snapshot.ready_queue = scheduled.into();
 }
 
+pub fn next_active_wave(
+    existing: Option<WaveStatus>,
+    mut active_task_ids: Vec<String>,
+) -> Option<WaveStatus> {
+    active_task_ids.sort();
+    active_task_ids.dedup();
+    if active_task_ids.is_empty() {
+        return None;
+    }
+
+    let now = Utc::now();
+    if let Some(existing) = existing {
+        let mut existing_task_ids = existing.task_ids.clone();
+        existing_task_ids.sort();
+        existing_task_ids.dedup();
+        if existing.completed_at.is_none() && existing_task_ids == active_task_ids {
+            return Some(existing);
+        }
+    }
+
+    Some(WaveStatus {
+        wave_id: format!("wave-{}", now.timestamp_millis()),
+        task_ids: active_task_ids,
+        started_at: now,
+        completed_at: None,
+    })
+}
+
+pub fn execution_tier(snapshot: &RunSnapshot) -> ExecutionTier {
+    if snapshot.dispatch.selected_tier != ExecutionTier::Inline || snapshot.tasks.len() <= 1 {
+        return snapshot.dispatch.selected_tier;
+    }
+    match snapshot.tasks.len() {
+        0 | 1 => ExecutionTier::Inline,
+        2..=24 if dag_depth(snapshot) <= 4 => ExecutionTier::Wave,
+        _ => ExecutionTier::Hierarchical,
+    }
+}
+
+pub fn planned_subruns(snapshot: &RunSnapshot) -> Vec<SubrunPlan> {
+    if execution_tier(snapshot) != ExecutionTier::Hierarchical {
+        return Vec::new();
+    }
+
+    let task_ids = snapshot.task_ids();
+    let mut adjacency = snapshot
+        .tasks
+        .keys()
+        .map(|task_id| (task_id.clone(), HashSet::new()))
+        .collect::<HashMap<_, HashSet<String>>>();
+
+    for (task_id, task) in &snapshot.tasks {
+        for dep in &task.deps {
+            if !snapshot.tasks.contains_key(dep) {
+                continue;
+            }
+            adjacency
+                .entry(task_id.clone())
+                .or_default()
+                .insert(dep.clone());
+            adjacency
+                .entry(dep.clone())
+                .or_default()
+                .insert(task_id.clone());
+        }
+    }
+
+    for (index, left_id) in task_ids.iter().enumerate() {
+        let Some(left_task) = snapshot.tasks.get(left_id) else {
+            continue;
+        };
+        for right_id in task_ids.iter().skip(index + 1) {
+            let Some(right_task) = snapshot.tasks.get(right_id) else {
+                continue;
+            };
+            let overlaps = left_task
+                .spec
+                .planned_touches
+                .iter()
+                .any(|path| right_task.spec.planned_touches.contains(path));
+            if overlaps {
+                adjacency
+                    .entry(left_id.clone())
+                    .or_default()
+                    .insert(right_id.clone());
+                adjacency
+                    .entry(right_id.clone())
+                    .or_default()
+                    .insert(left_id.clone());
+            }
+        }
+    }
+
+    let topological_order = topological_task_ids(snapshot);
+    let order_index = topological_order
+        .iter()
+        .enumerate()
+        .map(|(index, task_id)| (task_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    let mut visited = HashSet::new();
+    let mut components = Vec::new();
+    let mut seeds = task_ids;
+    seeds.sort_by_key(|task_id| order_index.get(task_id).copied().unwrap_or(usize::MAX));
+    for seed in seeds {
+        if !visited.insert(seed.clone()) {
+            continue;
+        }
+        let mut component = vec![seed.clone()];
+        let mut stack = vec![seed];
+        while let Some(task_id) = stack.pop() {
+            let mut neighbors = adjacency
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            neighbors
+                .sort_by_key(|neighbor| order_index.get(neighbor).copied().unwrap_or(usize::MAX));
+            for neighbor in neighbors {
+                if visited.insert(neighbor.clone()) {
+                    stack.push(neighbor.clone());
+                    component.push(neighbor);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components.sort_by_key(|component| {
+        component
+            .iter()
+            .filter_map(|task_id| order_index.get(task_id))
+            .min()
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut planned = Vec::new();
+    let mut subrun_index = 1usize;
+    let mut pending_task_ids = Vec::new();
+    for component in components {
+        let component_task_ids = component.into_iter().collect::<HashSet<_>>();
+        let ordered_component = topological_order
+            .iter()
+            .filter(|task_id| component_task_ids.contains(*task_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if ordered_component.len() > MAX_HIERARCHICAL_SUBRUN_TASKS {
+            if !pending_task_ids.is_empty() {
+                planned.push(SubrunPlan {
+                    subrun_id: format!("subrun-{subrun_index:02}"),
+                    task_ids: std::mem::take(&mut pending_task_ids),
+                });
+                subrun_index += 1;
+            }
+            for chunk in ordered_component.chunks(MAX_HIERARCHICAL_SUBRUN_TASKS) {
+                planned.push(SubrunPlan {
+                    subrun_id: format!("subrun-{subrun_index:02}"),
+                    task_ids: chunk.to_vec(),
+                });
+                subrun_index += 1;
+            }
+            continue;
+        }
+
+        if pending_task_ids.len() + ordered_component.len() > MAX_HIERARCHICAL_SUBRUN_TASKS
+            && !pending_task_ids.is_empty()
+        {
+            planned.push(SubrunPlan {
+                subrun_id: format!("subrun-{subrun_index:02}"),
+                task_ids: std::mem::take(&mut pending_task_ids),
+            });
+            subrun_index += 1;
+        }
+        pending_task_ids.extend(ordered_component);
+    }
+
+    if !pending_task_ids.is_empty() {
+        planned.push(SubrunPlan {
+            subrun_id: format!("subrun-{subrun_index:02}"),
+            task_ids: pending_task_ids,
+        });
+    }
+
+    planned
+}
+
+pub fn planned_wave_task_ids(snapshot: &RunSnapshot, candidate_task_ids: &[String]) -> Vec<String> {
+    let ready_task_ids = candidate_task_ids
+        .iter()
+        .filter_map(|task_id| {
+            let task = snapshot.tasks.get(task_id)?;
+            (task.runtime.state == TaskState::Ready).then_some(task_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let mut scheduled = Vec::new();
+    let mut touched_paths = HashSet::new();
+    let max_tasks = snapshot.effective_max_parallelism();
+
+    for task_id in ready_task_ids {
+        if scheduled.len() >= max_tasks {
+            break;
+        }
+        let Some(task) = snapshot.tasks.get(&task_id) else {
+            continue;
+        };
+        if task.spec.planned_touches.is_empty() {
+            if scheduled.is_empty() {
+                scheduled.push(task_id);
+            }
+            break;
+        }
+
+        let conflicts = task
+            .spec
+            .planned_touches
+            .iter()
+            .any(|path| touched_paths.contains(path));
+        if conflicts {
+            continue;
+        }
+
+        for path in &task.spec.planned_touches {
+            touched_paths.insert(path.clone());
+        }
+        scheduled.push(task_id);
+    }
+
+    scheduled
+}
+
 fn phase_event(snapshot: &RunSnapshot, phase: RunPhase, summary: &str) -> Vec<RuntimeEventKind> {
     (snapshot.phase != phase)
         .then_some(RuntimeEventKind::PhaseChanged {
@@ -263,6 +499,108 @@ fn dependencies_satisfied(snapshot: &RunSnapshot, task: &TaskNode) -> bool {
             )
         })
     })
+}
+
+fn dag_depth(snapshot: &RunSnapshot) -> usize {
+    fn visit(
+        task_id: &str,
+        deps: &HashMap<String, Vec<String>>,
+        memo: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(depth) = memo.get(task_id) {
+            return *depth;
+        }
+        if !visiting.insert(task_id.to_string()) {
+            return 1;
+        }
+        let depth = deps
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|dep| 1 + visit(dep, deps, memo, visiting))
+            .max()
+            .unwrap_or(1);
+        visiting.remove(task_id);
+        memo.insert(task_id.to_string(), depth);
+        depth
+    }
+
+    let deps = snapshot
+        .tasks
+        .iter()
+        .map(|(task_id, task)| (task_id.clone(), task.deps.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    snapshot
+        .tasks
+        .keys()
+        .map(|task_id| visit(task_id, &deps, &mut memo, &mut visiting))
+        .max()
+        .unwrap_or(0)
+}
+
+fn topological_task_ids(snapshot: &RunSnapshot) -> Vec<String> {
+    let task_ids = snapshot.task_ids();
+    let run_task_ids = task_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut in_degree = snapshot
+        .tasks
+        .keys()
+        .map(|task_id| (task_id.clone(), 0usize))
+        .collect::<HashMap<_, _>>();
+    let mut adjacency = snapshot
+        .tasks
+        .keys()
+        .map(|task_id| (task_id.clone(), Vec::new()))
+        .collect::<HashMap<_, Vec<String>>>();
+
+    for (task_id, task) in &snapshot.tasks {
+        for dep in &task.deps {
+            if run_task_ids.contains(dep) {
+                adjacency
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(task_id.clone());
+                *in_degree.entry(task_id.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    let mut ready = in_degree
+        .iter()
+        .filter_map(|(task_id, degree)| (*degree == 0).then_some(task_id.clone()))
+        .collect::<Vec<_>>();
+    ready.sort();
+
+    let mut ordered = Vec::with_capacity(task_ids.len());
+    while let Some(task_id) = ready.first().cloned() {
+        ready.remove(0);
+        ordered.push(task_id.clone());
+
+        let mut neighbors = adjacency.get(&task_id).cloned().unwrap_or_default();
+        neighbors.sort();
+        for neighbor in neighbors {
+            let Some(degree) = in_degree.get_mut(&neighbor) else {
+                continue;
+            };
+            *degree = degree.saturating_sub(1);
+            if *degree == 0 && !ordered.contains(&neighbor) && !ready.contains(&neighbor) {
+                ready.push(neighbor);
+            }
+        }
+        ready.sort();
+    }
+
+    let mut missing = snapshot
+        .tasks
+        .keys()
+        .filter(|task_id| !ordered.contains(task_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    ordered.extend(missing);
+    ordered
 }
 
 #[cfg(test)]

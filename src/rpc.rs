@@ -25,9 +25,10 @@ use crate::model::{
     UserMessage,
 };
 use crate::models::ModelEntry;
+#[cfg(test)]
+use crate::orchestration::WaveStatus;
 use crate::orchestration::{
-    ExecutionTier, FlockWorkspace, RunLifecycle, RunVerifyScopeKind, RunVerifyStatus, SubrunPlan,
-    TaskReport, WaveStatus,
+    ExecutionTier, FlockWorkspace, RunLifecycle, RunVerifyScopeKind, RunVerifyStatus, TaskReport,
 };
 use crate::provider::Provider;
 use crate::provider_metadata::{
@@ -1359,6 +1360,42 @@ fn sync_runtime_task_from_reliability(
     runtime_task: &mut TaskNode,
     reliability_task: &reliability::TaskNode,
 ) {
+    runtime_task
+        .spec
+        .objective
+        .clone_from(&reliability_task.spec.objective);
+    runtime_task.spec.planned_touches = reliability_task
+        .spec
+        .planned_touches
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    runtime_task.spec.input_snapshot = Some(reliability_task.spec.input_snapshot.clone());
+    runtime_task.spec.max_attempts = reliability_task.spec.max_attempts;
+    runtime_task
+        .spec
+        .constraints
+        .invariants
+        .clone_from(&reliability_task.spec.constraints.invariants);
+    runtime_task.spec.constraints.max_touched_files =
+        reliability_task.spec.constraints.max_touched_files;
+    runtime_task
+        .spec
+        .constraints
+        .forbid_paths
+        .clone_from(&reliability_task.spec.constraints.forbid_paths);
+    let reliability::VerifyPlan::Standard {
+        command,
+        timeout_sec,
+        ..
+    } = &reliability_task.spec.verify;
+    runtime_task.spec.verify.command.clone_from(command);
+    runtime_task.spec.verify.timeout_sec = *timeout_sec;
+    runtime_task
+        .spec
+        .verify
+        .acceptance_ids
+        .clone_from(&reliability_task.spec.acceptance_ids);
     runtime_task.runtime.attempt = reliability_task.runtime.attempt;
     runtime_task.runtime.continuation_reason = None;
     runtime_task.runtime.last_error = None;
@@ -1510,57 +1547,6 @@ fn apply_runtime_scheduler_lifecycle(snapshot: &mut RunSnapshot) {
     }
 
     snapshot.summary.next_action = next_action;
-}
-
-fn runtime_snapshot_dag_depth(snapshot: &RunSnapshot) -> usize {
-    fn visit(
-        task_id: &str,
-        deps: &HashMap<String, Vec<String>>,
-        memo: &mut HashMap<String, usize>,
-        visiting: &mut HashSet<String>,
-    ) -> usize {
-        if let Some(depth) = memo.get(task_id) {
-            return *depth;
-        }
-        if !visiting.insert(task_id.to_string()) {
-            return 1;
-        }
-        let depth = deps
-            .get(task_id)
-            .into_iter()
-            .flatten()
-            .map(|dep| 1 + visit(dep, deps, memo, visiting))
-            .max()
-            .unwrap_or(1);
-        visiting.remove(task_id);
-        memo.insert(task_id.to_string(), depth);
-        depth
-    }
-
-    let deps = snapshot
-        .tasks
-        .iter()
-        .map(|(task_id, task)| (task_id.clone(), task.deps.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut memo = HashMap::new();
-    let mut visiting = HashSet::new();
-    snapshot
-        .tasks
-        .keys()
-        .map(|task_id| visit(task_id, &deps, &mut memo, &mut visiting))
-        .max()
-        .unwrap_or(0)
-}
-
-fn runtime_snapshot_execution_tier(snapshot: &RunSnapshot) -> ExecutionTier {
-    if snapshot.dispatch.selected_tier != ExecutionTier::Inline || snapshot.tasks.len() <= 1 {
-        return snapshot.dispatch.selected_tier;
-    }
-    match snapshot.tasks.len() {
-        0 | 1 => ExecutionTier::Inline,
-        2..=24 if runtime_snapshot_dag_depth(snapshot) <= 4 => ExecutionTier::Wave,
-        _ => ExecutionTier::Hierarchical,
-    }
 }
 
 #[cfg(test)]
@@ -2266,306 +2252,6 @@ fn apply_run_verify_lifecycle(run: &mut RunSnapshot) {
     }
 }
 
-fn next_active_wave(
-    existing: Option<WaveStatus>,
-    mut active_task_ids: Vec<String>,
-) -> Option<WaveStatus> {
-    active_task_ids.sort();
-    active_task_ids.dedup();
-    if active_task_ids.is_empty() {
-        return None;
-    }
-
-    let now = chrono::Utc::now();
-    if let Some(existing) = existing {
-        let mut existing_task_ids = existing.task_ids.clone();
-        existing_task_ids.sort();
-        existing_task_ids.dedup();
-        if existing.completed_at.is_none() && existing_task_ids == active_task_ids {
-            return Some(existing);
-        }
-    }
-
-    Some(WaveStatus {
-        wave_id: format!("wave-{}", now.timestamp_millis()),
-        task_ids: active_task_ids,
-        started_at: now,
-        completed_at: None,
-    })
-}
-
-const MAX_HIERARCHICAL_SUBRUN_TASKS: usize = 12;
-
-fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunSnapshot) -> Vec<String> {
-    let task_ids = run.task_ids();
-    let run_task_ids = task_ids.iter().cloned().collect::<HashSet<_>>();
-    let mut in_degree = run
-        .tasks
-        .keys()
-        .map(|task_id| (task_id.clone(), 0usize))
-        .collect::<HashMap<_, _>>();
-    let mut adjacency = run
-        .tasks
-        .keys()
-        .map(|task_id| (task_id.clone(), Vec::new()))
-        .collect::<HashMap<_, Vec<String>>>();
-
-    for edge in &reliability.edges {
-        match &edge.kind {
-            reliability::EdgeKind::Prerequisite { .. }
-                if run_task_ids.contains(&edge.from) && run_task_ids.contains(&edge.to) =>
-            {
-                adjacency
-                    .entry(edge.from.clone())
-                    .or_default()
-                    .push(edge.to.clone());
-                *in_degree.entry(edge.to.clone()).or_default() += 1;
-            }
-            _ => {}
-        }
-    }
-
-    let mut ready = in_degree
-        .iter()
-        .filter_map(|(task_id, degree)| (*degree == 0).then_some(task_id.clone()))
-        .collect::<Vec<_>>();
-    ready.sort();
-
-    let mut ordered = Vec::with_capacity(task_ids.len());
-    while let Some(task_id) = ready.first().cloned() {
-        ready.remove(0);
-        ordered.push(task_id.clone());
-
-        let mut neighbors = adjacency.get(&task_id).cloned().unwrap_or_default();
-        neighbors.sort();
-        for neighbor in neighbors {
-            let Some(degree) = in_degree.get_mut(&neighbor) else {
-                continue;
-            };
-            *degree = degree.saturating_sub(1);
-            if *degree == 0 && !ordered.contains(&neighbor) && !ready.contains(&neighbor) {
-                ready.push(neighbor);
-            }
-        }
-        ready.sort();
-    }
-
-    let mut missing = run
-        .tasks
-        .keys()
-        .filter(|task_id| !ordered.contains(task_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    missing.sort();
-    ordered.extend(missing);
-    ordered
-}
-
-fn planned_subruns(reliability: &RpcReliabilityState, run: &RunSnapshot) -> Vec<SubrunPlan> {
-    if runtime_snapshot_execution_tier(run) != ExecutionTier::Hierarchical {
-        return Vec::new();
-    }
-
-    let task_ids = run.task_ids();
-    let mut adjacency = run
-        .tasks
-        .keys()
-        .map(|task_id| (task_id.clone(), HashSet::new()))
-        .collect::<HashMap<_, HashSet<String>>>();
-    let run_task_ids = task_ids.iter().cloned().collect::<HashSet<_>>();
-
-    for edge in &reliability.edges {
-        match &edge.kind {
-            reliability::EdgeKind::Prerequisite { .. }
-                if run_task_ids.contains(&edge.from) && run_task_ids.contains(&edge.to) =>
-            {
-                adjacency
-                    .entry(edge.from.clone())
-                    .or_default()
-                    .insert(edge.to.clone());
-                adjacency
-                    .entry(edge.to.clone())
-                    .or_default()
-                    .insert(edge.from.clone());
-            }
-            _ => {}
-        }
-    }
-
-    for (index, left_id) in task_ids.iter().enumerate() {
-        let Some(left_task) = reliability.tasks.get(left_id) else {
-            continue;
-        };
-        for right_id in task_ids.iter().skip(index + 1) {
-            let Some(right_task) = reliability.tasks.get(right_id) else {
-                continue;
-            };
-            let overlaps = left_task
-                .spec
-                .planned_touches
-                .iter()
-                .any(|path| right_task.spec.planned_touches.contains(path));
-            if overlaps {
-                adjacency
-                    .entry(left_id.clone())
-                    .or_default()
-                    .insert(right_id.clone());
-                adjacency
-                    .entry(right_id.clone())
-                    .or_default()
-                    .insert(left_id.clone());
-            }
-        }
-    }
-
-    let topological_order = topological_run_task_ids(reliability, run);
-    let order_index = topological_order
-        .iter()
-        .enumerate()
-        .map(|(index, task_id)| (task_id.clone(), index))
-        .collect::<HashMap<_, _>>();
-
-    let mut visited = HashSet::new();
-    let mut components = Vec::new();
-    let mut seeds = task_ids;
-    seeds.sort_by_key(|task_id| order_index.get(task_id).copied().unwrap_or(usize::MAX));
-    for seed in seeds {
-        if !visited.insert(seed.clone()) {
-            continue;
-        }
-        let mut component = vec![seed.clone()];
-        let mut stack = vec![seed];
-        while let Some(task_id) = stack.pop() {
-            let mut neighbors = adjacency
-                .get(&task_id)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>();
-            neighbors
-                .sort_by_key(|neighbor| order_index.get(neighbor).copied().unwrap_or(usize::MAX));
-            for neighbor in neighbors {
-                if visited.insert(neighbor.clone()) {
-                    stack.push(neighbor.clone());
-                    component.push(neighbor);
-                }
-            }
-        }
-        components.push(component);
-    }
-
-    components.sort_by_key(|component| {
-        component
-            .iter()
-            .filter_map(|task_id| order_index.get(task_id))
-            .min()
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
-
-    let mut planned = Vec::new();
-    let mut subrun_index = 1usize;
-    let mut pending_task_ids = Vec::new();
-    for component in components {
-        let component_task_ids = component.into_iter().collect::<HashSet<_>>();
-        let ordered_component = topological_order
-            .iter()
-            .filter(|task_id| component_task_ids.contains(*task_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if ordered_component.len() > MAX_HIERARCHICAL_SUBRUN_TASKS {
-            if !pending_task_ids.is_empty() {
-                planned.push(SubrunPlan {
-                    subrun_id: format!("subrun-{subrun_index:02}"),
-                    task_ids: std::mem::take(&mut pending_task_ids),
-                });
-                subrun_index += 1;
-            }
-            for chunk in ordered_component.chunks(MAX_HIERARCHICAL_SUBRUN_TASKS) {
-                planned.push(SubrunPlan {
-                    subrun_id: format!("subrun-{subrun_index:02}"),
-                    task_ids: chunk.to_vec(),
-                });
-                subrun_index += 1;
-            }
-            continue;
-        }
-
-        if pending_task_ids.len() + ordered_component.len() > MAX_HIERARCHICAL_SUBRUN_TASKS
-            && !pending_task_ids.is_empty()
-        {
-            planned.push(SubrunPlan {
-                subrun_id: format!("subrun-{subrun_index:02}"),
-                task_ids: std::mem::take(&mut pending_task_ids),
-            });
-            subrun_index += 1;
-        }
-        pending_task_ids.extend(ordered_component);
-    }
-
-    if !pending_task_ids.is_empty() {
-        planned.push(SubrunPlan {
-            subrun_id: format!("subrun-{subrun_index:02}"),
-            task_ids: pending_task_ids,
-        });
-    }
-
-    planned
-}
-
-fn planned_wave_task_ids(
-    reliability: &RpcReliabilityState,
-    run: &RunSnapshot,
-    candidate_task_ids: &[String],
-) -> Vec<String> {
-    let ready_task_ids = candidate_task_ids
-        .iter()
-        .filter_map(|task_id| {
-            let task = reliability.tasks.get(task_id)?;
-            if matches!(task.runtime.state, reliability::RuntimeState::Ready) {
-                Some(task_id.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let mut scheduled = Vec::new();
-    let mut touched_paths = HashSet::new();
-    let max_tasks = run.effective_max_parallelism();
-
-    for task_id in ready_task_ids {
-        if scheduled.len() >= max_tasks {
-            break;
-        }
-        let Some(task) = reliability.tasks.get(&task_id) else {
-            continue;
-        };
-        if task.spec.planned_touches.is_empty() {
-            if scheduled.is_empty() {
-                scheduled.push(task_id);
-            }
-            break;
-        }
-
-        let conflicts = task
-            .spec
-            .planned_touches
-            .iter()
-            .any(|path| touched_paths.contains(path));
-        if conflicts {
-            continue;
-        }
-
-        for path in &task.spec.planned_touches {
-            touched_paths.insert(path.clone());
-        }
-        scheduled.push(task_id);
-    }
-
-    scheduled
-}
-
 fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunSnapshot) -> bool {
     let task_ids = run.task_ids();
     !task_ids.is_empty()
@@ -2589,21 +2275,21 @@ fn refresh_live_run_from_reliability(
 fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunSnapshot) {
     let preserve_canceled = matches!(run.phase, RunPhase::Canceled);
     let task_ids = run.task_ids();
-    run.dispatch.planned_subruns = planned_subruns(reliability, run);
     sync_runtime_snapshot_from_reliability(reliability, run);
+    run.dispatch.selected_tier = scheduler::execution_tier(run);
+    run.dispatch.planned_subruns = scheduler::planned_subruns(run);
 
     if preserve_canceled || run_requires_plan_acceptance(run) {
         run.dispatch.active_subrun_id = None;
         run.dispatch.active_wave = None;
     } else {
-        let active_scope_task_ids = if runtime_snapshot_execution_tier(run)
-            == ExecutionTier::Hierarchical
+        let active_scope_task_ids = if scheduler::execution_tier(run) == ExecutionTier::Hierarchical
         {
             let active_subrun = run.dispatch.planned_subruns.iter().find(|subrun| {
                 subrun.task_ids.iter().any(|task_id| {
-                    reliability.tasks.get(task_id).is_some_and(|task| {
-                        !matches!(task.runtime.state, reliability::RuntimeState::Terminal(_))
-                    })
+                    run.tasks
+                        .get(task_id)
+                        .is_some_and(|task| !task.runtime.state.is_terminal())
                 })
             });
             run.dispatch.active_subrun_id = active_subrun.map(|subrun| subrun.subrun_id.clone());
@@ -2618,19 +2304,16 @@ fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut Run
         let mut active_task_ids = active_scope_task_ids
             .iter()
             .filter_map(|task_id| {
-                let task = reliability.tasks.get(task_id)?;
-                match &task.runtime.state {
-                    reliability::RuntimeState::Leased { .. }
-                    | reliability::RuntimeState::Verifying { .. } => Some(task_id.clone()),
-                    _ => None,
-                }
+                let task = run.tasks.get(task_id)?;
+                matches!(task.runtime.state, TaskState::Leased | TaskState::Verifying)
+                    .then_some(task_id.clone())
             })
             .collect::<Vec<_>>();
         if active_task_ids.is_empty() {
-            active_task_ids = planned_wave_task_ids(reliability, run, &active_scope_task_ids);
+            active_task_ids = scheduler::planned_wave_task_ids(run, &active_scope_task_ids);
         }
         run.dispatch.active_wave =
-            next_active_wave(run.dispatch.active_wave.take(), active_task_ids);
+            scheduler::next_active_wave(run.dispatch.active_wave.take(), active_task_ids);
     }
 
     if run_requires_plan_acceptance(run) {
