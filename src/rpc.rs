@@ -5296,7 +5296,7 @@ fn session_stats(session: &crate::session::Session) -> Value {
     let mut total_cache_write: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
-    let messages = session.to_messages_for_current_path();
+    let messages = session.to_messages_for_active_prompt_scope();
 
     for message in &messages {
         match message {
@@ -6107,7 +6107,7 @@ mod tests {
     };
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::runtime::reliability::ClosePayload;
-    use crate::session::Session;
+    use crate::session::{MessageContextRefs, Session, SessionMessage};
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;
     use futures::stream;
@@ -6178,6 +6178,48 @@ mod tests {
             auth,
             runtime_handle,
         }
+    }
+
+    #[test]
+    fn session_stats_uses_active_prompt_scope() {
+        let mut session = Session::in_memory();
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("global".to_string()),
+            timestamp: Some(0),
+        });
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-a".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-a tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-a".to_string()),
+                ..MessageContextRefs::default()
+            },
+        );
+        session.append_message_with_context(
+            SessionMessage::ToolResult {
+                tool_call_id: "call-b".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("task-b tool"))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            },
+            MessageContextRefs {
+                task_id: Some("task-b".to_string()),
+                ..MessageContextRefs::default()
+            },
+        );
+
+        let stats = session_stats(&session);
+        assert_eq!(stats["userMessages"], json!(1));
+        assert_eq!(stats["toolResults"], json!(1));
+        assert_eq!(stats["totalMessages"], json!(2));
     }
 
     #[derive(Debug)]
