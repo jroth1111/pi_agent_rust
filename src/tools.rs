@@ -2,7 +2,7 @@
 //!
 //! Pi provides built-in tools for file IO, shell execution, web access, and
 //! code navigation: read, bash, edit, write, grep, find, ls, websearch,
-//! webfetch, lsp, code.query, code.context, code.impact.
+//! webfetch, code.query, code.context, code.impact.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -37,14 +37,12 @@ use uuid::Uuid;
 
 mod code_context;
 mod html_extract;
-mod lsp;
 mod retry;
 mod web_cache;
 mod webfetch;
 mod websearch;
 
 use self::code_context::{CodeContextTool, CodeImpactTool, CodeQueryTool};
-use self::lsp::LspTool;
 use self::webfetch::WebFetchTool;
 use self::websearch::WebSearchTool;
 
@@ -1176,7 +1174,6 @@ impl ToolRegistry {
                 "code.query" => tools.push(Box::new(CodeQueryTool::new(cwd))),
                 "code.context" => tools.push(Box::new(CodeContextTool::new(cwd))),
                 "code.impact" => tools.push(Box::new(CodeImpactTool::new(cwd))),
-                "lsp" => tools.push(Box::new(LspTool::new(cwd))),
                 _ => {}
             }
         }
@@ -7659,5 +7656,14 @@ mod tests {
                     .contains(&DangerousCommandClass::PipeToShell),
             "Base64-encoded command with pipe should be detected"
         );
+    }
+
+    #[test]
+    fn tool_registry_does_not_register_builtin_lsp() {
+        let registry = ToolRegistry::new(&["code.query", "lsp"], Path::new("."), None);
+        let names: Vec<&str> = registry.tools().iter().map(|tool| tool.name()).collect();
+
+        assert!(names.contains(&"code.query"));
+        assert!(!names.contains(&"lsp"));
     }
 }

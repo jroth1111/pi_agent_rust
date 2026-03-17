@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use ignore::WalkBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::lsp::registry::rust_backend_available;
 use crate::model::{ContentBlock, TextContent};
 
 use super::{Tool, ToolOutput, ToolUpdate, resolve_path};
@@ -32,6 +33,175 @@ struct SymbolMatch {
     kind: String,
     name: String,
     line_text: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CodeBundleKind {
+    Query,
+    Context,
+    Impact,
+}
+
+impl CodeBundleKind {
+    const fn tool_name(self) -> &'static str {
+        match self {
+            Self::Query => "code.query",
+            Self::Context => "code.context",
+            Self::Impact => "code.impact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeBundleItem {
+    path: String,
+    line: usize,
+    kind: String,
+    name: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeBundleExcerpt {
+    path: String,
+    anchor_line: usize,
+    snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeContextBundle {
+    kind: CodeBundleKind,
+    scope: String,
+    focus: Option<String>,
+    semantic_backend: Option<String>,
+    overview: Vec<String>,
+    symbols: Vec<CodeBundleItem>,
+    excerpts: Vec<CodeBundleExcerpt>,
+    references: Vec<String>,
+    related_tests: Vec<String>,
+}
+
+impl CodeContextBundle {
+    fn new(kind: CodeBundleKind, scope: String, focus: Option<String>, cwd: &Path) -> Self {
+        let semantic_backend =
+            rust_backend_available(cwd).then_some("rust-diagnostics".to_string());
+        Self {
+            kind,
+            scope,
+            focus,
+            semantic_backend,
+            overview: Vec::new(),
+            symbols: Vec::new(),
+            excerpts: Vec::new(),
+            references: Vec::new(),
+            related_tests: Vec::new(),
+        }
+    }
+
+    fn push_overview(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if !line.trim().is_empty() {
+            self.overview.push(line);
+        }
+    }
+
+    fn push_symbols(&mut self, matches: &[SymbolMatch]) {
+        self.symbols
+            .extend(matches.iter().map(|item| CodeBundleItem {
+                path: item.path.display().to_string(),
+                line: item.line,
+                kind: item.kind.clone(),
+                name: item.name.clone(),
+                summary: item.line_text.clone(),
+            }));
+    }
+
+    fn push_excerpt(&mut self, path: &Path, anchor_line: usize, snippet: String) {
+        if snippet.trim().is_empty() {
+            return;
+        }
+        self.excerpts.push(CodeBundleExcerpt {
+            path: path.display().to_string(),
+            anchor_line,
+            snippet,
+        });
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(self.kind.tool_name());
+        out.push_str("\nscope=");
+        out.push_str(&self.scope);
+
+        if let Some(focus) = &self.focus {
+            out.push_str("\nfocus=");
+            out.push_str(focus);
+        }
+        if let Some(semantic_backend) = &self.semantic_backend {
+            out.push_str("\nsemantic_backend=");
+            out.push_str(semantic_backend);
+        }
+
+        if !self.overview.is_empty() {
+            out.push_str("\n\noverview");
+            for line in &self.overview {
+                out.push_str("\n- ");
+                out.push_str(line);
+            }
+        }
+
+        if !self.symbols.is_empty() {
+            out.push_str("\n\nsymbols");
+            for item in &self.symbols {
+                out.push_str("\n- ");
+                out.push_str(&format!(
+                    "{}:{} [{}] {}",
+                    item.path, item.line, item.kind, item.name
+                ));
+                if !item.summary.trim().is_empty() {
+                    out.push_str(" :: ");
+                    out.push_str(&item.summary);
+                }
+            }
+        }
+
+        if !self.excerpts.is_empty() {
+            out.push_str("\n\ncontext");
+            for excerpt in &self.excerpts {
+                out.push_str("\n- ");
+                out.push_str(&format!(
+                    "{}:{}\n{}",
+                    excerpt.path, excerpt.anchor_line, excerpt.snippet
+                ));
+            }
+        }
+
+        if !self.references.is_empty() {
+            out.push_str("\n\nreferences");
+            for item in &self.references {
+                out.push_str("\n- ");
+                out.push_str(item);
+            }
+        }
+
+        if !self.related_tests.is_empty() {
+            out.push_str("\n\ntests");
+            for item in &self.related_tests {
+                out.push_str("\n- ");
+                out.push_str(item);
+            }
+        }
+
+        out
+    }
+
+    fn details(&self) -> serde_json::Value {
+        json!(self)
+    }
 }
 
 pub struct CodeQueryTool {
@@ -190,30 +360,6 @@ fn scan_symbol_matches(
     }
 
     Ok(out)
-}
-
-fn format_symbol_matches(title: &str, matches: &[SymbolMatch]) -> String {
-    if matches.is_empty() {
-        return format!("{title}\n(no matches)");
-    }
-
-    let mut out = String::new();
-    out.push_str(title);
-    for item in matches {
-        out.push_str("\n- ");
-        out.push_str(&format!(
-            "{}:{} [{}] {}",
-            item.path.display(),
-            item.line,
-            item.kind,
-            item.name
-        ));
-        if !item.line_text.is_empty() {
-            out.push_str(" :: ");
-            out.push_str(&item.line_text);
-        }
-    }
-    out
 }
 
 fn extract_outline(path: &Path, limit: usize) -> Result<Vec<SymbolMatch>> {
@@ -376,15 +522,22 @@ impl Tool for CodeQueryTool {
             .or(input.symbol.as_deref())
             .map(str::trim);
         let matches = scan_symbol_matches(&self.cwd, &scope, query, limit)?;
-        let text = format_symbol_matches("code.query", &matches);
+        let mut bundle = CodeContextBundle::new(
+            CodeBundleKind::Query,
+            scope.display().to_string(),
+            query.map(str::to_string),
+            &self.cwd,
+        );
+        bundle.push_overview(format!("symbol_hits={}", matches.len()));
+        bundle.push_overview("retrieval_next=code.context");
+        if matches.is_empty() {
+            bundle.push_overview("status=no_symbol_matches");
+        }
+        bundle.push_symbols(&matches);
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(json!({
-                "scope": scope.display().to_string(),
-                "query": query,
-                "count": matches.len(),
-            })),
+            content: vec![ContentBlock::Text(TextContent::new(bundle.render()))],
+            details: Some(bundle.details()),
             is_error: false,
         })
     }
@@ -440,10 +593,28 @@ impl Tool for CodeContextTool {
             .as_deref()
             .map_or_else(|| self.cwd.clone(), |path| resolve_path(path, &self.cwd));
 
-        let mut sections = Vec::new();
+        let focus = input
+            .symbol
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            });
+        let mut bundle = CodeContextBundle::new(
+            CodeBundleKind::Context,
+            path.display().to_string(),
+            focus,
+            &self.cwd,
+        );
+
         if path.is_file() {
             let outline = extract_outline(&path, limit)?;
-            sections.push(format_symbol_matches("outline", &outline));
+            bundle.push_overview(format!("outline_items={}", outline.len()));
+            bundle.push_symbols(&outline);
         }
 
         if let Some(symbol) = input
@@ -458,7 +629,8 @@ impl Tool for CodeContextTool {
                 path.parent().unwrap_or(&self.cwd).to_path_buf()
             };
             let matches = scan_symbol_matches(&self.cwd, &scope, Some(symbol), limit)?;
-            sections.push(format_symbol_matches("matches", &matches));
+            bundle.push_overview(format!("symbol_hits={}", matches.len()));
+            bundle.push_symbols(&matches);
             if let Some(first) = matches.first() {
                 let full_path = if first.path.is_absolute() {
                     first.path.clone()
@@ -466,23 +638,19 @@ impl Tool for CodeContextTool {
                     self.cwd.join(&first.path)
                 };
                 let excerpt = excerpt_around(&full_path, first.line, before, after)?;
-                if !excerpt.is_empty() {
-                    sections.push(format!("excerpt\n{}\n", excerpt));
-                }
+                bundle.push_excerpt(&full_path, first.line, excerpt);
             }
         }
 
-        if sections.is_empty() && path.is_file() {
+        if bundle.symbols.is_empty() && path.is_file() {
             let excerpt = excerpt_around(&path, 1, 0, after)?;
-            sections.push(format!("file\n{excerpt}"));
+            bundle.push_overview("fallback=file_excerpt");
+            bundle.push_excerpt(&path, 1, excerpt);
         }
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(sections.join("\n\n")))],
-            details: Some(json!({
-                "path": path.display().to_string(),
-                "symbol": input.symbol,
-            })),
+            content: vec![ContentBlock::Text(TextContent::new(bundle.render()))],
+            details: Some(bundle.details()),
             is_error: false,
         })
     }
@@ -547,33 +715,23 @@ impl Tool for CodeImpactTool {
 
         let refs = reference_lines(&self.cwd, &needle, limit)?;
         let tests = related_tests(&self.cwd, &needle, limit.min(20))?;
-        let mut text = String::from("code.impact");
-        text.push_str("\nreferences");
+        let mut bundle = CodeContextBundle::new(
+            CodeBundleKind::Impact,
+            self.cwd.display().to_string(),
+            Some(needle.clone()),
+            &self.cwd,
+        );
+        bundle.push_overview(format!("reference_hits={}", refs.len()));
+        bundle.push_overview(format!("related_tests={}", tests.len()));
         if refs.is_empty() {
-            text.push_str("\n(no references)");
-        } else {
-            for item in &refs {
-                text.push_str("\n- ");
-                text.push_str(item);
-            }
+            bundle.push_overview("status=no_repo_references");
         }
-        text.push_str("\n\ntests");
-        if tests.is_empty() {
-            text.push_str("\n(no related tests)");
-        } else {
-            for item in &tests {
-                text.push_str("\n- ");
-                text.push_str(item);
-            }
-        }
+        bundle.references = refs;
+        bundle.related_tests = tests;
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(json!({
-                "needle": needle,
-                "referenceCount": refs.len(),
-                "testCount": tests.len(),
-            })),
+            content: vec![ContentBlock::Text(TextContent::new(bundle.render()))],
+            details: Some(bundle.details()),
             is_error: false,
         })
     }
@@ -612,5 +770,38 @@ mod tests {
         assert!(excerpt.contains(">    3 three"));
         assert!(excerpt.contains("     2 two"));
         assert!(excerpt.contains("     4 four"));
+    }
+
+    #[test]
+    fn code_context_bundle_renders_compact_sections() {
+        let mut bundle = CodeContextBundle::new(
+            CodeBundleKind::Context,
+            "src/lib.rs".to_string(),
+            Some("Alpha".to_string()),
+            Path::new("."),
+        );
+        bundle.push_overview("outline_items=1");
+        bundle.push_symbols(&[SymbolMatch {
+            path: PathBuf::from("src/lib.rs"),
+            line: 4,
+            kind: "struct".to_string(),
+            name: "Alpha".to_string(),
+            line_text: "pub struct Alpha {}".to_string(),
+        }]);
+        bundle.push_excerpt(
+            Path::new("src/lib.rs"),
+            4,
+            ">    4 pub struct Alpha {}".to_string(),
+        );
+        bundle
+            .references
+            .push("src/main.rs:9: Alpha::new()".to_string());
+
+        let rendered = bundle.render();
+        assert!(rendered.contains("code.context"));
+        assert!(rendered.contains("scope=src/lib.rs"));
+        assert!(rendered.contains("symbols"));
+        assert!(rendered.contains("context"));
+        assert!(rendered.contains("references"));
     }
 }

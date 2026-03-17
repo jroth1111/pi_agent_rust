@@ -358,7 +358,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,websearch,webfetch,code.query,code.context,code.impact,lsp)
+    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,websearch,webfetch,code.query,code.context,code.impact)
     #[arg(
         long,
         default_value = "read,bash,edit,write,code.query,code.context,code.impact"

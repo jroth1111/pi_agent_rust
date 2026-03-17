@@ -224,10 +224,6 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
             "code.impact",
             "Reference and test impact search for symbols or files",
         ),
-        (
-            "lsp",
-            "Fallback symbol lookup and diagnostics for code navigation",
-        ),
     ];
 
     let mut tools = Vec::new();
@@ -256,7 +252,6 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let has_code_query = has_tool("code.query");
     let has_code_context = has_tool("code.context");
     let has_code_impact = has_tool("code.impact");
-    let has_lsp = has_tool("lsp");
 
     let mut guidelines_list = Vec::new();
     if has_bash && !has_grep && !has_find && !has_ls {
@@ -290,11 +285,6 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     if has_code_query || has_code_context || has_code_impact {
         guidelines_list.push(
             "Prefer code.query, code.context, and code.impact for code navigation before broad grep/find churn.",
-        );
-    }
-    if has_lsp {
-        guidelines_list.push(
-            "Use lsp only as a fallback when the code.* tools do not provide enough context.",
         );
     }
 
@@ -1117,6 +1107,30 @@ mod tests {
 
         assert!(prompt.contains("# Repo Policy Digest"));
         assert!(!prompt.contains("# Project Context"));
+    }
+
+    #[test]
+    fn build_system_prompt_does_not_advertise_builtin_lsp_fallback() {
+        let root = tempdir().expect("tempdir");
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let prompt = build_system_prompt(
+            &cli,
+            &cwd,
+            &["read", "code.query", "code.context", "code.impact"],
+            None,
+            root.path(),
+            root.path(),
+            true,
+        );
+
+        assert!(prompt.contains("code.query"));
+        assert!(prompt.contains("code.context"));
+        assert!(prompt.contains("code.impact"));
+        assert!(!prompt.contains("- lsp:"));
+        assert!(!prompt.contains("Use lsp only as a fallback"));
     }
 
     #[test]

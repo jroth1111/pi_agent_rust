@@ -5726,7 +5726,7 @@ impl AgentSession {
 
     fn turn_retrieval_bundle(objective: &str) -> String {
         format!(
-            "objective={objective}\nretrieval_ladder=code.query -> code.context -> code.impact -> read -> grep/find"
+            "objective={objective}\nretrieval_ladder=code.query -> code.context -> code.impact -> read -> grep/find\nbundle_contract=compact_code_context_bundle_with_semantic_hints"
         )
     }
 
