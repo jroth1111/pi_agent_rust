@@ -98,6 +98,7 @@ pub mod auth;
 pub mod autocomplete;
 pub mod buffer_shim;
 pub mod cli;
+pub mod code_index;
 pub mod compaction;
 pub mod compaction_worker;
 pub mod config;
