@@ -1,0 +1,12 @@
+commands:
+  install: /Users/gwizz/.cargo/bin/cargo fetch --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml
+  fmt: /Users/gwizz/.cargo/bin/cargo fmt --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --check
+  check: /Users/gwizz/.cargo/bin/cargo check --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --all-targets
+  clippy: /Users/gwizz/.cargo/bin/cargo clippy --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --all-targets -- -D warnings
+  test: /Users/gwizz/.cargo/bin/cargo test --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --all-targets -- --test-threads=2
+  verify: /Users/gwizz/CascadeProjects/pi_agent_rust/verify
+  cli_smoke: /Users/gwizz/.cargo/bin/cargo run --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --bin pi -- --help
+  rpc_smoke: printf '{"id":"req-1","type":"get_state"}\n' | /Users/gwizz/.cargo/bin/cargo run --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --bin pi -- --mode rpc
+  tui_smoke: PI_TEST_MODE=1 /Users/gwizz/.cargo/bin/cargo test --manifest-path /Users/gwizz/CascadeProjects/pi_agent_rust/Cargo.toml --test e2e_tui -- --nocapture --test-threads=1
+
+services: {}
