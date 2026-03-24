@@ -85,6 +85,12 @@ const USAGE_ERROR_PATTERNS: &[&str] = &[
     "theme spec is empty",
 ];
 
+enum SurfaceStartupRecovery {
+    RetryAfterSetup,
+    ExitQuietly,
+    None,
+}
+
 fn main() {
     if let Err(err) = main_impl() {
         let exit_code = exit_code_for_error(&err);
@@ -980,16 +986,24 @@ async fn run(
             Ok(selection) => selection,
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    // Interactive mode with TTY can run first-time setup
-                    if surface_bootstrap.can_run_interactive_setup() {
-                        if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
+                    match try_run_surface_startup_setup(
+                        &surface_bootstrap,
+                        startup,
+                        &mut auth,
+                        &mut cli,
+                        &models_path,
+                    )
+                    .await?
+                    {
+                        SurfaceStartupRecovery::RetryAfterSetup => {
                             model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
                             if let Some(error) = model_registry.error() {
                                 eprintln!("Warning: models.json error: {error}");
                             }
                             continue;
                         }
-                        return Ok(());
+                        SurfaceStartupRecovery::ExitQuietly => return Ok(()),
+                        SurfaceStartupRecovery::None => {}
                     }
                     // Non-interactive mode: fail closed with explicit error
                     if let Some(ref guard) = non_interactive_guard {
@@ -1017,16 +1031,24 @@ async fn run(
                         }
                     }
 
-                    // Interactive mode with TTY can run first-time setup
-                    if surface_bootstrap.can_run_interactive_setup() {
-                        if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
+                    match try_run_surface_startup_setup(
+                        &surface_bootstrap,
+                        startup,
+                        &mut auth,
+                        &mut cli,
+                        &models_path,
+                    )
+                    .await?
+                    {
+                        SurfaceStartupRecovery::RetryAfterSetup => {
                             model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
                             if let Some(error) = model_registry.error() {
                                 eprintln!("Warning: models.json error: {error}");
                             }
                             continue;
                         }
-                        return Ok(());
+                        SurfaceStartupRecovery::ExitQuietly => return Ok(()),
+                        SurfaceStartupRecovery::None => {}
                     }
                     // Non-interactive mode: fail closed with explicit OAuth error
                     if let Some(ref guard) = non_interactive_guard {
@@ -3534,6 +3556,24 @@ Code expires in {} seconds.\n",
     ));
     console.render_info("Continuing startup...");
     Ok(true)
+}
+
+async fn try_run_surface_startup_setup(
+    surface_bootstrap: &pi::surface::CliSurfaceBootstrap,
+    startup_error: &StartupError,
+    auth: &mut AuthStorage,
+    cli: &mut cli::Cli,
+    models_path: &Path,
+) -> Result<SurfaceStartupRecovery> {
+    if !surface_bootstrap.can_run_interactive_setup() {
+        return Ok(SurfaceStartupRecovery::None);
+    }
+
+    if run_first_time_setup(startup_error, auth, cli, models_path).await? {
+        return Ok(SurfaceStartupRecovery::RetryAfterSetup);
+    }
+
+    Ok(SurfaceStartupRecovery::ExitQuietly)
 }
 
 fn filter_models_by_pattern(models: Vec<ModelEntry>, pattern: &str) -> Vec<ModelEntry> {
