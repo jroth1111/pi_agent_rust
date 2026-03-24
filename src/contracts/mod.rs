@@ -6,12 +6,17 @@
 //! concerns such as inference, context, workspace, host execution, identity,
 //! capability approval, and admission.
 
+pub mod bootstrap;
 pub mod boundary;
 pub mod dto;
 pub mod engine;
 pub mod kernel;
 pub mod plane;
 
+pub use bootstrap::{
+    BootstrapPaths, BootstrapProfile, BootstrapRequest, InteractionMode, ResumeTarget,
+    SurfaceCapabilities, SurfaceKind,
+};
 pub use boundary::{ContractBoundary, SurfaceBoundary, assert_surface_boundary};
 pub use dto::{
     AdmissionControl, AdmissionDecision, AdmissionGrant, ApprovalChoice, ApprovalControl,
