@@ -9,6 +9,7 @@
 pub mod boundary;
 pub mod dto;
 pub mod engine;
+pub mod kernel;
 pub mod plane;
 
 pub use boundary::{ContractBoundary, SurfaceBoundary, assert_surface_boundary};
@@ -27,6 +28,7 @@ pub use engine::{
     SubmitTaskResult, TaskContract, TaskPrerequisite, TaskStateDigest, WaveStatus,
     WorkerRuntimeContract, WorkflowContract,
 };
+pub use kernel::{ApplicationKernel, ApplicationKernelBuilder};
 pub use plane::{
     ActorIdentity, ActorType, AdmissionContract, AdmissionRecord, AdmissionState,
     CapabilityContract, CapabilityDecision, CapabilityRequest, ConflictInfo, ConflictType,
