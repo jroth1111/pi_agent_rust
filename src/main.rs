@@ -699,6 +699,74 @@ fn apply_cli_retry_override(config: &mut Config, cli: &cli::Cli) {
     config.retry = Some(retry);
 }
 
+struct StartupResources {
+    config: Config,
+    resources: ResourceLoader,
+    auth: AuthStorage,
+    resource_cli: ResourceCliOptions,
+}
+
+async fn load_startup_resources(
+    cli: &cli::Cli,
+    extension_flags: &[cli::ExtensionCliFlag],
+    cwd: &Path,
+) -> Result<StartupResources> {
+    let mut config = Config::load()?;
+    if let Some(theme_spec) = cli.theme.as_deref() {
+        // Theme already validated above.
+        config.theme = Some(theme_spec.to_string());
+    }
+    apply_cli_retry_override(&mut config, cli);
+    spawn_session_index_maintenance();
+
+    let package_manager = PackageManager::new(cwd.to_path_buf());
+    let resource_cli = ResourceCliOptions {
+        no_skills: cli.no_skills,
+        no_prompt_templates: cli.no_prompt_templates,
+        no_extensions: cli.no_extensions,
+        no_themes: cli.no_themes,
+        skill_paths: cli.skill.clone(),
+        prompt_paths: cli.prompt_template.clone(),
+        extension_paths: cli.extension.clone(),
+        theme_paths: cli.theme_path.clone(),
+    };
+
+    let auth_path = Config::auth_path();
+    let (resources_result, auth_result) = futures::future::join(
+        ResourceLoader::load(&package_manager, cwd, &config, &resource_cli),
+        AuthStorage::load_async(auth_path),
+    )
+    .await;
+
+    let resources = match resources_result {
+        Ok(resources) => resources,
+        Err(err) => {
+            eprintln!("Warning: Failed to load skills/prompts: {err}");
+            ResourceLoader::empty(config.enable_skill_commands())
+        }
+    };
+
+    if !extension_flags.is_empty() && resources.extensions().is_empty() {
+        let rendered = extension_flags
+            .iter()
+            .map(cli::ExtensionCliFlag::display_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(pi::error::Error::validation(format!(
+            "Extension flags were provided ({rendered}), but no extensions are loaded. \
+             Add extensions via --extension or remove the flags."
+        ))
+        .into());
+    }
+
+    Ok(StartupResources {
+        config,
+        resources,
+        auth: auth_result?,
+        resource_cli,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -719,56 +787,12 @@ async fn run(
         }
     }
 
-    let mut config = Config::load()?;
-    if let Some(theme_spec) = cli.theme.as_deref() {
-        // Theme already validated above
-        config.theme = Some(theme_spec.to_string());
-    }
-    apply_cli_retry_override(&mut config, &cli);
-    spawn_session_index_maintenance();
-    let package_manager = PackageManager::new(cwd.clone());
-    let resource_cli = ResourceCliOptions {
-        no_skills: cli.no_skills,
-        no_prompt_templates: cli.no_prompt_templates,
-        no_extensions: cli.no_extensions,
-        no_themes: cli.no_themes,
-        skill_paths: cli.skill.clone(),
-        prompt_paths: cli.prompt_template.clone(),
-        extension_paths: cli.extension.clone(),
-        theme_paths: cli.theme_path.clone(),
-    };
-    // Run resource loading and auth loading in parallel — they are independent.
-    let auth_path = Config::auth_path();
-    let (resources_result, auth_result) = futures::future::join(
-        ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli),
-        AuthStorage::load_async(auth_path),
-    )
-    .await;
-
-    let resources = match resources_result {
-        Ok(resources) => resources,
-        Err(err) => {
-            eprintln!("Warning: Failed to load skills/prompts: {err}");
-            ResourceLoader::empty(config.enable_skill_commands())
-        }
-    };
-
-    // Fail early when extension flags were extracted from the CLI but no extensions
-    // are available.  Without this check the binary proceeds to model selection which
-    // may fail for an unrelated reason (e.g. "No models available") and mask the real
-    // usage error.
-    if !extension_flags.is_empty() && resources.extensions().is_empty() {
-        let rendered = extension_flags
-            .iter()
-            .map(cli::ExtensionCliFlag::display_name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(pi::error::Error::validation(format!(
-            "Extension flags were provided ({rendered}), but no extensions are loaded. \
-             Add extensions via --extension or remove the flags."
-        ))
-        .into());
-    }
+    let StartupResources {
+        config,
+        resources,
+        mut auth,
+        resource_cli,
+    } = load_startup_resources(&cli, &extension_flags, &cwd).await?;
 
     let mut has_js_extensions = false;
     let mut has_native_extensions = false;
@@ -887,7 +911,6 @@ async fn run(
         ))
     };
 
-    let mut auth = auth_result?;
     auth.refresh_expired_oauth_tokens().await?;
 
     // Prune stale credentials that are well past expiry and lack refresh metadata.
@@ -1353,10 +1376,7 @@ fn spawn_session_index_maintenance() {
     });
 }
 
-async fn flush_session_autosave_on_shutdown(
-    session_handle: &Arc<Mutex<Session>>,
-    disabled: bool,
-) {
+async fn flush_session_autosave_on_shutdown(session_handle: &Arc<Mutex<Session>>, disabled: bool) {
     if disabled {
         return;
     }
@@ -3597,10 +3617,7 @@ async fn recover_surface_startup_error_for_selection(
     }
 }
 
-fn load_model_registry_with_warning(
-    auth: &AuthStorage,
-    models_path: &Path,
-) -> ModelRegistry {
+fn load_model_registry_with_warning(auth: &AuthStorage, models_path: &Path) -> ModelRegistry {
     let model_registry = ModelRegistry::load(auth, Some(models_path.to_path_buf()));
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
