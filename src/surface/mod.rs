@@ -96,11 +96,12 @@ impl NonInteractiveGuard {
             return Ok(());
         }
 
-        // In non-interactive mode, TTY-only operations are allowed to proceed
-        // since the route is explicitly non-interactive by user choice.
-        // The guard only fails when approval/OAuth is required, not TTY access.
-        let _ = operation;
-        Ok(())
+        Err(crate::error::Error::validation(format!(
+            "TTY access required for '{}' in non-interactive mode. \
+            This operation requires an interactive terminal but the current route is non-interactive. \
+            Use interactive mode without --print/--mode flags, or complete the setup/configuration beforehand.",
+            operation
+        )))
     }
 
     /// Mark the guard as having a blocked approval.
@@ -243,6 +244,18 @@ mod tests {
         // Error message should mention OAuth and interactive mode
         let err = result.unwrap_err();
         assert!(err.to_string().contains("OAuth"));
+        assert!(err.to_string().contains("non-interactive"));
+    }
+
+    #[test]
+    fn non_interactive_guard_tty_check() {
+        let guard = NonInteractiveGuard::new();
+
+        let result = guard.check_tty_required("first-time setup");
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("TTY access required"));
         assert!(err.to_string().contains("non-interactive"));
     }
 
