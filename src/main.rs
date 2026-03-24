@@ -1004,10 +1004,8 @@ async fn run(
                     .await?
                     {
                         SurfaceStartupRecovery::RetryAfterSetup => {
-                            model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
-                            if let Some(error) = model_registry.error() {
-                                eprintln!("Warning: models.json error: {error}");
-                            }
+                            model_registry =
+                                reload_model_registry_after_surface_setup(&auth, &models_path);
                             continue;
                         }
                         SurfaceStartupRecovery::ExitQuietly => return Ok(()),
@@ -1054,10 +1052,8 @@ async fn run(
                     .await?
                     {
                         SurfaceStartupRecovery::RetryAfterSetup => {
-                            model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
-                            if let Some(error) = model_registry.error() {
-                                eprintln!("Warning: models.json error: {error}");
-                            }
+                            model_registry =
+                                reload_model_registry_after_surface_setup(&auth, &models_path);
                             continue;
                         }
                         SurfaceStartupRecovery::ExitQuietly => return Ok(()),
@@ -3612,6 +3608,17 @@ async fn handle_surface_startup_error(
     }
 
     Ok(SurfaceStartupRecovery::None)
+}
+
+fn reload_model_registry_after_surface_setup(
+    auth: &AuthStorage,
+    models_path: &Path,
+) -> ModelRegistry {
+    let model_registry = ModelRegistry::load(auth, Some(models_path.to_path_buf()));
+    if let Some(error) = model_registry.error() {
+        eprintln!("Warning: models.json error: {error}");
+    }
+    model_registry
 }
 
 fn filter_models_by_pattern(models: Vec<ModelEntry>, pattern: &str) -> Vec<ModelEntry> {
