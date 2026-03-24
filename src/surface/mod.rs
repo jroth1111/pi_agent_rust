@@ -36,6 +36,12 @@ pub struct NonInteractiveGuard {
     pub blocked_reason: Option<String>,
 }
 
+impl Default for NonInteractiveGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Resolved CLI surface bootstrap plan.
 #[derive(Debug, Clone)]
 pub struct CliSurfaceBootstrap {

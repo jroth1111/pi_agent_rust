@@ -60,7 +60,7 @@ impl KernelReadiness {
     }
 
     #[must_use]
-    pub fn all_required_ready(&self, requires_extension_runtime: bool) -> bool {
+    pub const fn all_required_ready(&self, requires_extension_runtime: bool) -> bool {
         self.conversation.is_ready()
             && self.workflow.is_ready()
             && self.persistence.is_ready()
@@ -154,7 +154,7 @@ impl BootstrapOutcome {
     }
 
     #[must_use]
-    pub fn is_ready_for_execution(&self, requires_extension_runtime: bool) -> bool {
+    pub const fn is_ready_for_execution(&self, requires_extension_runtime: bool) -> bool {
         self.readiness
             .all_required_ready(requires_extension_runtime)
     }
@@ -165,6 +165,7 @@ impl BootstrapOutcome {
 /// Thin entrypoints should translate CLI/TUI/RPC startup intent into a
 /// [`BootstrapRequest`] and call this contract instead of open-coding startup
 /// policy, resume logic, or readiness checks.
+#[allow(async_fn_in_trait)]
 pub trait RuntimeBootstrapContract: Send + Sync {
     /// Bootstrap a runtime session for a surface.
     async fn bootstrap(&self, request: BootstrapRequest) -> Result<BootstrapOutcome>;

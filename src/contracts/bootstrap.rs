@@ -57,25 +57,13 @@ pub struct BootstrapPaths {
 }
 
 /// Surface capabilities that affect safe startup behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SurfaceCapabilities {
     pub stdin_tty: bool,
     pub stdout_tty: bool,
     pub allow_prompts: bool,
     pub allow_browser_auth: bool,
     pub allow_approval_ui: bool,
-}
-
-impl Default for SurfaceCapabilities {
-    fn default() -> Self {
-        Self {
-            stdin_tty: false,
-            stdout_tty: false,
-            allow_prompts: false,
-            allow_browser_auth: false,
-            allow_approval_ui: false,
-        }
-    }
 }
 
 /// Resume intent carried across compaction, restart, or handoff.
@@ -91,7 +79,7 @@ pub struct ResumeTarget {
 
 impl ResumeTarget {
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.session_id.is_none() && self.run_id.is_none() && self.task_id.is_none()
     }
 }
