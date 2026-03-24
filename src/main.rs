@@ -1285,15 +1285,7 @@ async fn run(
     )
     .await;
 
-    // Best-effort autosave flush on shutdown.
-    let cx = pi::agent_cx::AgentCx::for_request();
-    if !cli.no_session {
-        if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
-            if let Err(e) = guard.flush_autosave_on_shutdown().await {
-                eprintln!("Warning: Failed to flush session autosave: {e}");
-            }
-        }
-    }
+    flush_session_autosave_on_shutdown(&session_handle, cli.no_session).await;
 
     result
 }
@@ -1373,6 +1365,22 @@ fn spawn_session_index_maintenance() {
             }
         }
     });
+}
+
+async fn flush_session_autosave_on_shutdown(
+    session_handle: &Arc<Mutex<Session>>,
+    disabled: bool,
+) {
+    if disabled {
+        return;
+    }
+
+    let cx = pi::agent_cx::AgentCx::for_request();
+    if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
+        if let Err(e) = guard.flush_autosave_on_shutdown().await {
+            eprintln!("Warning: Failed to flush session autosave: {e}");
+        }
+    }
 }
 
 const fn scope_from_flag(local: bool) -> PackageScope {
