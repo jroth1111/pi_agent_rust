@@ -933,6 +933,15 @@ async fn run(
     let is_interactive = !cli.print && cli.mode.is_none();
     let mode = cli.mode.clone().unwrap_or_else(|| "text".to_string());
 
+    // Create non-interactive guard for fail-closed behavior.
+    // Non-interactive routes (print, rpc, json, text modes) must fail explicitly
+    // when they would require interactive approval, OAuth flows, or TTY access.
+    let non_interactive_guard = if !is_interactive {
+        Some(pi::surface::NonInteractiveGuard::new())
+    } else {
+        None
+    };
+
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         pi::app::parse_models_arg(models_arg)
     } else {
@@ -972,6 +981,7 @@ async fn run(
             Ok(selection) => selection,
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
+                    // Interactive mode with TTY can run first-time setup
                     if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
                         if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
                             model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
@@ -981,6 +991,10 @@ async fn run(
                             continue;
                         }
                         return Ok(());
+                    }
+                    // Non-interactive mode: fail closed with explicit error
+                    if let Some(ref guard) = non_interactive_guard {
+                        guard.check_tty_required("first-time setup")?;
                     }
                 }
                 return Err(err);
@@ -1004,6 +1018,7 @@ async fn run(
                         }
                     }
 
+                    // Interactive mode with TTY can run first-time setup
                     if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
                         if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
                             model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
@@ -1013,6 +1028,12 @@ async fn run(
                             continue;
                         }
                         return Ok(());
+                    }
+                    // Non-interactive mode: fail closed with explicit OAuth error
+                    if let Some(ref guard) = non_interactive_guard {
+                        if let StartupError::MissingApiKey { provider } = startup {
+                            guard.check_oauth_required(provider)?;
+                        }
                     }
                 }
                 return Err(err);
@@ -3682,6 +3703,11 @@ async fn run_print_mode(
     runtime_handle: RuntimeHandle,
     config: &Config,
 ) -> Result<()> {
+    // Fail closed: non-interactive modes cannot handle approval prompts.
+    // Print mode is always non-interactive and should never fall back to TTY prompts.
+    // Extension capability requests are handled by the extension UI mechanism,
+    // which fails closed when no UI sender is configured.
+
     if mode != "text" && mode != "json" {
         bail!("Unknown mode: {mode}");
     }

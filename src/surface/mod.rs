@@ -136,14 +136,22 @@ impl CliRouteKind {
     pub const fn is_non_interactive(&self) -> bool {
         matches!(
             self,
-            Self::Rpc | Self::Print | Self::Json | Self::Text | Self::Subcommand | Self::FastOffline
+            Self::Rpc
+                | Self::Print
+                | Self::Json
+                | Self::Text
+                | Self::Subcommand
+                | Self::FastOffline
         )
     }
 
     /// Determine if this route requires streaming/inference.
     #[must_use]
     pub const fn requires_inference(&self) -> bool {
-        matches!(self, Self::Interactive | Self::Rpc | Self::Print | Self::Json | Self::Text)
+        matches!(
+            self,
+            Self::Interactive | Self::Rpc | Self::Print | Self::Json | Self::Text
+        )
     }
 }
 
