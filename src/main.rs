@@ -904,10 +904,7 @@ async fn run(
     let global_dir = Config::global_dir();
     let package_dir = Config::package_dir();
     let models_path = default_models_path(&global_dir);
-    let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
-    if let Some(error) = model_registry.error() {
-        eprintln!("Warning: models.json error: {error}");
-    }
+    let mut model_registry = load_model_registry_with_warning(&auth, &models_path);
     if let Some(pattern) = &cli.list_models {
         list_models(&model_registry, pattern.as_deref());
         return Ok(());
@@ -3592,7 +3589,7 @@ async fn recover_surface_startup_error_for_selection(
     .await?
     {
         SurfaceStartupRecovery::RetryAfterSetup => {
-            *model_registry = reload_model_registry_after_surface_setup(auth, models_path);
+            *model_registry = load_model_registry_with_warning(auth, models_path);
             Ok(SurfaceStartupLoopAction::ContinueSelection)
         }
         SurfaceStartupRecovery::ExitQuietly => Ok(SurfaceStartupLoopAction::ExitQuietly),
@@ -3600,7 +3597,7 @@ async fn recover_surface_startup_error_for_selection(
     }
 }
 
-fn reload_model_registry_after_surface_setup(
+fn load_model_registry_with_warning(
     auth: &AuthStorage,
     models_path: &Path,
 ) -> ModelRegistry {
