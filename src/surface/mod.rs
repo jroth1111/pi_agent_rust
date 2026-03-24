@@ -104,6 +104,36 @@ impl NonInteractiveGuard {
         )))
     }
 
+    /// Check whether an extension UI request can be served on a non-interactive route.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the requested extension UI interaction
+    /// would require approval or a terminal on a non-interactive route.
+    pub fn check_extension_ui_request(
+        &self,
+        method: &str,
+        capability: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<()> {
+        let title = title.map(str::trim).filter(|value| !value.is_empty());
+        let capability = capability
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(title);
+
+        match method.trim() {
+            "confirm" => self.check_approval_required(
+                capability.unwrap_or("extension confirmation"),
+                "extension_ui",
+            ),
+            "select" | "input" | "editor" => {
+                self.check_tty_required(capability.unwrap_or("extension UI request"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Mark the guard as having a blocked approval.
     pub fn mark_blocked(&mut self, reason: &str) {
         self.blocked_reason = Some(reason.to_string());
@@ -257,6 +287,34 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("TTY access required"));
         assert!(err.to_string().contains("non-interactive"));
+    }
+
+    #[test]
+    fn non_interactive_guard_extension_confirm_check() {
+        let guard = NonInteractiveGuard::new();
+
+        let result = guard.check_extension_ui_request(
+            "confirm",
+            Some("filesystem.write"),
+            Some("Allow capability"),
+        );
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("filesystem.write"));
+        assert!(err.to_string().contains("Approval required"));
+    }
+
+    #[test]
+    fn non_interactive_guard_extension_input_check() {
+        let guard = NonInteractiveGuard::new();
+
+        let result = guard.check_extension_ui_request("input", None, Some("Extension needs input"));
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("TTY access required"));
+        assert!(err.to_string().contains("Extension needs input"));
     }
 
     #[test]
