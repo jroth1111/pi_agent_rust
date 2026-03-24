@@ -91,6 +91,12 @@ enum SurfaceStartupRecovery {
     None,
 }
 
+enum SurfaceStartupLoopAction {
+    ContinueSelection,
+    ExitQuietly,
+    Propagate,
+}
+
 enum NonInteractiveStartupRequirement<'a> {
     None,
     Tty(&'a str),
@@ -992,24 +998,21 @@ async fn run(
             Ok(selection) => selection,
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    match handle_surface_startup_error(
+                    match recover_surface_startup_error_for_selection(
                         &surface_bootstrap,
                         non_interactive_guard.as_ref(),
                         startup,
                         &mut auth,
                         &mut cli,
                         &models_path,
+                        &mut model_registry,
                         NonInteractiveStartupRequirement::Tty("first-time setup"),
                     )
                     .await?
                     {
-                        SurfaceStartupRecovery::RetryAfterSetup => {
-                            model_registry =
-                                reload_model_registry_after_surface_setup(&auth, &models_path);
-                            continue;
-                        }
-                        SurfaceStartupRecovery::ExitQuietly => return Ok(()),
-                        SurfaceStartupRecovery::None => {}
+                        SurfaceStartupLoopAction::ContinueSelection => continue,
+                        SurfaceStartupLoopAction::ExitQuietly => return Ok(()),
+                        SurfaceStartupLoopAction::Propagate => {}
                     }
                 }
                 return Err(err);
@@ -1040,24 +1043,21 @@ async fn run(
                         _ => NonInteractiveStartupRequirement::None,
                     };
 
-                    match handle_surface_startup_error(
+                    match recover_surface_startup_error_for_selection(
                         &surface_bootstrap,
                         non_interactive_guard.as_ref(),
                         startup,
                         &mut auth,
                         &mut cli,
                         &models_path,
+                        &mut model_registry,
                         non_interactive_requirement,
                     )
                     .await?
                     {
-                        SurfaceStartupRecovery::RetryAfterSetup => {
-                            model_registry =
-                                reload_model_registry_after_surface_setup(&auth, &models_path);
-                            continue;
-                        }
-                        SurfaceStartupRecovery::ExitQuietly => return Ok(()),
-                        SurfaceStartupRecovery::None => {}
+                        SurfaceStartupLoopAction::ContinueSelection => continue,
+                        SurfaceStartupLoopAction::ExitQuietly => return Ok(()),
+                        SurfaceStartupLoopAction::Propagate => {}
                     }
                 }
                 return Err(err);
@@ -3568,6 +3568,36 @@ async fn handle_surface_startup_error(
     }
 
     Ok(SurfaceStartupRecovery::None)
+}
+
+async fn recover_surface_startup_error_for_selection(
+    surface_bootstrap: &pi::surface::CliSurfaceBootstrap,
+    non_interactive_guard: Option<&pi::surface::NonInteractiveGuard>,
+    startup_error: &StartupError,
+    auth: &mut AuthStorage,
+    cli: &mut cli::Cli,
+    models_path: &Path,
+    model_registry: &mut ModelRegistry,
+    non_interactive_requirement: NonInteractiveStartupRequirement<'_>,
+) -> Result<SurfaceStartupLoopAction> {
+    match handle_surface_startup_error(
+        surface_bootstrap,
+        non_interactive_guard,
+        startup_error,
+        auth,
+        cli,
+        models_path,
+        non_interactive_requirement,
+    )
+    .await?
+    {
+        SurfaceStartupRecovery::RetryAfterSetup => {
+            *model_registry = reload_model_registry_after_surface_setup(auth, models_path);
+            Ok(SurfaceStartupLoopAction::ContinueSelection)
+        }
+        SurfaceStartupRecovery::ExitQuietly => Ok(SurfaceStartupLoopAction::ExitQuietly),
+        SurfaceStartupRecovery::None => Ok(SurfaceStartupLoopAction::Propagate),
+    }
 }
 
 fn reload_model_registry_after_surface_setup(
