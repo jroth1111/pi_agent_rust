@@ -802,6 +802,23 @@ fn resolve_extension_runtime_flavor(
     }
 }
 
+async fn refresh_startup_auth(auth: &mut AuthStorage) -> Result<()> {
+    auth.refresh_expired_oauth_tokens().await?;
+
+    // Prune stale credentials that are well past expiry and lack refresh metadata.
+    // 7-day cutoff (in milliseconds).
+    let pruned = auth.prune_stale_credentials(7 * 24 * 60 * 60 * 1000);
+    if !pruned.is_empty() {
+        tracing::info!(
+            pruned_providers = ?pruned,
+            "Pruned stale credentials during startup"
+        );
+        auth.save()?;
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -928,18 +945,7 @@ async fn run(
         ))
     };
 
-    auth.refresh_expired_oauth_tokens().await?;
-
-    // Prune stale credentials that are well past expiry and lack refresh metadata.
-    // 7-day cutoff (in milliseconds).
-    let pruned = auth.prune_stale_credentials(7 * 24 * 60 * 60 * 1000);
-    if !pruned.is_empty() {
-        tracing::info!(
-            pruned_providers = ?pruned,
-            "Pruned stale credentials during startup"
-        );
-        auth.save()?;
-    }
+    refresh_startup_auth(&mut auth).await?;
 
     let global_dir = Config::global_dir();
     let package_dir = Config::package_dir();
