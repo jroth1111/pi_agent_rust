@@ -12,6 +12,7 @@ pub mod dto;
 pub mod engine;
 pub mod kernel;
 pub mod plane;
+pub mod runtime;
 
 pub use bootstrap::{
     BootstrapPaths, BootstrapProfile, BootstrapRequest, InteractionMode, ResumeTarget,
@@ -45,6 +46,7 @@ pub use plane::{
     SecretHandleRequest, SecretType, ToolDefinition, WorkspaceConfig, WorkspaceContract,
     WorkspaceStatus, WorktreeConfig, WorktreeInfo,
 };
+pub use runtime::{BootstrapOutcome, BootstrapWarning, KernelReadiness, ServiceState};
 
 /// Contract version for compatibility tracking.
 pub const CONTRACT_VERSION: &str = "1.0.0";
