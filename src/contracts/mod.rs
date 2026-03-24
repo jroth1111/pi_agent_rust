@@ -46,7 +46,9 @@ pub use plane::{
     SecretHandleRequest, SecretType, ToolDefinition, WorkspaceConfig, WorkspaceContract,
     WorkspaceStatus, WorktreeConfig, WorktreeInfo,
 };
-pub use runtime::{BootstrapOutcome, BootstrapWarning, KernelReadiness, ServiceState};
+pub use runtime::{
+    BootstrapOutcome, BootstrapWarning, KernelReadiness, RuntimeBootstrapContract, ServiceState,
+};
 
 /// Contract version for compatibility tracking.
 pub const CONTRACT_VERSION: &str = "1.0.0";

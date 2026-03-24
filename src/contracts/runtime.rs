@@ -3,7 +3,8 @@
 //! These types let surfaces observe the result of kernel startup without
 //! reaching into concrete engine implementations.
 
-use crate::contracts::bootstrap::{InteractionMode, SurfaceKind};
+use crate::contracts::bootstrap::{BootstrapRequest, InteractionMode, SurfaceKind};
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 
 /// Service health classification exposed during bootstrap.
@@ -157,6 +158,19 @@ impl BootstrapOutcome {
         self.readiness
             .all_required_ready(requires_extension_runtime)
     }
+}
+
+/// Surface-facing bootstrap service.
+///
+/// Thin entrypoints should translate CLI/TUI/RPC startup intent into a
+/// [`BootstrapRequest`] and call this contract instead of open-coding startup
+/// policy, resume logic, or readiness checks.
+pub trait RuntimeBootstrapContract: Send + Sync {
+    /// Bootstrap a runtime session for a surface.
+    async fn bootstrap(&self, request: BootstrapRequest) -> Result<BootstrapOutcome>;
+
+    /// Return the latest readiness snapshot without starting a new session.
+    async fn readiness(&self) -> Result<KernelReadiness>;
 }
 
 #[cfg(test)]
