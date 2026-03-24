@@ -1243,68 +1243,77 @@ async fn run(
     // Clone session handle for shutdown flush (ensures autosave queue is drained).
     let session_handle = Arc::clone(&agent_session.session);
 
-    let result = if mode == "rpc" {
-        let available_models = model_registry.get_available();
-        let rpc_scoped_models = selection
-            .scoped_models
-            .iter()
-            .map(|sm| pi::rpc::RpcScopedModel {
-                model: sm.model.clone(),
-                thinking_level: sm.thinking_level,
-            })
-            .collect::<Vec<_>>();
-        Box::pin(run_rpc_mode(
-            agent_session,
-            resources,
-            config.clone(),
-            available_models,
-            rpc_scoped_models,
-            auth.clone(),
-            runtime_handle.clone(),
-        ))
-        .await
-    } else if is_interactive {
-        let model_scope = selection
-            .scoped_models
-            .iter()
-            .map(|sm| sm.model.clone())
-            .collect::<Vec<_>>();
-        let available_models = model_registry.get_available();
-
-        run_interactive_mode(
-            agent_session,
-            initial,
-            messages,
-            config.clone(),
-            selection.model_entry.clone(),
-            model_scope,
-            available_models,
-            !cli.no_session,
-            resources,
-            resource_cli,
-            cwd.clone(),
-            runtime_handle.clone(),
-        )
-        .await
-    } else {
-        let result = run_print_mode(
-            &mut agent_session,
-            &mode,
-            initial,
-            messages,
-            &resources,
-            runtime_handle.clone(),
-            &config,
-        )
-        .await;
-        // Explicitly shut down extension runtimes before the session drops.
-        // Without this, ExtensionRegion::drop() runs synchronously and cannot
-        // coordinate with the QuickJS runtime thread, causing a GC assertion
-        // failure (non-empty gc_obj_list) when 2+ JS extensions are loaded.
-        if let Some(ref ext) = agent_session.extensions {
-            ext.shutdown().await;
+    let result = match surface_bootstrap.route_kind {
+        pi::surface::CliRouteKind::Rpc => {
+            let available_models = model_registry.get_available();
+            let rpc_scoped_models = selection
+                .scoped_models
+                .iter()
+                .map(|sm| pi::rpc::RpcScopedModel {
+                    model: sm.model.clone(),
+                    thinking_level: sm.thinking_level,
+                })
+                .collect::<Vec<_>>();
+            Box::pin(run_rpc_mode(
+                agent_session,
+                resources,
+                config.clone(),
+                available_models,
+                rpc_scoped_models,
+                auth.clone(),
+                runtime_handle.clone(),
+            ))
+            .await
         }
-        result
+        pi::surface::CliRouteKind::Interactive => {
+            let model_scope = selection
+                .scoped_models
+                .iter()
+                .map(|sm| sm.model.clone())
+                .collect::<Vec<_>>();
+            let available_models = model_registry.get_available();
+
+            run_interactive_mode(
+                agent_session,
+                initial,
+                messages,
+                config.clone(),
+                selection.model_entry.clone(),
+                model_scope,
+                available_models,
+                !cli.no_session,
+                resources,
+                resource_cli,
+                cwd.clone(),
+                runtime_handle.clone(),
+            )
+            .await
+        }
+        pi::surface::CliRouteKind::Print
+        | pi::surface::CliRouteKind::Json
+        | pi::surface::CliRouteKind::Text => {
+            let result = run_print_mode(
+                &mut agent_session,
+                &mode,
+                initial,
+                messages,
+                &resources,
+                runtime_handle.clone(),
+                &config,
+            )
+            .await;
+            // Explicitly shut down extension runtimes before the session drops.
+            // Without this, ExtensionRegion::drop() runs synchronously and cannot
+            // coordinate with the QuickJS runtime thread, causing a GC assertion
+            // failure (non-empty gc_obj_list) when 2+ JS extensions are loaded.
+            if let Some(ref ext) = agent_session.extensions {
+                ext.shutdown().await;
+            }
+            result
+        }
+        pi::surface::CliRouteKind::Subcommand | pi::surface::CliRouteKind::FastOffline => {
+            unreachable!("subcommands and fast-offline routes do not enter run()")
+        }
     };
 
     // Best-effort autosave flush on shutdown.
