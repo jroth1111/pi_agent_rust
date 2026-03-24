@@ -17,7 +17,11 @@
 //! fail closed when they would require interactive approval flows. This prevents
 //! silent fallback to interactive mode.
 
+use crate::contracts::bootstrap::{
+    BootstrapRequest, InteractionMode, SurfaceCapabilities, SurfaceKind,
+};
 use crate::error::Result;
+use std::path::PathBuf;
 
 /// Guard that ensures non-interactive routes fail closed instead of entering interactive flows.
 ///
@@ -153,6 +157,62 @@ impl CliRouteKind {
             Self::Interactive | Self::Rpc | Self::Print | Self::Json | Self::Text
         )
     }
+
+    /// Map the CLI route kind to the surface kind used by bootstrap contracts.
+    #[must_use]
+    pub const fn surface_kind(&self) -> SurfaceKind {
+        match self {
+            Self::Interactive => SurfaceKind::Interactive,
+            Self::Rpc => SurfaceKind::Rpc,
+            Self::Print | Self::Json | Self::Text | Self::Subcommand | Self::FastOffline => {
+                SurfaceKind::Cli
+            }
+        }
+    }
+
+    /// Map the CLI route kind to the intended interaction mode.
+    #[must_use]
+    pub const fn interaction_mode(&self) -> InteractionMode {
+        match self {
+            Self::Interactive => InteractionMode::Interactive,
+            Self::Rpc => InteractionMode::Headless,
+            Self::Print | Self::Json | Self::Text | Self::Subcommand | Self::FastOffline => {
+                InteractionMode::Batch
+            }
+        }
+    }
+
+    /// Build a typed bootstrap request for the route.
+    #[must_use]
+    pub fn bootstrap_request(
+        &self,
+        cwd: impl Into<PathBuf>,
+        stdin_tty: bool,
+        stdout_tty: bool,
+        argv: Vec<String>,
+    ) -> BootstrapRequest {
+        let mut request =
+            BootstrapRequest::for_surface(self.surface_kind(), self.interaction_mode(), cwd);
+        request.capabilities = SurfaceCapabilities {
+            stdin_tty,
+            stdout_tty,
+            allow_prompts: !self.is_non_interactive(),
+            allow_browser_auth: !self.is_non_interactive(),
+            allow_approval_ui: !self.is_non_interactive(),
+        };
+        request.argv = argv;
+        request
+    }
+
+    /// Construct a non-interactive guard when the route must fail closed.
+    #[must_use]
+    pub const fn non_interactive_guard(&self) -> Option<NonInteractiveGuard> {
+        if self.is_non_interactive() {
+            Some(NonInteractiveGuard::new())
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +267,30 @@ mod tests {
         assert!(CliRouteKind::Text.requires_inference());
         assert!(!CliRouteKind::Subcommand.requires_inference());
         assert!(!CliRouteKind::FastOffline.requires_inference());
+    }
+
+    #[test]
+    fn route_kind_builds_bootstrap_request_with_expected_surface_traits() {
+        let interactive = CliRouteKind::Interactive.bootstrap_request(
+            "/tmp/project",
+            true,
+            true,
+            vec!["pi".to_string()],
+        );
+        assert_eq!(interactive.surface, SurfaceKind::Interactive);
+        assert_eq!(interactive.interaction_mode, InteractionMode::Interactive);
+        assert!(interactive.capabilities.allow_prompts);
+        assert!(interactive.validate().is_ok());
+
+        let rpc = CliRouteKind::Rpc.bootstrap_request(
+            "/tmp/project",
+            false,
+            false,
+            vec!["pi".to_string(), "--mode".to_string(), "rpc".to_string()],
+        );
+        assert_eq!(rpc.surface, SurfaceKind::Rpc);
+        assert_eq!(rpc.interaction_mode, InteractionMode::Headless);
+        assert!(!rpc.capabilities.allow_prompts);
+        assert!(rpc.validate().is_ok());
     }
 }
