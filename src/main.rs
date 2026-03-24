@@ -91,6 +91,12 @@ enum SurfaceStartupRecovery {
     None,
 }
 
+enum NonInteractiveStartupRequirement<'a> {
+    None,
+    Tty(&'a str),
+    OAuth(&'a str),
+}
+
 fn main() {
     if let Err(err) = main_impl() {
         let exit_code = exit_code_for_error(&err);
@@ -986,12 +992,14 @@ async fn run(
             Ok(selection) => selection,
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    match try_run_surface_startup_setup(
+                    match handle_surface_startup_error(
                         &surface_bootstrap,
+                        non_interactive_guard.as_ref(),
                         startup,
                         &mut auth,
                         &mut cli,
                         &models_path,
+                        NonInteractiveStartupRequirement::Tty("first-time setup"),
                     )
                     .await?
                     {
@@ -1004,10 +1012,6 @@ async fn run(
                         }
                         SurfaceStartupRecovery::ExitQuietly => return Ok(()),
                         SurfaceStartupRecovery::None => {}
-                    }
-                    // Non-interactive mode: fail closed with explicit error
-                    if let Some(ref guard) = non_interactive_guard {
-                        guard.check_tty_required("first-time setup")?;
                     }
                 }
                 return Err(err);
@@ -1031,12 +1035,21 @@ async fn run(
                         }
                     }
 
-                    match try_run_surface_startup_setup(
+                    let non_interactive_requirement = match startup {
+                        StartupError::MissingApiKey { provider } => {
+                            NonInteractiveStartupRequirement::OAuth(provider)
+                        }
+                        _ => NonInteractiveStartupRequirement::None,
+                    };
+
+                    match handle_surface_startup_error(
                         &surface_bootstrap,
+                        non_interactive_guard.as_ref(),
                         startup,
                         &mut auth,
                         &mut cli,
                         &models_path,
+                        non_interactive_requirement,
                     )
                     .await?
                     {
@@ -1049,12 +1062,6 @@ async fn run(
                         }
                         SurfaceStartupRecovery::ExitQuietly => return Ok(()),
                         SurfaceStartupRecovery::None => {}
-                    }
-                    // Non-interactive mode: fail closed with explicit OAuth error
-                    if let Some(ref guard) = non_interactive_guard {
-                        if let StartupError::MissingApiKey { provider } = startup {
-                            guard.check_oauth_required(provider)?;
-                        }
                     }
                 }
                 return Err(err);
@@ -3574,6 +3581,37 @@ async fn try_run_surface_startup_setup(
     }
 
     Ok(SurfaceStartupRecovery::ExitQuietly)
+}
+
+async fn handle_surface_startup_error(
+    surface_bootstrap: &pi::surface::CliSurfaceBootstrap,
+    non_interactive_guard: Option<&pi::surface::NonInteractiveGuard>,
+    startup_error: &StartupError,
+    auth: &mut AuthStorage,
+    cli: &mut cli::Cli,
+    models_path: &Path,
+    non_interactive_requirement: NonInteractiveStartupRequirement<'_>,
+) -> Result<SurfaceStartupRecovery> {
+    let recovery =
+        try_run_surface_startup_setup(surface_bootstrap, startup_error, auth, cli, models_path)
+            .await?;
+    if !matches!(recovery, SurfaceStartupRecovery::None) {
+        return Ok(recovery);
+    }
+
+    if let Some(guard) = non_interactive_guard {
+        match non_interactive_requirement {
+            NonInteractiveStartupRequirement::None => {}
+            NonInteractiveStartupRequirement::Tty(operation) => {
+                guard.check_tty_required(operation)?;
+            }
+            NonInteractiveStartupRequirement::OAuth(provider) => {
+                guard.check_oauth_required(provider)?;
+            }
+        }
+    }
+
+    Ok(SurfaceStartupRecovery::None)
 }
 
 fn filter_models_by_pattern(models: Vec<ModelEntry>, pattern: &str) -> Vec<ModelEntry> {
