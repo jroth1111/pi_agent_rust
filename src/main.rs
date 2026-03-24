@@ -930,31 +930,17 @@ async fn run(
             .unwrap_or(true),
     )?;
 
-    let route_kind = if cli.mode.as_deref() == Some("rpc") {
-        pi::surface::CliRouteKind::Rpc
-    } else if !cli.print && cli.mode.is_none() {
-        pi::surface::CliRouteKind::Interactive
-    } else if cli.print {
-        pi::surface::CliRouteKind::Print
-    } else if cli.mode.as_deref() == Some("json") {
-        pi::surface::CliRouteKind::Json
-    } else {
-        pi::surface::CliRouteKind::Text
-    };
-    let bootstrap_request = route_kind.bootstrap_request(
+    let surface_bootstrap = pi::surface::CliSurfaceBootstrap::from_cli(
+        cli.mode.as_deref(),
+        cli.print,
         cwd.clone(),
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
         std::env::args().collect(),
-    );
-    bootstrap_request.validate()?;
-
-    let is_interactive = matches!(
-        bootstrap_request.interaction_mode,
-        pi::contracts::bootstrap::InteractionMode::Interactive
-    );
-    let mode = cli.mode.clone().unwrap_or_else(|| "text".to_string());
-    let non_interactive_guard = route_kind.non_interactive_guard();
+    )?;
+    let is_interactive = surface_bootstrap.is_interactive();
+    let mode = surface_bootstrap.mode.clone();
+    let non_interactive_guard = surface_bootstrap.non_interactive_guard();
 
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         pi::app::parse_models_arg(models_arg)

@@ -36,6 +36,14 @@ pub struct NonInteractiveGuard {
     pub blocked_reason: Option<String>,
 }
 
+/// Resolved CLI surface bootstrap plan.
+#[derive(Debug, Clone)]
+pub struct CliSurfaceBootstrap {
+    pub route_kind: CliRouteKind,
+    pub bootstrap_request: BootstrapRequest,
+    pub mode: String,
+}
+
 impl NonInteractiveGuard {
     /// Create a new guard for a non-interactive route.
     #[must_use]
@@ -143,6 +151,56 @@ impl NonInteractiveGuard {
     #[must_use]
     pub const fn is_blocked(&self) -> bool {
         self.blocked_reason.is_some()
+    }
+}
+
+impl CliSurfaceBootstrap {
+    /// Resolve CLI flags into a typed route/bootstrap plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the synthesized bootstrap request is incoherent.
+    pub fn from_cli(
+        mode: Option<&str>,
+        print: bool,
+        cwd: impl Into<PathBuf>,
+        stdin_tty: bool,
+        stdout_tty: bool,
+        argv: Vec<String>,
+    ) -> Result<Self> {
+        let route_kind = if mode == Some("rpc") {
+            CliRouteKind::Rpc
+        } else if !print && mode.is_none() {
+            CliRouteKind::Interactive
+        } else if print {
+            CliRouteKind::Print
+        } else if mode == Some("json") {
+            CliRouteKind::Json
+        } else {
+            CliRouteKind::Text
+        };
+
+        let bootstrap_request = route_kind.bootstrap_request(cwd, stdin_tty, stdout_tty, argv);
+        bootstrap_request.validate()?;
+
+        Ok(Self {
+            route_kind,
+            bootstrap_request,
+            mode: mode.unwrap_or("text").to_string(),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_interactive(&self) -> bool {
+        matches!(
+            self.bootstrap_request.interaction_mode,
+            InteractionMode::Interactive
+        )
+    }
+
+    #[must_use]
+    pub const fn non_interactive_guard(&self) -> Option<NonInteractiveGuard> {
+        self.route_kind.non_interactive_guard()
     }
 }
 
@@ -363,5 +421,34 @@ mod tests {
         assert_eq!(rpc.interaction_mode, InteractionMode::Headless);
         assert!(!rpc.capabilities.allow_prompts);
         assert!(rpc.validate().is_ok());
+    }
+
+    #[test]
+    fn cli_surface_bootstrap_resolves_print_mode() {
+        let bootstrap = CliSurfaceBootstrap::from_cli(
+            Some("json"),
+            true,
+            "/tmp/project",
+            false,
+            false,
+            vec!["pi".to_string(), "--print".to_string()],
+        )
+        .expect("print bootstrap should validate");
+
+        assert_eq!(bootstrap.route_kind, CliRouteKind::Print);
+        assert_eq!(bootstrap.mode, "json");
+        assert!(!bootstrap.is_interactive());
+        assert!(bootstrap.non_interactive_guard().is_some());
+    }
+
+    #[test]
+    fn cli_surface_bootstrap_resolves_interactive_mode() {
+        let bootstrap =
+            CliSurfaceBootstrap::from_cli(None, false, "/tmp/project", true, true, vec![])
+                .expect("interactive bootstrap should validate");
+
+        assert_eq!(bootstrap.route_kind, CliRouteKind::Interactive);
+        assert!(bootstrap.is_interactive());
+        assert!(bootstrap.non_interactive_guard().is_none());
     }
 }
