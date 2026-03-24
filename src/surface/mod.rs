@@ -21,7 +21,12 @@ use crate::contracts::bootstrap::{
     BootstrapRequest, InteractionMode, SurfaceCapabilities, SurfaceKind,
 };
 use crate::error::Result;
+use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
+use crate::agent::AgentSession;
+use asupersync::runtime::RuntimeHandle;
+use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// Guard that ensures non-interactive routes fail closed instead of entering interactive flows.
 ///
@@ -219,6 +224,95 @@ impl CliSurfaceBootstrap {
     pub const fn can_run_interactive_setup(&self) -> bool {
         self.is_interactive() && self.has_tty_access()
     }
+}
+
+/// Install a fail-closed bridge for extension UI on non-interactive routes.
+///
+/// The returned slot records the first blocked reason observed by the bridge so
+/// callers can convert it into a startup/runtime error at a deterministic boundary.
+#[must_use]
+pub fn install_non_interactive_extension_ui_bridge(
+    session: &AgentSession,
+    runtime_handle: &RuntimeHandle,
+) -> Option<Arc<StdMutex<Option<String>>>> {
+    let manager = session
+        .extensions
+        .as_ref()
+        .map(|region| region.manager().clone())?;
+    let (extension_ui_tx, extension_ui_rx) =
+        asupersync::channel::mpsc::channel::<ExtensionUiRequest>(64);
+    manager.set_ui_sender(extension_ui_tx);
+
+    let blocked_reason = Arc::new(StdMutex::new(None));
+    let blocked_reason_task = Arc::clone(&blocked_reason);
+    let manager_ui = manager.clone();
+    let runtime_handle_ui = runtime_handle.clone();
+    runtime_handle.spawn(async move {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let guard = NonInteractiveGuard::new();
+        while let Ok(request) = extension_ui_rx.recv(&cx).await {
+            if let Err(err) = check_non_interactive_extension_ui_request(&guard, &request) {
+                let mut slot = blocked_reason_task
+                    .lock()
+                    .expect("non-interactive extension UI blocked reason lock");
+                if slot.is_none() {
+                    *slot = Some(err.to_string());
+                }
+            }
+
+            if request.expects_response() {
+                let _ = manager_ui.respond_ui(ExtensionUiResponse {
+                    id: request.id.clone(),
+                    value: None,
+                    cancelled: true,
+                });
+            }
+        }
+
+        drop(runtime_handle_ui);
+    });
+
+    Some(blocked_reason)
+}
+
+/// Check whether a queued extension UI request should fail closed on a
+/// non-interactive route.
+///
+/// # Errors
+///
+/// Returns a validation error when the request requires approval or TTY access.
+pub fn check_non_interactive_extension_ui_request(
+    guard: &NonInteractiveGuard,
+    request: &ExtensionUiRequest,
+) -> Result<()> {
+    let capability = request.payload.get("capability").and_then(Value::as_str);
+    let title = request
+        .payload
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| request.payload.get("message").and_then(Value::as_str));
+    Ok(guard.check_extension_ui_request(&request.method, capability, title)?)
+}
+
+/// Convert the first blocked extension UI reason into a runtime error.
+///
+/// # Errors
+///
+/// Returns the recorded blocked reason, if any.
+pub fn check_non_interactive_extension_ui_blocked(
+    blocked_reason: &Option<Arc<StdMutex<Option<String>>>>,
+) -> Result<()> {
+    let Some(blocked_reason) = blocked_reason else {
+        return Ok(());
+    };
+    if let Some(message) = blocked_reason
+        .lock()
+        .expect("non-interactive extension UI blocked reason lock")
+        .take()
+    {
+        return Err(crate::error::Error::validation(message));
+    }
+    Ok(())
 }
 
 /// CLI route classification for determining interactive vs non-interactive behavior.

@@ -52,8 +52,8 @@ use pi::config::Config;
 use pi::config::SettingsScope;
 use pi::extension_index::ExtensionIndexStore;
 use pi::extensions::{
-    ALL_CAPABILITIES, Capability, ExtensionLoadSpec, ExtensionRuntimeHandle, ExtensionUiRequest,
-    ExtensionUiResponse, JsExtensionRuntimeHandle, NativeRustExtensionRuntimeHandle,
+    ALL_CAPABILITIES, Capability, ExtensionLoadSpec, ExtensionRuntimeHandle,
+    JsExtensionRuntimeHandle, NativeRustExtensionRuntimeHandle,
     PolicyDecision, resolve_extension_load_spec,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
@@ -3878,7 +3878,7 @@ async fn run_print_mode(
     }
 
     let extension_ui_blocked =
-        install_non_interactive_extension_ui_bridge(session, &runtime_handle);
+        pi::surface::install_non_interactive_extension_ui_bridge(session, &runtime_handle);
 
     if mode == "json" {
         let cx = pi::agent_cx::AgentCx::for_request();
@@ -3957,7 +3957,7 @@ async fn run_print_mode(
             )
             .await?,
         );
-        check_non_interactive_extension_ui_blocked(&extension_ui_blocked)?;
+        pi::surface::check_non_interactive_extension_ui_blocked(&extension_ui_blocked)?;
     }
 
     for message in messages {
@@ -3974,7 +3974,7 @@ async fn run_print_mode(
             )
             .await?,
         );
-        check_non_interactive_extension_ui_blocked(&extension_ui_blocked)?;
+        pi::surface::check_non_interactive_extension_ui_blocked(&extension_ui_blocked)?;
     }
 
     let Some(last_message) = last_message else {
@@ -4108,79 +4108,6 @@ async fn run_selected_surface_route(
             unreachable!("subcommands and fast-offline routes do not enter run()")
         }
     }
-}
-
-fn install_non_interactive_extension_ui_bridge(
-    session: &AgentSession,
-    runtime_handle: &RuntimeHandle,
-) -> Option<Arc<StdMutex<Option<String>>>> {
-    let manager = session
-        .extensions
-        .as_ref()
-        .map(|region| region.manager().clone())?;
-    let (extension_ui_tx, extension_ui_rx) =
-        asupersync::channel::mpsc::channel::<ExtensionUiRequest>(64);
-    manager.set_ui_sender(extension_ui_tx);
-
-    let blocked_reason = Arc::new(StdMutex::new(None));
-    let blocked_reason_task = Arc::clone(&blocked_reason);
-    let manager_ui = manager.clone();
-    let runtime_handle_ui = runtime_handle.clone();
-    runtime_handle.spawn(async move {
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let guard = pi::surface::NonInteractiveGuard::new();
-        while let Ok(request) = extension_ui_rx.recv(&cx).await {
-            if let Err(err) = check_non_interactive_extension_ui_request(&guard, &request) {
-                let mut slot = blocked_reason_task
-                    .lock()
-                    .expect("non-interactive extension UI blocked reason lock");
-                if slot.is_none() {
-                    *slot = Some(err.to_string());
-                }
-            }
-
-            if request.expects_response() {
-                let _ = manager_ui.respond_ui(ExtensionUiResponse {
-                    id: request.id.clone(),
-                    value: None,
-                    cancelled: true,
-                });
-            }
-        }
-
-        drop(runtime_handle_ui);
-    });
-
-    Some(blocked_reason)
-}
-
-fn check_non_interactive_extension_ui_request(
-    guard: &pi::surface::NonInteractiveGuard,
-    request: &ExtensionUiRequest,
-) -> Result<()> {
-    let capability = request.payload.get("capability").and_then(Value::as_str);
-    let title = request
-        .payload
-        .get("title")
-        .and_then(Value::as_str)
-        .or_else(|| request.payload.get("message").and_then(Value::as_str));
-    Ok(guard.check_extension_ui_request(&request.method, capability, title)?)
-}
-
-fn check_non_interactive_extension_ui_blocked(
-    blocked_reason: &Option<Arc<StdMutex<Option<String>>>>,
-) -> Result<()> {
-    let Some(blocked_reason) = blocked_reason else {
-        return Ok(());
-    };
-    if let Some(message) = blocked_reason
-        .lock()
-        .expect("non-interactive extension UI blocked reason lock")
-        .take()
-    {
-        bail!(message);
-    }
-    Ok(())
 }
 
 /// Discriminated prompt input for retry helper.
