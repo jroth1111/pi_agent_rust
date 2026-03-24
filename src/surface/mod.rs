@@ -202,6 +202,17 @@ impl CliSurfaceBootstrap {
     pub const fn non_interactive_guard(&self) -> Option<NonInteractiveGuard> {
         self.route_kind.non_interactive_guard()
     }
+
+    #[must_use]
+    pub const fn has_tty_access(&self) -> bool {
+        self.bootstrap_request.capabilities.stdin_tty
+            && self.bootstrap_request.capabilities.stdout_tty
+    }
+
+    #[must_use]
+    pub const fn can_run_interactive_setup(&self) -> bool {
+        self.is_interactive() && self.has_tty_access()
+    }
 }
 
 /// CLI route classification for determining interactive vs non-interactive behavior.
@@ -449,6 +460,25 @@ mod tests {
 
         assert_eq!(bootstrap.route_kind, CliRouteKind::Interactive);
         assert!(bootstrap.is_interactive());
+        assert!(bootstrap.has_tty_access());
+        assert!(bootstrap.can_run_interactive_setup());
         assert!(bootstrap.non_interactive_guard().is_none());
+    }
+
+    #[test]
+    fn cli_surface_bootstrap_denies_interactive_setup_without_tty() {
+        let bootstrap = CliSurfaceBootstrap::from_cli(
+            None,
+            false,
+            "/tmp/project",
+            true,
+            false,
+            vec!["pi".to_string()],
+        )
+        .expect("bootstrap should validate");
+
+        assert!(bootstrap.is_interactive());
+        assert!(!bootstrap.has_tty_access());
+        assert!(!bootstrap.can_run_interactive_setup());
     }
 }

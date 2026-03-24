@@ -938,7 +938,6 @@ async fn run(
         io::stdout().is_terminal(),
         std::env::args().collect(),
     )?;
-    let is_interactive = surface_bootstrap.is_interactive();
     let mode = surface_bootstrap.mode.clone();
     let non_interactive_guard = surface_bootstrap.non_interactive_guard();
 
@@ -982,7 +981,7 @@ async fn run(
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
                     // Interactive mode with TTY can run first-time setup
-                    if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                    if surface_bootstrap.can_run_interactive_setup() {
                         if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
                             model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
                             if let Some(error) = model_registry.error() {
@@ -1019,7 +1018,7 @@ async fn run(
                     }
 
                     // Interactive mode with TTY can run first-time setup
-                    if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                    if surface_bootstrap.can_run_interactive_setup() {
                         if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
                             model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
                             if let Some(error) = model_registry.error() {
