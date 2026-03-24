@@ -1128,18 +1128,7 @@ async fn run(
     .with_reliability_mode(config.reliability_enforcement_mode())
     .with_retry_settings(config.retry.clone().unwrap_or_default());
 
-    let history = {
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let session = agent_session
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        session.to_messages_for_current_path()
-    };
-    if !history.is_empty() {
-        agent_session.agent.replace_messages(history);
-    }
+    restore_session_history(&mut agent_session).await?;
 
     if !resources.extensions().is_empty() {
         // Await the pre-warmed extension runtime (spawned earlier to overlap with
@@ -1381,6 +1370,24 @@ async fn flush_session_autosave_on_shutdown(
             eprintln!("Warning: Failed to flush session autosave: {e}");
         }
     }
+}
+
+async fn restore_session_history(agent_session: &mut AgentSession) -> Result<()> {
+    let history = {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let session = agent_session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        session.to_messages_for_current_path()
+    };
+
+    if !history.is_empty() {
+        agent_session.agent.replace_messages(history);
+    }
+
+    Ok(())
 }
 
 const fn scope_from_flag(local: bool) -> PackageScope {
