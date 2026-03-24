@@ -706,6 +706,12 @@ struct StartupResources {
     resource_cli: ResourceCliOptions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionRuntimeFlavor {
+    Js,
+    NativeRust,
+}
+
 async fn load_startup_resources(
     cli: &cli::Cli,
     extension_flags: &[cli::ExtensionCliFlag],
@@ -767,6 +773,35 @@ async fn load_startup_resources(
     })
 }
 
+fn resolve_extension_runtime_flavor(
+    resources: &ResourceLoader,
+) -> Result<Option<ExtensionRuntimeFlavor>> {
+    let mut has_js_extensions = false;
+    let mut has_native_extensions = false;
+    for entry in resources.extensions() {
+        match resolve_extension_load_spec(entry) {
+            Ok(ExtensionLoadSpec::NativeRust(_)) => has_native_extensions = true,
+            Ok(ExtensionLoadSpec::Js(_)) => has_js_extensions = true,
+            #[cfg(feature = "wasm-host")]
+            Ok(ExtensionLoadSpec::Wasm(_)) => {}
+            Err(err) => {
+                return Err(anyhow::Error::new(err));
+            }
+        }
+    }
+
+    match (has_js_extensions, has_native_extensions) {
+        (true, true) => Err(pi::error::Error::validation(
+            "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
+                .to_string(),
+        )
+        .into()),
+        (true, false) => Ok(Some(ExtensionRuntimeFlavor::Js)),
+        (false, true) => Ok(Some(ExtensionRuntimeFlavor::NativeRust)),
+        (false, false) => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -793,28 +828,7 @@ async fn run(
         mut auth,
         resource_cli,
     } = load_startup_resources(&cli, &extension_flags, &cwd).await?;
-
-    let mut has_js_extensions = false;
-    let mut has_native_extensions = false;
-    for entry in resources.extensions() {
-        match resolve_extension_load_spec(entry) {
-            Ok(ExtensionLoadSpec::NativeRust(_)) => has_native_extensions = true,
-            Ok(ExtensionLoadSpec::Js(_)) => has_js_extensions = true,
-            #[cfg(feature = "wasm-host")]
-            Ok(ExtensionLoadSpec::Wasm(_)) => {}
-            Err(err) => {
-                return Err(anyhow::Error::new(err));
-            }
-        }
-    }
-
-    if has_js_extensions && has_native_extensions {
-        return Err(pi::error::Error::validation(
-            "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
-                .to_string(),
-        )
-        .into());
-    }
+    let extension_runtime_flavor = resolve_extension_runtime_flavor(&resources)?;
 
     let prewarm_policy = config
         .resolve_extension_policy_with_metadata(cli.extension_policy.as_deref())
@@ -830,8 +844,11 @@ async fn run(
 
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
-    let extension_prewarm_handle = if resources.extensions().is_empty() || has_js_extensions {
-        if resources.extensions().is_empty() {
+    let extension_prewarm_handle = if matches!(
+        extension_runtime_flavor,
+        None | Some(ExtensionRuntimeFlavor::Js)
+    ) {
+        if extension_runtime_flavor.is_none() {
             None
         } else {
             let pre_enabled_tools = cli.enabled_tools();
