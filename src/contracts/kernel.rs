@@ -193,27 +193,42 @@ impl ApplicationKernelBuilder {
     ///
     /// Returns a validation error if any required service is missing.
     pub fn build(self) -> Result<ApplicationKernel> {
+        let Self {
+            conversation,
+            workflow,
+            persistence,
+            worker_runtime,
+            inference,
+            context,
+            workspace,
+            host_execution,
+            identity,
+            capability,
+            admission,
+            extension_runtime,
+        } = self;
+
         Ok(ApplicationKernel {
-            conversation: self.required(self.conversation, "conversation")?,
-            workflow: self.required(self.workflow, "workflow")?,
-            persistence: self.required(self.persistence, "persistence")?,
-            worker_runtime: self.required(self.worker_runtime, "worker_runtime")?,
-            inference: self.required(self.inference, "inference")?,
-            context: self.required(self.context, "context")?,
-            workspace: self.required(self.workspace, "workspace")?,
-            host_execution: self.required(self.host_execution, "host_execution")?,
-            identity: self.required(self.identity, "identity")?,
-            capability: self.required(self.capability, "capability")?,
-            admission: self.required(self.admission, "admission")?,
-            extension_runtime: self.required(self.extension_runtime, "extension_runtime")?,
+            conversation: Self::required(conversation, "conversation")?,
+            workflow: Self::required(workflow, "workflow")?,
+            persistence: Self::required(persistence, "persistence")?,
+            worker_runtime: Self::required(worker_runtime, "worker_runtime")?,
+            inference: Self::required(inference, "inference")?,
+            context: Self::required(context, "context")?,
+            workspace: Self::required(workspace, "workspace")?,
+            host_execution: Self::required(host_execution, "host_execution")?,
+            identity: Self::required(identity, "identity")?,
+            capability: Self::required(capability, "capability")?,
+            admission: Self::required(admission, "admission")?,
+            extension_runtime: Self::required(extension_runtime, "extension_runtime")?,
         })
     }
 
-    fn required<T>(&self, value: Option<Arc<T>>, name: &str) -> Result<Arc<T>>
+    fn required<T>(value: Option<Arc<T>>, name: &str) -> Result<Arc<T>>
     where
         T: ?Sized,
     {
-        value.ok_or_else(|| Error::validation(format!("missing ApplicationKernel service `{name}`")))
+        value
+            .ok_or_else(|| Error::validation(format!("missing ApplicationKernel service `{name}`")))
     }
 }
-
