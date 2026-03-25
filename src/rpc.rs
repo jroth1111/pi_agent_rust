@@ -399,7 +399,7 @@ impl RpcReliabilityState {
         }
     }
 
-    const fn state_label(state: &reliability::RuntimeState) -> &'static str {
+    pub(crate) const fn state_label(state: &reliability::RuntimeState) -> &'static str {
         ReliabilityService::state_label(state)
     }
 
@@ -458,7 +458,7 @@ impl RpcReliabilityState {
         ReliabilityService::request_dispatch(self, contract, agent_id, ttl_seconds)
     }
 
-    fn request_dispatch_existing(
+    pub(crate) fn request_dispatch_existing(
         &mut self,
         task_id: &str,
         agent_id: &str,
@@ -467,7 +467,7 @@ impl RpcReliabilityState {
         ReliabilityService::request_dispatch_existing_state(self, task_id, agent_id, ttl_seconds)
     }
 
-    fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
+    pub(crate) fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
         ReliabilityService::expire_dispatch_grant(self, grant)
     }
 
@@ -1387,45 +1387,7 @@ async fn append_evidence_record(
     session_identity: &SessionIdentity,
     req: AppendEvidenceRequest,
 ) -> Result<EvidenceRecord> {
-    let req_for_identity = req.clone();
-    let evidence = {
-        let mut rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        rel.append_evidence(req)?
-    };
-
-    let mut guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    {
-        let mut inner_session = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        if inner_session.header.id != session_identity.session_id {
-            return Err(Error::validation(format!(
-                "session identity mismatch for append_evidence: live session `{}` did not match typed session `{}`",
-                inner_session.header.id, session_identity.session_id
-            )));
-        }
-        inner_session.append_verification_evidence_entry(evidence.clone());
-        inner_session.append_custom_entry(
-            "workflow_mutation_identity".to_string(),
-            Some(json!({
-                "mutation": "reliability.append_evidence",
-                "sessionIdentity": session_identity,
-                "taskId": req_for_identity.task_id,
-                "command": req_for_identity.command,
-                "exitCode": req_for_identity.exit_code,
-            })),
-        );
-    }
-    guard.persist_session().await?;
-    Ok(evidence)
+    run_service::append_evidence_record(cx, session, reliability_state, session_identity, req).await
 }
 
 #[allow(dead_code)]
@@ -1438,68 +1400,16 @@ async fn submit_task_and_sync(
     session_identity: &SessionIdentity,
     req: SubmitTaskRequest,
 ) -> Result<SubmitTaskResponse> {
-    let req_for_report = req.clone();
-    let result = {
-        let mut rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        rel.submit_task(req)?
-    };
-
-    {
-        let mut guard = session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        {
-            let mut inner_session = guard
-                .session
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-            if inner_session.header.id != session_identity.session_id {
-                return Err(Error::validation(format!(
-                    "session identity mismatch for submit_task: live session `{}` did not match typed session `{}`",
-                    inner_session.header.id, session_identity.session_id
-                )));
-            }
-            inner_session
-                .append_close_decision_entry(result.close_payload.clone(), result.close.clone());
-            inner_session.append_task_transition_entry(
-                result.task_id.clone(),
-                None,
-                result.state.clone(),
-                Some(json!({
-                    "mutation": "reliability.submit_task",
-                    "sessionIdentity": session_identity,
-                    "leaseId": req_for_report.lease_id.clone(),
-                    "fenceToken": req_for_report.fence_token,
-                    "verifyRunId": req_for_report.verify_run_id.clone(),
-                })),
-            );
-        }
-        guard.persist_session().await?;
-    }
-
-    let report = {
-        let rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        build_submit_task_report(&rel, &req_for_report, &result)?
-    };
-    sync_task_runs(
+    run_service::submit_task_and_sync(
         cx,
         session,
         reliability_state,
         orchestration_state,
         run_store,
-        &result.task_id,
-        Some(report),
+        session_identity,
+        req,
     )
-    .await?;
-    Ok(result)
+    .await
 }
 
 #[allow(dead_code)]
@@ -1687,16 +1597,7 @@ async fn current_run_status(
     run_store: &RunStore,
     run_id: &str,
 ) -> Result<RunStatus> {
-    if let Some(run) = {
-        let orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.get_run(run_id)
-    } {
-        return Ok(run);
-    }
-    run_store.load(run_id)
+    run_service::current_run_status(cx, orchestration_state, run_store, run_id).await
 }
 
 async fn finalize_captured_dispatch_execution(
@@ -2137,20 +2038,7 @@ async fn current_session_identity(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
 ) -> Result<SessionIdentity> {
-    let guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    let inner = guard
-        .session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-    Ok(SessionIdentity {
-        session_id: inner.header.id.clone(),
-        name: None,
-        path: inner.path.as_ref().map(|path| path.display().to_string()),
-    })
+    run_service::current_session_identity(cx, session).await
 }
 
 async fn dispatch_run_until_quiescent(

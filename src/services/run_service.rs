@@ -1,5 +1,6 @@
 use crate::agent::AgentSession;
 use crate::agent_cx::AgentCx;
+use crate::contracts::dto::SessionIdentity;
 use crate::error::{Error, Result};
 use crate::orchestration::{
     ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind, RunVerifyStatus,
@@ -7,7 +8,8 @@ use crate::orchestration::{
 };
 use crate::reliability::verifier::Verifier;
 use crate::rpc::{
-    RpcOrchestrationState, RpcReliabilityState, SubmitTaskRequest, SubmitTaskResponse,
+    AppendEvidenceRequest, EvidenceRecord, RpcOrchestrationState, RpcReliabilityState,
+    SubmitTaskRequest, SubmitTaskResponse,
 };
 use crate::services::reliability_service::ReliabilityService;
 use asupersync::sync::Mutex;
@@ -911,6 +913,165 @@ pub(crate) async fn refresh_run_if_live(
     }
 
     Ok(run)
+}
+
+pub(crate) async fn current_session_identity(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+) -> Result<SessionIdentity> {
+    let guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let inner = guard
+        .session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    Ok(SessionIdentity {
+        session_id: inner.header.id.clone(),
+        name: None,
+        path: inner.path.as_ref().map(|path| path.display().to_string()),
+    })
+}
+
+pub(crate) async fn append_evidence_record(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    session_identity: &SessionIdentity,
+    req: AppendEvidenceRequest,
+) -> Result<EvidenceRecord> {
+    let req_for_identity = req.clone();
+    let evidence = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        ReliabilityService::append_evidence_state(&mut rel, req)?
+    };
+
+    let mut guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    {
+        let mut inner_session = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        if inner_session.header.id != session_identity.session_id {
+            return Err(Error::validation(format!(
+                "session identity mismatch for append_evidence: live session `{}` did not match typed session `{}`",
+                inner_session.header.id, session_identity.session_id
+            )));
+        }
+        inner_session.append_verification_evidence_entry(evidence.clone());
+        inner_session.append_custom_entry(
+            "workflow_mutation_identity".to_string(),
+            Some(json!({
+                "mutation": "reliability.append_evidence",
+                "sessionIdentity": session_identity,
+                "taskId": req_for_identity.task_id,
+                "command": req_for_identity.command,
+                "exitCode": req_for_identity.exit_code,
+            })),
+        );
+    }
+    guard.persist_session().await?;
+    Ok(evidence)
+}
+
+pub(crate) async fn submit_task_and_sync(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    session_identity: &SessionIdentity,
+    req: SubmitTaskRequest,
+) -> Result<SubmitTaskResponse> {
+    let req_for_report = req.clone();
+    let result = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        ReliabilityService::submit_task_state(&mut rel, req)?
+    };
+
+    {
+        let mut guard = session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        {
+            let mut inner_session = guard
+                .session
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+            if inner_session.header.id != session_identity.session_id {
+                return Err(Error::validation(format!(
+                    "session identity mismatch for submit_task: live session `{}` did not match typed session `{}`",
+                    inner_session.header.id, session_identity.session_id
+                )));
+            }
+            inner_session
+                .append_close_decision_entry(result.close_payload.clone(), result.close.clone());
+            inner_session.append_task_transition_entry(
+                result.task_id.clone(),
+                None,
+                result.state.clone(),
+                Some(json!({
+                    "mutation": "reliability.submit_task",
+                    "sessionIdentity": session_identity,
+                    "leaseId": req_for_report.lease_id.clone(),
+                    "fenceToken": req_for_report.fence_token,
+                    "verifyRunId": req_for_report.verify_run_id.clone(),
+                })),
+            );
+        }
+        guard.persist_session().await?;
+    }
+
+    let report = {
+        let rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        build_submit_task_report(&rel, &req_for_report, &result)?
+    };
+    sync_task_runs(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        &result.task_id,
+        Some(report),
+    )
+    .await?;
+    Ok(result)
+}
+
+pub(crate) async fn current_run_status(
+    cx: &AgentCx,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<RunStatus> {
+    if let Some(run) = {
+        let orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.get_run(run_id)
+    } {
+        return Ok(run);
+    }
+    run_store.load(run_id)
 }
 
 pub(crate) const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
