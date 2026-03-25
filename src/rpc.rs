@@ -11,7 +11,7 @@
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode};
+use crate::agent::{AbortHandle, AgentEvent, AgentSession, QueueMode};
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
@@ -23,39 +23,32 @@ use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
 use crate::model::{
-    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent,
-    UserMessage,
+    ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyStatus, SubrunPlan,
-    TaskReport, WaveStatus,
+    ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyStatus, SubrunPlan, TaskReport,
+    WaveStatus,
 };
-use crate::provider::Provider;
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
-use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
 use crate::services::reliability_service::ReliabilityService;
 use crate::services::run_service::{self, CompletedRunVerifyScope};
-use crate::session::{Session, SessionMessage};
+use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
-use async_trait::async_trait;
 use memchr::memchr_iter;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -621,59 +614,8 @@ async fn append_dispatch_grants_session_entries(
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     grants: &[DispatchGrant],
 ) -> Result<()> {
-    if grants.is_empty() {
-        return Ok(());
-    }
-
-    let tasks = {
-        let reliability = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        grants
-            .iter()
-            .filter_map(|grant| {
-                reliability
-                    .tasks
-                    .get(&grant.task_id)
-                    .map(|task| (grant.clone(), task.spec.objective.clone()))
-            })
-            .collect::<Vec<_>>()
-    };
-
-    if tasks.is_empty() {
-        return Ok(());
-    }
-
-    let mut guard = session
-        .lock(cx)
+    run_service::append_dispatch_grants_session_entries(cx, session, reliability_state, grants)
         .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    {
-        let mut inner_session = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        for (grant, objective) in tasks {
-            inner_session.append_task_created_entry(
-                grant.task_id.clone(),
-                objective,
-                Some(grant.agent_id.clone()),
-            );
-            inner_session.append_task_transition_entry(
-                grant.task_id,
-                None,
-                grant.state,
-                Some(json!({
-                    "leaseId": grant.lease_id,
-                    "fenceToken": grant.fence_token,
-                })),
-            );
-        }
-    }
-    guard.persist_session().await?;
-    Ok(())
 }
 
 async fn append_canceled_dispatch_grants_session_entries(
@@ -682,60 +624,13 @@ async fn append_canceled_dispatch_grants_session_entries(
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     grants: &[DispatchGrant],
 ) -> Result<()> {
-    if grants.is_empty() {
-        return Ok(());
-    }
-
-    let transitions = {
-        let reliability = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        grants
-            .iter()
-            .filter_map(|grant| {
-                reliability.tasks.get(&grant.task_id).map(|task| {
-                    (
-                        grant.task_id.clone(),
-                        grant.state.clone(),
-                        RpcReliabilityState::state_label(&task.runtime.state).to_string(),
-                        grant.lease_id.clone(),
-                        grant.fence_token,
-                    )
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-
-    if transitions.is_empty() {
-        return Ok(());
-    }
-
-    let mut guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    {
-        let mut inner_session = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        for (task_id, from, to, lease_id, fence_token) in transitions {
-            inner_session.append_task_transition_entry(
-                task_id,
-                Some(from),
-                to,
-                Some(json!({
-                    "leaseId": lease_id,
-                    "fenceToken": fence_token,
-                    "reason": "orchestration.cancel_run",
-                })),
-            );
-        }
-    }
-    guard.persist_session().await?;
-    Ok(())
+    run_service::append_canceled_dispatch_grants_session_entries(
+        cx,
+        session,
+        reliability_state,
+        grants,
+    )
+    .await
 }
 
 async fn append_dispatch_rollback_session_entry(
@@ -745,30 +640,7 @@ async fn append_dispatch_rollback_session_entry(
     to_state: &str,
     summary: &str,
 ) -> Result<()> {
-    let mut guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    {
-        let mut inner_session = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        inner_session.append_task_transition_entry(
-            grant.task_id.clone(),
-            Some(grant.state.clone()),
-            to_state.to_string(),
-            Some(json!({
-                "leaseId": grant.lease_id,
-                "fenceToken": grant.fence_token,
-                "reason": "orchestration.rollback_dispatch_grant",
-                "summary": summary,
-            })),
-        );
-    }
-    guard.persist_session().await?;
-    Ok(())
+    run_service::append_dispatch_rollback_session_entry(cx, session, grant, to_state, summary).await
 }
 
 fn ensure_run_id_available(
@@ -997,73 +869,17 @@ async fn cancel_live_run_tasks_and_sync(
     run_store: &RunStore,
     run: &mut RunStatus,
 ) -> Result<()> {
-    let canceled_grants = {
-        let mut rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        cancel_live_run_tasks(&mut rel, run)
-    };
-
-    {
-        let mut orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(run.clone());
-    }
-
-    append_canceled_dispatch_grants_session_entries(
+    run_service::cancel_live_run_tasks_and_sync(
         cx,
         session,
         reliability_state,
-        &canceled_grants,
+        orchestration_state,
+        run_store,
+        run,
     )
-    .await?;
-
-    for grant in canceled_grants {
-        let report = {
-            let rel = reliability_state
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-            build_cancel_run_task_report(&rel, &run.run_id, &grant.task_id)
-        };
-        let updated_runs = sync_task_runs(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            &grant.task_id,
-            report,
-        )
-        .await?;
-        if let Some(updated_run) = updated_runs
-            .into_iter()
-            .find(|updated_run| updated_run.run_id == run.run_id)
-        {
-            *run = updated_run;
-        }
-    }
-
-    run.lifecycle = RunLifecycle::Canceled;
-    run.active_wave = None;
-    run.active_subrun_id = None;
-    run.touch();
-    {
-        let mut orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(run.clone());
-    }
-    persist_run_status(cx, session, run_store, run).await?;
-
-    Ok(())
+    .await
 }
 
-const INLINE_WORKER_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 fn next_recoverable_retry_delay(
     reliability: &RpcReliabilityState,
     run: &RunStatus,
@@ -1077,306 +893,6 @@ fn apply_dispatch_rollback_recovery(
     failure_summary: Option<&str>,
 ) -> String {
     run_service::apply_dispatch_rollback_recovery(reliability, grant, failure_summary)
-}
-
-#[derive(Debug)]
-struct TaskVerificationOutcome {
-    command: String,
-    exit_code: i32,
-    output: String,
-    timed_out: bool,
-    passed: bool,
-}
-
-#[allow(dead_code)]
-#[async_trait]
-trait OrchestrationInlineWorker: Send + Sync {
-    async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String>;
-}
-
-#[allow(dead_code)]
-struct RpcSessionInlineWorker {
-    provider: Arc<dyn Provider>,
-    config: Config,
-}
-
-#[allow(dead_code)]
-impl RpcSessionInlineWorker {
-    fn new(provider: Arc<dyn Provider>, config: Config) -> Self {
-        Self { provider, config }
-    }
-}
-
-#[allow(dead_code)]
-#[async_trait]
-impl OrchestrationInlineWorker for RpcSessionInlineWorker {
-    async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String> {
-        let tools = crate::tools::ToolRegistry::new(
-            &INLINE_WORKER_TOOLS,
-            workspace_path,
-            Some(&self.config),
-        );
-        let agent = Agent::new(Arc::clone(&self.provider), tools, AgentConfig::default());
-        let inner_session = Arc::new(Mutex::new(Session::create_with_dir(Some(
-            workspace_path.to_path_buf(),
-        ))));
-        let mut session = AgentSession::new(
-            agent,
-            inner_session,
-            false,
-            ResolvedCompactionSettings::default(),
-        );
-        let prompt = automation_worker_prompt(task);
-        let message = session.run_text(prompt, |_| {}).await?;
-        Ok(assistant_message_summary(&message))
-    }
-}
-
-#[allow(dead_code)]
-fn assistant_message_summary(message: &AssistantMessage) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.trim()),
-            _ => None,
-        })
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[allow(dead_code)]
-fn automation_worker_prompt(task: &TaskContract) -> String {
-    let invariants = if task.invariants.is_empty() {
-        "none".to_string()
-    } else {
-        task.invariants.join("; ")
-    };
-    let forbidden = if task.forbid_paths.is_empty() {
-        "none".to_string()
-    } else {
-        task.forbid_paths.join(", ")
-    };
-    let planned_touches = if task.planned_touches.is_empty() {
-        "not specified; keep the diff minimal".to_string()
-    } else {
-        task.planned_touches.join(", ")
-    };
-    let acceptance = if task.acceptance_ids.is_empty() {
-        "not specified".to_string()
-    } else {
-        task.acceptance_ids.join(", ")
-    };
-    format!(
-        "You are executing one isolated orchestration task inside a git worktree.\n\
-         Complete only the task below and keep the diff minimal.\n\n\
-         Task ID: {task_id}\n\
-         Objective: {objective}\n\
-         Acceptance IDs: {acceptance}\n\
-         Planned touches: {planned_touches}\n\
-         Invariants: {invariants}\n\
-         Forbidden paths: {forbidden}\n\
-         Verify command: {verify_command}\n\n\
-         Requirements:\n\
-         - Stay inside the task scope.\n\
-         - Prefer the built-in edit/write/bash/read tools.\n\
-         - Run the verify command before finishing if possible.\n\
-         - End with a short plain-language summary of what changed and whether verification passed.\n",
-        task_id = task.task_id,
-        objective = task.objective,
-        acceptance = acceptance,
-        planned_touches = planned_touches,
-        invariants = invariants,
-        forbidden = forbidden,
-        verify_command = task.verify_command,
-    )
-}
-
-#[allow(dead_code)]
-fn patch_digest_for_diff(diff: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(diff.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-#[allow(dead_code)]
-fn changed_files_from_diff(diff: &str) -> Vec<String> {
-    let mut changed = Vec::new();
-    for line in diff.lines() {
-        if !line.starts_with("diff --git ") {
-            continue;
-        }
-        let parts = line.split_whitespace().collect::<Vec<_>>();
-        if parts.len() < 4 {
-            continue;
-        }
-        let path = parts[2].strip_prefix("a/").unwrap_or(parts[2]).to_string();
-        if !changed.contains(&path) {
-            changed.push(path);
-        }
-    }
-    changed
-}
-
-#[allow(dead_code)]
-fn apply_diff_to_repo(repo_root: &Path, diff: &str) -> Result<()> {
-    if diff.trim().is_empty() {
-        return Ok(());
-    }
-
-    let mut child = Command::new("git")
-        .current_dir(repo_root)
-        .args(["apply", "--reject", "--whitespace=fix"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| Error::Io(Box::new(err)))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(diff.as_bytes())
-            .map_err(|err| Error::Io(Box::new(err)))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(Error::tool(
-        "orchestration",
-        format!(
-            "failed to apply worker diff: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    ))
-}
-
-#[allow(dead_code)]
-fn repo_worktree_diff_against_snapshot(repo_root: &Path, snapshot: &str) -> Result<String> {
-    let temp_dir = tempfile::tempdir().map_err(|err| Error::Io(Box::new(err)))?;
-    let index_path = temp_dir.path().join("orchestration.index");
-
-    let read_tree = Command::new("git")
-        .current_dir(repo_root)
-        .env("GIT_INDEX_FILE", &index_path)
-        .args(["read-tree", snapshot])
-        .output()
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    if !read_tree.status.success() {
-        return Err(Error::tool(
-            "orchestration",
-            format!(
-                "failed to seed temporary index from snapshot {snapshot}: {}",
-                String::from_utf8_lossy(&read_tree.stderr).trim()
-            ),
-        ));
-    }
-
-    let add_all = Command::new("git")
-        .current_dir(repo_root)
-        .env("GIT_INDEX_FILE", &index_path)
-        .args(["add", "--all"])
-        .output()
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    if !add_all.status.success() {
-        return Err(Error::tool(
-            "orchestration",
-            format!(
-                "failed to capture parent worktree state: {}",
-                String::from_utf8_lossy(&add_all.stderr).trim()
-            ),
-        ));
-    }
-
-    let diff_output = Command::new("git")
-        .current_dir(repo_root)
-        .env("GIT_INDEX_FILE", &index_path)
-        .args(["diff", "--cached", "--binary", snapshot])
-        .output()
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    if !diff_output.status.success() {
-        return Err(Error::tool(
-            "orchestration",
-            format!(
-                "failed to diff parent worktree against snapshot {snapshot}: {}",
-                String::from_utf8_lossy(&diff_output.stderr).trim()
-            ),
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&diff_output.stdout).into_owned())
-}
-
-#[allow(dead_code)]
-fn task_contract_for_runtime_task(
-    reliability: &RpcReliabilityState,
-    task_id: &str,
-) -> Result<TaskContract> {
-    let task = reliability
-        .tasks
-        .get(task_id)
-        .ok_or_else(|| Error::validation(format!("Unknown reliability task: {task_id}")))?;
-    let (verify_command, verify_timeout_sec) = match &task.spec.verify {
-        reliability::VerifyPlan::Standard {
-            command,
-            timeout_sec,
-            ..
-        } => (command.clone(), Some(*timeout_sec)),
-    };
-
-    Ok(TaskContract {
-        task_id: task.id.clone(),
-        objective: task.spec.objective.clone(),
-        parent_goal_trace_id: reliability.parent_goal_trace_by_task.get(task_id).cloned(),
-        invariants: task.spec.constraints.invariants.clone(),
-        max_touched_files: task.spec.constraints.max_touched_files,
-        forbid_paths: task.spec.constraints.forbid_paths.clone(),
-        verify_command,
-        verify_timeout_sec,
-        max_attempts: Some(task.spec.max_attempts),
-        input_snapshot: Some(task.spec.input_snapshot.clone()),
-        acceptance_ids: task.spec.acceptance_ids.clone(),
-        planned_touches: task.spec.planned_touches.clone(),
-        prerequisites: Vec::new(),
-        enforce_symbol_drift_check: reliability
-            .symbol_drift_required_by_task
-            .get(task_id)
-            .copied()
-            .unwrap_or(false),
-    })
-}
-
-#[allow(dead_code)]
-async fn execute_task_verification(
-    workspace_path: &Path,
-    task: &TaskContract,
-) -> TaskVerificationOutcome {
-    let timeout_sec = task.verify_timeout_sec.unwrap_or(60);
-    match Verifier::execute_verify_command(workspace_path, &task.verify_command, timeout_sec).await
-    {
-        Ok(execution) => {
-            let passed = execution.passed();
-            TaskVerificationOutcome {
-                command: execution.command,
-                exit_code: execution.exit_code,
-                output: execution.output,
-                timed_out: execution.cancelled,
-                passed,
-            }
-        }
-        Err(err) => TaskVerificationOutcome {
-            command: task.verify_command.clone(),
-            exit_code: -1,
-            output: err.to_string(),
-            timed_out: false,
-            passed: false,
-        },
-    }
 }
 
 #[allow(dead_code)]
@@ -1423,575 +939,17 @@ async fn rollback_dispatch_grant(
     grant: &DispatchGrant,
     failure_summary: Option<String>,
 ) {
-    let (updated_run, rolled_back_state) = {
-        let Ok(mut rel) = reliability_state.lock(cx).await else {
-            return;
-        };
-        let rolled_back_state =
-            apply_dispatch_rollback_recovery(&mut rel, grant, failure_summary.as_deref());
-        let rollback_report = failure_summary.as_ref().and_then(|summary| {
-            build_dispatch_rollback_task_report(
-                &rel,
-                &grant.task_id,
-                summary,
-                "orchestration_execution_error",
-            )
-        });
-        let mut run = {
-            let Ok(orchestration) = orchestration_state.lock(cx).await else {
-                return;
-            };
-            orchestration
-                .get_run(run_id)
-                .or_else(|| run_store.load(run_id).ok())
-        };
-        if let Some(mut run) = run.take() {
-            if let Some(report) = rollback_report.as_ref() {
-                run.upsert_task_report(report.clone());
-            }
-            refresh_run_from_reliability(&rel, &mut run);
-            if let Ok(mut orchestration) = orchestration_state.lock(cx).await {
-                orchestration.update_run(run.clone());
-            }
-            (Some(run), rolled_back_state)
-        } else {
-            (None, rolled_back_state)
-        }
-    };
-
-    if let Some(summary) = failure_summary.as_deref() {
-        let _ =
-            append_dispatch_rollback_session_entry(cx, session, grant, &rolled_back_state, summary)
-                .await;
-    }
-
-    if let Some(run) = updated_run {
-        let _ = persist_run_status(cx, session, run_store, &run).await;
-    }
-}
-
-struct CapturedDispatchExecution {
-    grant: DispatchGrant,
-    contract: TaskContract,
-    summary: String,
-    diff: String,
-    changed_files: Vec<String>,
-    patch_digest: String,
-    verification: TaskVerificationOutcome,
-}
-
-fn dispatch_workspace_segment_id(grant: &DispatchGrant) -> usize {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    grant.task_id.hash(&mut hasher);
-    grant.lease_id.hash(&mut hasher);
-    grant.fence_token.hash(&mut hasher);
-    hasher.finish() as usize
-}
-
-async fn capture_dispatch_grant_execution(
-    cx: &AgentCx,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    repo_root: &Path,
-    grant: &DispatchGrant,
-    worker: &dyn OrchestrationInlineWorker,
-) -> Result<CapturedDispatchExecution> {
-    capture_dispatch_grant_execution_with_base_patches(
-        cx,
-        reliability_state,
-        repo_root,
-        grant,
-        worker,
-        &[],
-    )
-    .await
-}
-
-async fn capture_dispatch_grant_execution_with_base_patches(
-    cx: &AgentCx,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    repo_root: &Path,
-    grant: &DispatchGrant,
-    worker: &dyn OrchestrationInlineWorker,
-    base_patches: &[String],
-) -> Result<CapturedDispatchExecution> {
-    let contract = {
-        let rel = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        task_contract_for_runtime_task(&rel, &grant.task_id)?
-    };
-    let snapshot = contract
-        .input_snapshot
-        .clone()
-        .ok_or_else(|| Error::validation("inline orchestration task missing input snapshot"))?;
-    let assigned_files = contract
-        .planned_touches
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let mut workspace = FlockWorkspace::spawn_with_snapshot(
-        repo_root,
-        dispatch_workspace_segment_id(grant),
-        assigned_files,
-        snapshot.clone(),
-    )?;
-    workspace.prepare()?;
-    let layered_base = if base_patches.is_empty() {
-        let parent_base_patch = repo_worktree_diff_against_snapshot(repo_root, &snapshot)?;
-        if parent_base_patch.trim().is_empty() {
-            false
-        } else {
-            workspace.apply_patch(&parent_base_patch)?;
-            true
-        }
-    } else {
-        for patch in base_patches {
-            workspace.apply_patch(patch)?;
-        }
-        true
-    };
-    if layered_base {
-        workspace.commit_staged_changes("pi orchestration replay base")?;
-    }
-
-    let summary = worker.execute(workspace.workspace_path(), &contract).await;
-    let diff = if layered_base {
-        workspace.get_changes_since_head()
-    } else {
-        workspace.get_changes()
-    };
-    let verification = execute_task_verification(workspace.workspace_path(), &contract).await;
-    let teardown_result = workspace.teardown();
-
-    let summary = summary?;
-    let diff = diff?;
-    teardown_result?;
-
-    Ok(CapturedDispatchExecution {
-        grant: grant.clone(),
-        contract,
-        summary,
-        changed_files: changed_files_from_diff(&diff),
-        patch_digest: patch_digest_for_diff(&diff),
-        diff,
-        verification,
-    })
-}
-
-fn captured_dispatches_overlap(captures: &[CapturedDispatchExecution]) -> bool {
-    let mut changed_paths = HashSet::new();
-    for capture in captures {
-        for path in &capture.changed_files {
-            if !changed_paths.insert(path.clone()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-async fn current_run_status(
-    cx: &AgentCx,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    run_id: &str,
-) -> Result<RunStatus> {
-    run_service::current_run_status(cx, orchestration_state, run_store, run_id).await
-}
-
-async fn finalize_captured_dispatch_execution(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    repo_root: &Path,
-    run_id: &str,
-    capture: CapturedDispatchExecution,
-) -> Result<RunStatus> {
-    let session_identity = current_session_identity(cx, session).await?;
-    let evidence = match append_evidence_record(
-        cx,
-        session,
-        reliability_state,
-        &session_identity,
-        AppendEvidenceRequest {
-            task_id: capture.contract.task_id.clone(),
-            command: capture.verification.command.clone(),
-            exit_code: capture.verification.exit_code,
-            stdout: capture.verification.output.clone(),
-            stderr: String::new(),
-            artifact_ids: Vec::new(),
-            env_id: Some("orchestration:auto".to_string()),
-        },
-    )
-    .await
-    {
-        Ok(evidence) => evidence,
-        Err(err) => {
-            let summary = format!("failed to record orchestration evidence: {err}");
-            rollback_dispatch_grant(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                run_id,
-                &capture.grant,
-                Some(summary),
-            )
-            .await;
-            return Err(err);
-        }
-    };
-
-    if capture.verification.passed
-        && let Err(err) = apply_diff_to_repo(repo_root, &capture.diff)
-    {
-        let summary = format!("failed to apply verified orchestration diff: {err}");
-        rollback_dispatch_grant(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            run_id,
-            &capture.grant,
-            Some(summary),
-        )
-        .await;
-        return Err(err);
-    }
-
-    let trimmed_summary = capture.summary.trim();
-    let close = capture.verification.passed.then(|| ClosePayload {
-        task_id: capture.contract.task_id.clone(),
-        outcome: if trimmed_summary.is_empty() {
-            format!("Completed {}", capture.contract.objective)
-        } else {
-            trimmed_summary.to_string()
-        },
-        outcome_kind: Some(reliability::CloseOutcomeKind::Success),
-        acceptance_ids: capture.contract.acceptance_ids.clone(),
-        evidence_ids: vec![evidence.evidence_id.clone()],
-        trace_parent: capture.contract.parent_goal_trace_id.clone(),
-    });
-    if let Err(err) = submit_task_and_sync(
+    run_service::rollback_dispatch_grant(
         cx,
         session,
         reliability_state,
         orchestration_state,
         run_store,
-        &session_identity,
-        SubmitTaskRequest {
-            task_id: capture.grant.task_id.clone(),
-            lease_id: capture.grant.lease_id.clone(),
-            fence_token: capture.grant.fence_token,
-            patch_digest: capture.patch_digest,
-            verify_run_id: format!("orchestration-inline:{run_id}:{}", capture.grant.task_id),
-            verify_passed: Some(capture.verification.passed),
-            verify_timed_out: capture.verification.timed_out,
-            failure_class: (!capture.verification.passed)
-                .then_some(reliability::FailureClass::VerificationFailed),
-            changed_files: capture.changed_files,
-            symbol_drift_violations: Vec::new(),
-            close,
-        },
-    )
-    .await
-    {
-        let summary = format!("failed to submit orchestration task result: {err}");
-        rollback_dispatch_grant(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            run_id,
-            &capture.grant,
-            Some(summary),
-        )
-        .await;
-        return Err(err);
-    }
-
-    current_run_status(cx, orchestration_state, run_store, run_id).await
-}
-
-#[allow(dead_code)]
-async fn execute_inline_dispatch_grant_with_worker(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    repo_root: &Path,
-    run_id: &str,
-    grant: &DispatchGrant,
-    worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
-    let capture =
-        match capture_dispatch_grant_execution(cx, reliability_state, repo_root, grant, worker)
-            .await
-        {
-            Ok(capture) => capture,
-            Err(err) => {
-                let summary = format!("worker execution failed for {}: {err}", grant.task_id);
-                rollback_dispatch_grant(
-                    cx,
-                    session,
-                    reliability_state,
-                    orchestration_state,
-                    run_store,
-                    run_id,
-                    grant,
-                    Some(summary),
-                )
-                .await;
-                return Err(err);
-            }
-        };
-
-    finalize_captured_dispatch_execution(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        repo_root,
         run_id,
-        capture,
+        grant,
+        failure_summary,
     )
     .await
-}
-
-async fn execute_dispatch_grants_sequentially_with_replay_base(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    repo_root: &Path,
-    run: RunStatus,
-    grants: &[DispatchGrant],
-    worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
-    let mut updated_run = run;
-    let mut replay_base_patches = Vec::new();
-
-    for grant in grants {
-        let capture = match capture_dispatch_grant_execution_with_base_patches(
-            cx,
-            reliability_state,
-            repo_root,
-            grant,
-            worker,
-            &replay_base_patches,
-        )
-        .await
-        {
-            Ok(capture) => capture,
-            Err(err) => {
-                let summary = format!(
-                    "worker replay execution failed for {}: {err}",
-                    grant.task_id
-                );
-                rollback_dispatch_grant(
-                    cx,
-                    session,
-                    reliability_state,
-                    orchestration_state,
-                    run_store,
-                    &updated_run.run_id,
-                    grant,
-                    Some(summary),
-                )
-                .await;
-                return Err(err);
-            }
-        };
-
-        let replay_patch = capture.diff.clone();
-        updated_run = finalize_captured_dispatch_execution(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            repo_root,
-            &updated_run.run_id,
-            capture,
-        )
-        .await?;
-
-        if !replay_patch.trim().is_empty() {
-            replay_base_patches.push(replay_patch);
-        }
-    }
-
-    Ok(updated_run)
-}
-
-async fn finalize_captured_dispatches(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    repo_root: &Path,
-    run: RunStatus,
-    captures: Vec<CapturedDispatchExecution>,
-) -> Result<RunStatus> {
-    let mut updated_run = run;
-    for capture in captures {
-        updated_run = finalize_captured_dispatch_execution(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            repo_root,
-            &updated_run.run_id,
-            capture,
-        )
-        .await?;
-    }
-    Ok(updated_run)
-}
-
-async fn execute_dispatch_grants_with_worker(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    repo_root: &Path,
-    run: RunStatus,
-    grants: &[DispatchGrant],
-    worker: &dyn OrchestrationInlineWorker,
-) -> Result<RunStatus> {
-    if grants.is_empty() {
-        return Ok(run);
-    }
-
-    if grants.len() > 1 {
-        let capture_results = futures::future::join_all(grants.iter().map(|grant| {
-            capture_dispatch_grant_execution(cx, reliability_state, repo_root, grant, worker)
-        }))
-        .await;
-        let mut captures = Vec::with_capacity(capture_results.len());
-        let mut rollback_summaries = Vec::new();
-        for (grant, result) in grants.iter().zip(capture_results) {
-            match result {
-                Ok(capture) => captures.push(capture),
-                Err(err) => {
-                    let failure_message = format!(
-                        "parallel wave worker execution failed for {}: {err}",
-                        grant.task_id
-                    );
-                    rollback_summaries.push((grant.clone(), failure_message));
-                }
-            }
-        }
-
-        if !rollback_summaries.is_empty() {
-            for (grant, summary) in rollback_summaries {
-                rollback_dispatch_grant(
-                    cx,
-                    session,
-                    reliability_state,
-                    orchestration_state,
-                    run_store,
-                    &run.run_id,
-                    &grant,
-                    Some(summary),
-                )
-                .await;
-            }
-
-            let salvaged_count = captures.len();
-            let updated_run = if salvaged_count > 0 {
-                if captured_dispatches_overlap(&captures) {
-                    let success_grants = captures
-                        .iter()
-                        .map(|capture| capture.grant.clone())
-                        .collect::<Vec<_>>();
-                    execute_dispatch_grants_sequentially_with_replay_base(
-                        cx,
-                        session,
-                        reliability_state,
-                        orchestration_state,
-                        run_store,
-                        repo_root,
-                        run,
-                        &success_grants,
-                        worker,
-                    )
-                    .await?
-                } else {
-                    finalize_captured_dispatches(
-                        cx,
-                        session,
-                        reliability_state,
-                        orchestration_state,
-                        run_store,
-                        repo_root,
-                        run,
-                        captures,
-                    )
-                    .await?
-                }
-            } else {
-                current_run_status(cx, orchestration_state, run_store, &run.run_id).await?
-            };
-            return Ok(updated_run);
-        }
-
-        if captured_dispatches_overlap(&captures) {
-            return execute_dispatch_grants_sequentially_with_replay_base(
-                cx,
-                session,
-                reliability_state,
-                orchestration_state,
-                run_store,
-                repo_root,
-                run,
-                grants,
-                worker,
-            )
-            .await;
-        }
-
-        return finalize_captured_dispatches(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            repo_root,
-            run,
-            captures,
-        )
-        .await;
-    }
-
-    let mut updated_run = run;
-    for grant in grants {
-        updated_run = execute_inline_dispatch_grant_with_worker(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            repo_root,
-            &updated_run.run_id,
-            grant,
-            worker,
-        )
-        .await?;
-    }
-    Ok(updated_run)
 }
 
 async fn execute_inline_run_dispatch(
@@ -2004,27 +962,26 @@ async fn execute_inline_run_dispatch(
     run: RunStatus,
     grants: &[DispatchGrant],
 ) -> Result<RunStatus> {
-    let repo_root = session_workspace_root(cx, session).await?;
-    let provider = {
-        let guard = session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        guard.agent.provider()
-    };
-    let worker = RpcSessionInlineWorker::new(provider, config.clone());
-    execute_dispatch_grants_with_worker(
+    run_service::execute_inline_run_dispatch(
         cx,
         session,
         reliability_state,
         orchestration_state,
         run_store,
-        repo_root.as_path(),
+        config,
         run,
         grants,
-        &worker,
     )
     .await
+}
+
+async fn current_run_status(
+    cx: &AgentCx,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<RunStatus> {
+    run_service::current_run_status(cx, orchestration_state, run_store, run_id).await
 }
 
 async fn session_workspace_root(
@@ -2048,106 +1005,22 @@ async fn dispatch_run_until_quiescent(
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     run_store: &RunStore,
     config: &Config,
-    mut run: RunStatus,
+    run: RunStatus,
     agent_id_prefix: &str,
     lease_ttl_sec: i64,
 ) -> Result<(RunStatus, Vec<DispatchGrant>)> {
-    loop {
-        let mut grants = {
-            let mut rel = reliability_state
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-            let has_live_tasks = !run.task_ids.is_empty()
-                && run
-                    .task_ids
-                    .iter()
-                    .all(|task_id| rel.tasks.contains_key(task_id));
-            if has_live_tasks {
-                dispatch_run_wave(&mut rel, &mut run, agent_id_prefix, lease_ttl_sec)
-            } else {
-                Err(Error::session(format!(
-                    "orchestration run {} is not live in this process",
-                    run.run_id
-                )))
-            }
-        }?;
-
-        {
-            let mut orchestration = orchestration_state
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-            orchestration.update_run(run.clone());
-        }
-
-        if grants.is_empty() {
-            let recoverable_wait = {
-                let rel = reliability_state
-                    .lock(cx)
-                    .await
-                    .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                if run_has_live_tasks(&rel, &run)
-                    && matches!(run.lifecycle, RunLifecycle::Pending | RunLifecycle::Running)
-                {
-                    next_recoverable_retry_delay(&rel, &run)
-                } else {
-                    None
-                }
-            };
-            if let Some(wait_for) = recoverable_wait
-                .filter(|wait_for| *wait_for <= run_service::MAX_AUTOMATED_RECOVERABLE_WAIT)
-            {
-                cx.time().sleep(wait_for).await;
-                continue;
-            }
-            return Ok((run, grants));
-        }
-
-        append_dispatch_grants_session_entries(cx, session, reliability_state, &grants).await?;
-        let run_id = run.run_id.clone();
-        run = match execute_inline_run_dispatch(
-            cx,
-            session,
-            reliability_state,
-            orchestration_state,
-            run_store,
-            config,
-            run,
-            &grants,
-        )
-        .await
-        {
-            Ok(updated_run) => updated_run,
-            Err(err) if grants.len() == 1 => {
-                let recovered_run =
-                    current_run_status(cx, orchestration_state, run_store, &run_id).await?;
-                if matches!(
-                    recovered_run.lifecycle,
-                    RunLifecycle::Pending | RunLifecycle::Running
-                ) {
-                    grants.clear();
-                    run = recovered_run;
-                    continue;
-                }
-                drop(err);
-                recovered_run
-            }
-            Err(err) => return Err(err),
-        };
-        grants.clear();
-
-        if matches!(
-            run.lifecycle,
-            RunLifecycle::Canceled
-                | RunLifecycle::Failed
-                | RunLifecycle::Succeeded
-                | RunLifecycle::Blocked
-                | RunLifecycle::AwaitingHuman
-        ) {
-            return Ok((run, grants));
-        }
-    }
+    run_service::dispatch_run_until_quiescent(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        config,
+        run,
+        agent_id_prefix,
+        lease_ttl_sec,
+    )
+    .await
 }
 
 fn build_submit_task_report(
@@ -2197,7 +1070,7 @@ async fn execute_run_verification(
     run: &mut RunStatus,
     scope: &CompletedRunVerifyScope,
 ) {
-    run_service::execute_run_verification(cwd, run, scope).await
+    run_service::execute_run_verification(cwd, run, scope).await;
 }
 
 async fn sync_task_runs(
@@ -6876,6 +5749,7 @@ mod tests {
         AssistantMessage, ContentBlock, ImageContent, StopReason, StreamEvent, TextContent,
         ThinkingLevel, Usage, UserContent, UserMessage,
     };
+    use crate::orchestration::RunVerifyScopeKind;
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::session::Session;
     use crate::tools::ToolRegistry;
