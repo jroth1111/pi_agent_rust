@@ -5,17 +5,27 @@
 //! Lives in the surface layer because it is purely startup I/O coordination —
 //! no inference, session state, or business-rule ownership.
 
+use std::future::Future;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
+use asupersync::sync::Mutex;
 
+use crate::agent::{Agent, AgentConfig, AgentSession};
 use crate::app::{ModelSelection, ScopedModel, StartupError};
 use crate::auth::AuthStorage;
 use crate::cli;
+use crate::compaction::ResolvedCompactionSettings;
 use crate::config::Config;
+use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
 use crate::models::ModelRegistry;
+use crate::providers;
 use crate::session::Session;
 use crate::surface::auth_setup::run_first_time_setup;
+use crate::surface::extension_runtime::activate_extensions_for_session;
+use crate::tools::ToolRegistry;
 
 /// Outcome of a surface startup error handling attempt.
 pub enum SurfaceStartupRecovery {
@@ -279,4 +289,120 @@ pub async fn resolve_surface_model_selection(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_surface_agent_session<J>(
+    cli: &cli::Cli,
+    config: &Config,
+    cwd: &Path,
+    selection: &ModelSelection,
+    resolved_key: Option<String>,
+    mut session: Session,
+    model_registry: &mut ModelRegistry,
+    auth: &mut AuthStorage,
+    enabled_tools: &[&str],
+    skills_prompt: Option<&str>,
+    global_dir: &Path,
+    package_dir: &Path,
+    test_mode: bool,
+    extension_flags: &[cli::ExtensionCliFlag],
+    extension_entries: &[PathBuf],
+    extension_prewarm_handle: Option<(ExtensionManager, Arc<ToolRegistry>, J)>,
+) -> Result<AgentSession>
+where
+    J: Future<Output = anyhow::Result<ExtensionRuntimeHandle>>,
+{
+    crate::app::update_session_for_selection(&mut session, selection);
+
+    if let Some(message) = &selection.fallback_message {
+        eprintln!("Warning: {message}");
+    }
+
+    let system_prompt = crate::app::build_system_prompt(
+        cli,
+        cwd,
+        enabled_tools,
+        skills_prompt,
+        global_dir,
+        package_dir,
+        test_mode,
+    );
+    let provider =
+        providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
+    let stream_options =
+        crate::app::build_stream_options(config, resolved_key, selection, &session);
+    let agent_config = AgentConfig {
+        system_prompt: Some(system_prompt),
+        max_tool_iterations: 50,
+        stream_options,
+        block_images: config.image_block_images(),
+    };
+
+    let tools = ToolRegistry::new(enabled_tools, cwd, Some(config));
+    let session_arc = Arc::new(Mutex::new(session));
+    let context_window_tokens = if selection.model_entry.model.context_window == 0 {
+        tracing::warn!(
+            "Model {} reported context_window=0; falling back to default compaction window",
+            selection.model_entry.model.id
+        );
+        ResolvedCompactionSettings::default().context_window_tokens
+    } else {
+        selection.model_entry.model.context_window
+    };
+    let compaction_settings = ResolvedCompactionSettings {
+        enabled: config.compaction_enabled(),
+        reserve_tokens: config.compaction_reserve_tokens(),
+        keep_recent_tokens: config.compaction_keep_recent_tokens(),
+        context_window_tokens,
+    };
+    let mut agent_session = AgentSession::new(
+        Agent::new(provider, tools, agent_config),
+        session_arc,
+        !cli.no_session,
+        compaction_settings,
+    )
+    .with_reliability_enabled(config.reliability_enabled())
+    .with_reliability_mode(config.reliability_enforcement_mode())
+    .with_retry_settings(config.retry.clone().unwrap_or_default());
+
+    restore_session_history(&mut agent_session).await?;
+
+    activate_extensions_for_session(
+        &mut agent_session,
+        enabled_tools,
+        cwd,
+        config,
+        extension_entries,
+        extension_flags,
+        auth,
+        model_registry,
+        cli.extension_policy.as_deref(),
+        cli.repair_policy.as_deref(),
+        extension_prewarm_handle,
+    )
+    .await?;
+
+    agent_session.set_model_registry(model_registry.clone());
+    agent_session.set_auth_storage(auth.clone());
+
+    Ok(agent_session)
+}
+
+async fn restore_session_history(agent_session: &mut AgentSession) -> Result<()> {
+    let history = {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = agent_session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        session.to_messages_for_current_path()
+    };
+
+    if !history.is_empty() {
+        agent_session.agent.replace_messages(history);
+    }
+
+    Ok(())
 }

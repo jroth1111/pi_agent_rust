@@ -41,10 +41,9 @@ use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
-use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
+use pi::agent::{AbortHandle, AgentEvent, AgentSession};
 use pi::auth::AuthStorage;
 use pi::cli;
-use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::config::SettingsScope;
 use pi::extension_index::ExtensionIndexStore;
@@ -60,7 +59,6 @@ use pi::package_manager::{
 };
 use pi::provider::InputType;
 use pi::provider_metadata::PROVIDER_METADATA;
-use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
@@ -69,9 +67,9 @@ use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::extension_policy::{
     print_resolved_extension_policy, print_resolved_repair_policy,
 };
-use pi::surface::extension_runtime::activate_extensions_for_session;
 use pi::surface::startup::{
-    SurfaceSelectionOutcome, load_model_registry_with_warning, resolve_surface_model_selection,
+    SurfaceSelectionOutcome, build_surface_agent_session, load_model_registry_with_warning,
+    resolve_surface_model_selection,
 };
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
@@ -663,7 +661,7 @@ async fn run(
     else {
         return Ok(());
     };
-    let mut session = Box::pin(Session::new(&cli, &config)).await?;
+    let session = Box::pin(Session::new(&cli, &config)).await?;
 
     let (selection, resolved_key) = match resolve_surface_model_selection(
         &surface_bootstrap,
@@ -685,12 +683,6 @@ async fn run(
         SurfaceSelectionOutcome::ExitQuietly => return Ok(()),
     };
 
-    pi::app::update_session_for_selection(&mut session, &selection);
-
-    if let Some(message) = &selection.fallback_message {
-        eprintln!("Warning: {message}");
-    }
-
     let enabled_tools = cli.enabled_tools();
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
@@ -698,9 +690,15 @@ async fn run(
         String::new()
     };
     let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
-    let system_prompt = pi::app::build_system_prompt(
+    let agent_session = build_surface_agent_session(
         &cli,
+        &config,
         &cwd,
+        &selection,
+        resolved_key,
+        session,
+        &mut model_registry,
+        &mut auth,
         &enabled_tools,
         if skills_prompt.is_empty() {
             None
@@ -710,63 +708,11 @@ async fn run(
         &global_dir,
         &package_dir,
         test_mode,
-    );
-    let provider =
-        providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
-    let stream_options = pi::app::build_stream_options(&config, resolved_key, &selection, &session);
-    let agent_config = AgentConfig {
-        system_prompt: Some(system_prompt),
-        max_tool_iterations: 50,
-        stream_options,
-        block_images: config.image_block_images(),
-    };
-
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
-    let session_arc = Arc::new(Mutex::new(session));
-    let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-        tracing::warn!(
-            "Model {} reported context_window=0; falling back to default compaction window",
-            selection.model_entry.model.id
-        );
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        selection.model_entry.model.context_window
-    };
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: config.compaction_enabled(),
-        reserve_tokens: config.compaction_reserve_tokens(),
-        keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        context_window_tokens,
-    };
-    let mut agent_session = AgentSession::new(
-        Agent::new(provider, tools, agent_config),
-        session_arc,
-        !cli.no_session,
-        compaction_settings,
-    )
-    .with_reliability_enabled(config.reliability_enabled())
-    .with_reliability_mode(config.reliability_enforcement_mode())
-    .with_retry_settings(config.retry.clone().unwrap_or_default());
-
-    restore_session_history(&mut agent_session).await?;
-
-    activate_extensions_for_session(
-        &mut agent_session,
-        &enabled_tools,
-        &cwd,
-        &config,
-        resources.extensions(),
         &extension_flags,
-        &mut auth,
-        &mut model_registry,
-        cli.extension_policy.as_deref(),
-        cli.repair_policy.as_deref(),
+        resources.extensions(),
         extension_prewarm_handle,
     )
     .await?;
-
-    agent_session.set_model_registry(model_registry.clone());
-    agent_session.set_auth_storage(auth.clone());
 
     // Clone session handle for shutdown flush (ensures autosave queue is drained).
     let session_handle = Arc::clone(&agent_session.session);
@@ -882,24 +828,6 @@ async fn flush_session_autosave_on_shutdown(session_handle: &Arc<Mutex<Session>>
             eprintln!("Warning: Failed to flush session autosave: {e}");
         }
     }
-}
-
-async fn restore_session_history(agent_session: &mut AgentSession) -> Result<()> {
-    let history = {
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let session = agent_session
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        session.to_messages_for_current_path()
-    };
-
-    if !history.is_empty() {
-        agent_session.agent.replace_messages(history);
-    }
-
-    Ok(())
 }
 
 const fn scope_from_flag(local: bool) -> PackageScope {
