@@ -317,6 +317,19 @@ impl RpcOrchestrationState {
             .map(|ids| ids.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    pub(crate) fn all_runs(&self) -> Vec<RunStatus> {
+        self.runs.values().cloned().collect()
+    }
+
+    pub(crate) fn task_run_entries(&self) -> Vec<(String, Vec<String>)> {
+        self.task_runs
+            .iter()
+            .map(|(task_id, run_ids)| {
+                (task_id.clone(), run_ids.iter().cloned().collect::<Vec<_>>())
+            })
+            .collect()
+    }
 }
 
 impl RpcReliabilityState {

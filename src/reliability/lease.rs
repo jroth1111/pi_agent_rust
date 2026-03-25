@@ -218,6 +218,10 @@ impl LeaseManager {
         Ok(grant)
     }
 
+    pub fn prune_expired(&mut self, now: DateTime<Utc>) {
+        self.prune_expired_leases(now);
+    }
+
     pub fn validate_fence(&self, lease_id: &str, fence_token: u64) -> Result<(), LeaseError> {
         let Some(grant) = self.by_lease.get(lease_id) else {
             return Err(LeaseError::LeaseNotFound(lease_id.to_string()));
