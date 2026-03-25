@@ -375,7 +375,7 @@ impl RpcReliabilityState {
         self.leases.set_external_provider(provider);
     }
 
-    fn mode_blocks(&self) -> bool {
+    const fn mode_blocks(&self) -> bool {
         ReliabilityService::mode_blocks(self)
     }
 
@@ -399,7 +399,7 @@ impl RpcReliabilityState {
         }
     }
 
-    fn state_label(state: &reliability::RuntimeState) -> &'static str {
+    const fn state_label(state: &reliability::RuntimeState) -> &'static str {
         ReliabilityService::state_label(state)
     }
 
@@ -3617,6 +3617,13 @@ pub async fn run(
     let orchestration_state = Arc::new(Mutex::new(RpcOrchestrationState::default()));
     let run_store = RunStore::from_global_dir();
 
+    // NOTE: Contract adapters (RpcWorkflowAdapter) were designed for std::sync::Mutex
+    // but RPC state uses asupersync::sync::Mutex which requires Cx context.
+    // Full adapter wiring requires either:
+    // 1. Making adapter methods async to pass Cx, or
+    // 2. Changing RPC state to use std::sync::Mutex (synchronous access only)
+    // Currently, handlers directly access reliability_state via async locking.
+
     {
         use futures::future::BoxFuture;
         let steering_state = Arc::clone(&shared_state);
@@ -6610,15 +6617,15 @@ mod retry_tests {
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for FlakyProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "test-provider"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "test-api"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "test-model"
         }
 
@@ -6683,15 +6690,15 @@ mod retry_tests {
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for AlwaysErrorProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "test-provider"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "test-api"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "test-model"
         }
 
@@ -8122,15 +8129,15 @@ mod tests {
 
     #[async_trait]
     impl Provider for CountingProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "counting"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "counting"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "counting-model"
         }
 
@@ -8317,15 +8324,15 @@ mod tests {
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for NoopProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "test-provider"
         }
 
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "test-api"
         }
 
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "test-model"
         }
 

@@ -20,6 +20,20 @@ Use for final-placement and cutover features involving:
 
 None.
 
+## Performance Discipline
+
+- Keep assistant output terse. Do not narrate before every tool call or emit long reasoning summaries.
+- Keep the todo list short, at most 5 items, and update it only when task state changes materially.
+- On resumed or interrupted sessions, inspect the current git diff, touched files, and latest failing command output before making new edits. Continue from the existing state; do not restate the whole architecture in prose.
+- Read only the cutover assertions and the exact transitional paths being removed or quarantined.
+- Use manifest-declared cargo commands or their exact embedded absolute invocations only.
+- Prefer targeted extension/runtime tests before broader cargo runs.
+- Remove one default path or compatibility seam at a time; avoid broad unrelated cleanup during cutover.
+- After two failed edit attempts caused by stale context or mismatched patches, re-read the exact file and apply one minimal fix. If still blocked, hand off instead of looping.
+- After two failed validation attempts with the same root cause, stop retrying variants and return a structured handoff with the blocker.
+- After any BYOK/provider `429`, `TimeoutError`, or Fair Use restriction message in-session, stop and hand off instead of continuing with more planning or retries.
+- Once one authority move and one focused validation pass are complete, either apply one minimal fix or hand off. Do not start a second broad rewrite in the same session.
+
 ## Work Procedure
 
 1. Read the cutover assertions and identify the exact transitional or compatibility-first behavior that must stop being authoritative.

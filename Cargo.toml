@@ -172,7 +172,7 @@ harness = false
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [features]
-default = ["image-resize", "jemalloc", "clipboard", "wasm-host", "sqlite-sessions", "keyring"]
+default = ["image-resize", "clipboard", "wasm-host", "sqlite-sessions", "keyring"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]

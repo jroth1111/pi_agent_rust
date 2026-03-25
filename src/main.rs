@@ -895,7 +895,9 @@ async fn run(
                         StartupError::MissingApiKey { provider } => {
                             NonInteractiveStartupRequirement::OAuth(provider)
                         }
-                        _ => NonInteractiveStartupRequirement::None,
+                        StartupError::NoModelsAvailable { .. } => {
+                            NonInteractiveStartupRequirement::None
+                        }
                     };
 
                     match recover_surface_startup_error_for_selection(

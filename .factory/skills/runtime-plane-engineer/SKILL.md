@@ -22,6 +22,20 @@ Use for features that create or cut over shared planes:
 
 None.
 
+## Performance Discipline
+
+- Keep assistant output terse. Do not narrate before every tool call or emit long reasoning summaries.
+- Keep the todo list short, at most 5 items, and update it only when task state changes materially.
+- On resumed or interrupted sessions, inspect the current git diff, touched files, and latest failing command output before making new edits. Continue from the existing state; do not restate the whole architecture in prose.
+- Read only the plane-specific assertions and the exact leaking call paths relevant to the feature.
+- Move one caller class or plane seam at a time; avoid multi-plane rewrites in one run.
+- Use manifest-declared cargo commands or their exact embedded absolute invocations only.
+- Prefer targeted plane-level tests before broader cargo runs.
+- After two failed edit attempts caused by stale context or mismatched patches, re-read the exact file and apply one minimal fix. If still blocked, hand off instead of looping.
+- After two failed validation attempts with the same root cause, stop retrying variants and return a structured handoff with the blocker.
+- After any BYOK/provider `429`, `TimeoutError`, or Fair Use restriction message in-session, stop and hand off instead of continuing with more planning or retries.
+- Once one authority move and one focused validation pass are complete, either apply one minimal fix or hand off. Do not start a second broad rewrite in the same session.
+
 ## Work Procedure
 
 1. Read the plane-specific mission assertions and identify exactly which code paths currently leak this concern outside its intended owner.

@@ -12,6 +12,8 @@ Mission-specific validation notes and invariants.
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets`
 
+Use the commands in `.factory/services.yaml` as the canonical way to invoke these gates. Do not rely on bare `cargo` being on `PATH`, and do not assume `.factory/init.sh` exports persist across later shell commands.
+
 ## Evidence expectations
 
 This architecture mission requires durable evidence, not only passing commands. Workers should prefer artifacts and records that can be joined across:
@@ -31,3 +33,10 @@ A feature that claims assertions in `fulfills` must make those assertions fully 
 ## Current execution limitation
 
 Environment/toolchain readiness is not yet fully repaired. If a worker cannot execute the approved gates because of external environment state, it must return to the orchestrator with exact blocker details instead of silently downgrading verification.
+
+## Runtime Hygiene
+
+- Prefer the narrowest meaningful validation first for the touched boundary before escalating to the full gate set.
+- If a targeted check already proves the same external blocker as a broader command would, stop and hand off instead of burning time on redundant reruns.
+- After two failed environment, linker, toolchain, or command attempts with the same root cause, stop retrying variants and return a structured handoff.
+- After one model/provider timeout or `429` class failure and one confirmatory retry, stop and return a structured handoff instead of re-asking repeatedly.

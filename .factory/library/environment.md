@@ -22,6 +22,11 @@ Use absolute tool paths where practical for this mission:
 - Cargo: `/Users/gwizz/.cargo/bin/cargo`
 - Rustup: `/opt/homebrew/bin/rustup`
 
+Use the commands in `.factory/services.yaml` rather than bare `cargo` invocations:
+- they carry the stable absolute tool paths
+- they pin `CARGO_TARGET_DIR` to `/Users/gwizz/CascadeProjects/pi_agent_rust/.tmp_cargo_tmp_final`
+- they avoid depending on shell-local `PATH` changes from `.factory/init.sh`
+
 ## External dependencies
 
 - No new long-running services are planned by default for this mission.

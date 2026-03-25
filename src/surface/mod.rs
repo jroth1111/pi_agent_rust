@@ -332,7 +332,7 @@ pub fn check_non_interactive_extension_ui_request(
         .get("title")
         .and_then(Value::as_str)
         .or_else(|| request.payload.get("message").and_then(Value::as_str));
-    Ok(guard.check_extension_ui_request(&request.method, capability, title)?)
+    guard.check_extension_ui_request(&request.method, capability, title)
 }
 
 /// Convert the first blocked extension UI reason into a runtime error.
@@ -346,12 +346,13 @@ pub fn check_non_interactive_extension_ui_blocked(
     let Some(blocked_reason) = blocked_reason else {
         return Ok(());
     };
-    if let Some(message) = blocked_reason
-        .lock()
-        .expect("non-interactive extension UI blocked reason lock")
-        .take()
     {
-        return Err(crate::error::Error::validation(message));
+        let mut guard = blocked_reason
+            .lock()
+            .expect("non-interactive extension UI blocked reason lock");
+        if let Some(message) = guard.take() {
+            return Err(crate::error::Error::validation(message));
+        }
     }
     Ok(())
 }

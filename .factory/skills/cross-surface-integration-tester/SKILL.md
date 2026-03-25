@@ -20,6 +20,15 @@ Use for final integration leaves that prove:
 
 None.
 
+## Performance Discipline
+
+- Keep assistant output terse. Do not narrate before every tool call or emit long reasoning summaries.
+- Keep the todo list short, at most 5 items, and update it only when task state changes materially.
+- Prove only the joins claimed by the feature. Do not broaden the integration scope once the representative surfaces and records are identified.
+- Prefer targeted integration tests and one representative live surface check over broad exploratory runs.
+- After two failed edit attempts caused by stale context or mismatched patches, re-read the exact file and apply one minimal fix. If still blocked, hand off instead of looping.
+- After two failed validation attempts with the same root cause, stop retrying variants and return a structured handoff with the blocker.
+
 ## Work Procedure
 
 1. Read the cross-area assertions claimed by the feature and list the exact records/transcripts needed to prove each join.

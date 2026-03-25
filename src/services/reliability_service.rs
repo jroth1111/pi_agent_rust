@@ -15,7 +15,7 @@ pub(crate) struct ReliabilityService {
 
 impl ReliabilityService {
     #[must_use]
-    pub(crate) fn new(state: Arc<Mutex<RpcReliabilityState>>) -> Self {
+    pub(crate) const fn new(state: Arc<Mutex<RpcReliabilityState>>) -> Self {
         Self { state }
     }
 
@@ -140,7 +140,7 @@ impl ReliabilityService {
         Ok(())
     }
 
-    pub(crate) fn state_label(state: &reliability::RuntimeState) -> &'static str {
+    pub(crate) const fn state_label(state: &reliability::RuntimeState) -> &'static str {
         match state {
             reliability::RuntimeState::Blocked { .. } => "blocked",
             reliability::RuntimeState::Ready => "ready",

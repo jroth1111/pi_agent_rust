@@ -1,2 +1,3 @@
-[build]
-rustc = "scripts/rustc-nightly.sh"
+# `rust-toolchain.toml` already pins nightly + required components for this
+# repo. Keep Cargo's `rustc` resolution default so subcommands like clippy and
+# fmt can invoke the active toolchain correctly.

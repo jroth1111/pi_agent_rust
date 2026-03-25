@@ -140,7 +140,7 @@ struct ScriptedProvider {
 }
 
 impl ScriptedProvider {
-    fn new(steps: Vec<ScriptedStep>) -> Self {
+    const fn new(steps: Vec<ScriptedStep>) -> Self {
         Self {
             steps,
             call_count: AtomicUsize::new(0),

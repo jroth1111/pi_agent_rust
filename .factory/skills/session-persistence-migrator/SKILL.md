@@ -15,6 +15,20 @@ Use for features that change session authority, migration, integrity, compaction
 
 None.
 
+## Performance Discipline
+
+- Keep assistant output terse. Do not narrate before every tool call or emit long reasoning summaries.
+- Keep the todo list short, at most 5 items, and update it only when task state changes materially.
+- On resumed or interrupted sessions, inspect the current git diff, touched files, and latest failing command output before making new edits. Continue from the existing state; do not restate the whole architecture in prose.
+- Read only the session docs, migration code, and persistence modules directly touched by the feature.
+- Use manifest-declared cargo commands or their exact embedded absolute invocations only.
+- Prefer targeted persistence and migration tests before broader cargo runs.
+- Change one authority boundary or migration seam at a time; avoid wide speculative cleanup during persistence cutover work.
+- After two failed edit attempts caused by stale context or mismatched patches, re-read the exact file and apply one minimal fix. If still blocked, hand off instead of looping.
+- After two failed validation attempts with the same root cause, stop retrying variants and return a structured handoff with the blocker.
+- After any BYOK/provider `429`, `TimeoutError`, or Fair Use restriction message in-session, stop and hand off instead of continuing with more planning or retries.
+- Once one authority move and one focused validation pass are complete, either apply one minimal fix or hand off. Do not start a second broad rewrite in the same session.
+
 ## Work Procedure
 
 1. Read the mission artifacts plus current session docs and code before editing (`docs/session.md`, `docs/tree.md`, relevant migration docs, `src/session*`).

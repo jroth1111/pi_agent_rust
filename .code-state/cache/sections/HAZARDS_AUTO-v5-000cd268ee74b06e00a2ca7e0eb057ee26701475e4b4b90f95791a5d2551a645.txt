@@ -1,0 +1,51 @@
+[scan] Scanning for hazard markers
+AGENTS.md:109:- Never create wrapper functions for deprecated APIs
+AGENTS.md:566:- **Contextual (judgment):** TODO/FIXME, println! debugging
+AGENTS.md:566:- **Contextual (judgment):** TODO/FIXME, println! debugging
+AGENTS.md:757:## Note on Built-in TODO Functionality
+AGENTS.md:759:Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+AGENTS.md:803:- **Contextual** (judgment): TODO/FIXME, console logs
+AGENTS.md:803:- **Contextual** (judgment): TODO/FIXME, console logs
+EXTENSIONS.md:1127:  "params": { "name": "grep", "input": { "pattern": "TODO", "path": "src/" } },
+README.md:288:| `grep` | Search file contents with context | Find all TODO comments |
+README.md:1706:Input: { "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+docs/EXTENSION_POPULARITY_CRITERIA.md:384:- `required_shims` is descriptive (what the extension appears to need), not a per-extension hack list.
+docs/development.md:23:If you want to hack on those repos locally (in lockstep), use a local-only Cargo patch. Assuming the sibling repos are checked out next to `pi_agent_rust` (e.g. `../asupersync`, `../rich_rust`, etc), add this to **your local checkout** (do not commit):
+docs/dropin-parity-gap-ledger.json:358:        "Classify whether variable is required, optional passthrough, or deprecated for strict parity.",
+docs/extension-npm-scan-summary.json:94:      "description": "DEPRECATED: Use @mariozechner/pi-coding-agent instead (supports Termux since v0.51.0)",
+docs/extension-research-playbook.json:67:        "exclude_deprecated": true
+docs/extension-research-playbook.json:307:        { "name": "is_deprecated", "type": "boolean", "required": false, "source": "npm", "description": "Whether the npm package is deprecated" }
+docs/non-mock-rubric.json:249:        "description": "Concrete path to remove the double (e.g., 'Replace with VCR cassette in bd-XXXX')."
+docs/program-governance.md:248:- Deprecated APIs emit runtime warnings for at least one minor release.
+docs/program-governance.md:253:- Deprecated APIs: warning for 2 minor releases, removal in next major.
+docs/provider-canonical-id-policy.md:31:| Deprecated ID | Canonical ID | Reason |
+docs/provider-canonical-id-policy.md:36:Both deprecated IDs will continue to work via alias resolution. A deprecation warning will be logged when they are used.
+docs/provider-discrepancy-ledger.json:264:      "user_impact": "No direct user impact. New tests could use deprecated v1 schema without warning.",
+docs/provider-gate-ubs-report.json:133:      "No TODO/FIXME/HACK markers in provider code",
+docs/provider-gate-ubs-report.json:133:      "No TODO/FIXME/HACK markers in provider code",
+docs/provider_e2e_artifact_contract.json:19:      "status": "deprecated",
+docs/qa-runbook.md:650:bead = "bd-XXXX"
+docs/schema/test_evidence_logging_contract.json:78:          "enum": ["canonical", "deprecated", "experimental"],
+docs/schema/test_evidence_logging_instance.json:18:        "status": "deprecated",
+docs/security/maintenance-playbook.md:265:bead = "bd-XXXX"
+docs/termux.md:8:1. Install **Termux** from F-Droid or GitHub (the Play Store build is deprecated).
+docs/testing-policy.md:712:bead = "bd-XXXX"                # Tracking bead for the fix
+fuzz/README.md:300:./scripts/fuzz_crash_manage.sh regress <target> panic-unwrap-001.bin --bead=bd-XXXX
+install.sh:2395:  staged_destination="$(mktemp -d "${destination_parent}/.${AGENT_SKILL_NAME}.tmp.XXXXXX" 2>/dev/null || true)"
+src/conformance_shapes.rs:915:    /// (test fixtures, deprecated extensions, multi-file bundles that are
+src/context/summary.rs:607:                    summary: "Removed deprecated code".to_string(),
+src/context/summary.rs:615:        assert!(context.contains("`/src/old.rs` (deleted): Removed deprecated code"));
+src/extensions.rs:46262:        let result = broker.maybe_redact("ANTHROPIC_API_KEY", "sk-ant-xxx");
+src/extensions.rs:46298:        let cmd = "ANTHROPIC_API_KEY=sk-ant-xxx my_script";
+src/extensions.rs:46301:        assert!(!result.contains("sk-ant-xxx"));
+src/extensions.rs:46307:        let cmd = "anthropic_api_key=sk-ant-xxx my_script";
+src/extensions.rs:46310:        assert!(!result.contains("sk-ant-xxx"));
+src/extensions.rs:46340:        let cmd = "ANTHROPIC_API_KEY=sk-ant-xxx my_script";
+src/extensions_js.rs:821:    /// (deprecated keys, schema version migration).
+src/extensions_js.rs:966:        description: "Migrate deprecated manifest fields to current schema",
+src/extensions_js.rs:973:        description: "Rewrite known deprecated API calls to current equivalents",
+src/extensions_js.rs:1730:    /// Source contains `with (` — deprecated scope-altering statement.
+src/migrations.rs:30:    /// Deprecated layout warnings (hooks/tools).
+src/migrations.rs:408:                "could not inspect deprecated tools/ directory at {}: {err}",
+src/verification/evidence.rs:181:    /// Whether all TODO items must be resolved
+src/verification/evidence.rs:250:        // Check TODO requirement
