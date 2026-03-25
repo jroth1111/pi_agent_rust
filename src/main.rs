@@ -41,9 +41,7 @@ use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
-use pi::agent::{
-    AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, PreWarmedExtensionRuntime,
-};
+use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
 use pi::auth::AuthStorage;
 use pi::cli;
@@ -67,12 +65,15 @@ use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
-use pi::surface::auth_setup::run_first_time_setup;
 #[cfg(test)]
 use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::extension_policy::{
-    maybe_print_extension_policy_migration_notice, print_resolved_extension_policy,
-    print_resolved_repair_policy,
+    print_resolved_extension_policy, print_resolved_repair_policy,
+};
+use pi::surface::extension_runtime::activate_extensions_for_session;
+use pi::surface::startup::{
+    NonInteractiveStartupRequirement, SurfaceStartupLoopAction, load_model_registry_with_warning,
+    recover_surface_startup_error_for_selection,
 };
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
@@ -90,24 +91,6 @@ const USAGE_ERROR_PATTERNS: &[&str] = &[
     "theme file not found",
     "theme spec is empty",
 ];
-
-enum SurfaceStartupRecovery {
-    RetryAfterSetup,
-    ExitQuietly,
-    None,
-}
-
-enum SurfaceStartupLoopAction {
-    ContinueSelection,
-    ExitQuietly,
-    Propagate,
-}
-
-enum NonInteractiveStartupRequirement<'a> {
-    None,
-    Tty(&'a str),
-    OAuth(&'a str),
-}
 
 fn main() {
     if let Err(err) = main_impl() {
@@ -316,143 +299,6 @@ fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> 
             pi::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
         }
     }
-    Ok(())
-}
-
-fn parse_bool_flag_value(flag_name: &str, raw: &str) -> Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(pi::error::Error::validation(format!(
-            "Invalid boolean value for extension flag --{flag_name}: \"{raw}\". Use one of: true,false,1,0,yes,no,on,off."
-        ))
-        .into()),
-    }
-}
-
-fn coerce_extension_flag_value(
-    flag: &cli::ExtensionCliFlag,
-    declared_type: &str,
-) -> Result<serde_json::Value> {
-    match declared_type.trim().to_ascii_lowercase().as_str() {
-        "bool" | "boolean" => {
-            if let Some(raw) = flag.value.as_deref() {
-                Ok(Value::Bool(parse_bool_flag_value(&flag.name, raw)?))
-            } else {
-                Ok(Value::Bool(true))
-            }
-        }
-        "number" | "int" | "integer" | "float" => {
-            let Some(raw) = flag.value.as_deref() else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} requires a numeric value.",
-                    flag.name
-                ))
-                .into());
-            };
-            if let Ok(parsed) = raw.parse::<i64>() {
-                return Ok(Value::Number(parsed.into()));
-            }
-            let parsed = raw.parse::<f64>().map_err(|_| {
-                pi::error::Error::validation(format!(
-                    "Invalid numeric value for extension flag --{}: \"{}\"",
-                    flag.name, raw
-                ))
-            })?;
-            let Some(number) = serde_json::Number::from_f64(parsed) else {
-                return Err(pi::error::Error::validation(format!(
-                    "Numeric value for extension flag --{} is not finite: \"{}\"",
-                    flag.name, raw
-                ))
-                .into());
-            };
-            Ok(Value::Number(number))
-        }
-        _ => {
-            let Some(raw) = flag.value.as_deref() else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} requires a value.",
-                    flag.name
-                ))
-                .into());
-            };
-            Ok(Value::String(raw.to_string()))
-        }
-    }
-}
-
-async fn apply_extension_cli_flags(
-    manager: &pi::extensions::ExtensionManager,
-    extension_flags: &[cli::ExtensionCliFlag],
-) -> Result<()> {
-    if extension_flags.is_empty() {
-        return Ok(());
-    }
-
-    let registered = manager.list_flags();
-    let known_names: std::collections::BTreeSet<String> = registered
-        .iter()
-        .filter_map(|flag| flag.get("name").and_then(Value::as_str))
-        .map(ToString::to_string)
-        .collect();
-
-    for cli_flag in extension_flags {
-        let matches = registered
-            .iter()
-            .filter(|flag| {
-                flag.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&cli_flag.name))
-            })
-            .collect::<Vec<_>>();
-
-        if matches.is_empty() {
-            let known = if known_names.is_empty() {
-                "(none)".to_string()
-            } else {
-                known_names
-                    .iter()
-                    .map(|name| format!("--{name}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            return Err(pi::error::Error::validation(format!(
-                "Unknown extension flag --{}. Registered extension flags: {known}",
-                cli_flag.name
-            ))
-            .into());
-        }
-
-        for spec in matches {
-            let Some(extension_id) = spec.get("extension_id").and_then(Value::as_str) else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} cannot be set because extension metadata is missing extension_id.",
-                    cli_flag.name
-                ))
-                .into());
-            };
-            if extension_id.trim().is_empty() {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} cannot be set because extension_id is empty.",
-                    cli_flag.name
-                ))
-                .into());
-            }
-            let registered_name = spec.get("name").and_then(Value::as_str).ok_or_else(|| {
-                pi::error::Error::validation(format!(
-                    "Extension flag --{} is missing name metadata.",
-                    cli_flag.name
-                ))
-            })?;
-            let flag_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
-            let value = coerce_extension_flag_value(cli_flag, flag_type)?;
-            manager
-                .set_flag_value(extension_id, registered_name, value)
-                .await
-                .map_err(anyhow::Error::new)?;
-        }
-    }
-
     Ok(())
 }
 
@@ -987,125 +833,20 @@ async fn run(
 
     restore_session_history(&mut agent_session).await?;
 
-    if !resources.extensions().is_empty() {
-        // Await the pre-warmed extension runtime (spawned earlier to overlap with
-        // auth refresh, model selection, and session creation).
-        let pre_warmed = if let Some((mgr, tools, join_handle)) = extension_prewarm_handle {
-            match join_handle.await {
-                Ok(runtime) => {
-                    tracing::info!(
-                        event = "pi.extension_runtime.prewarm.success",
-                        runtime = runtime.runtime_name(),
-                        "Pre-warmed extension runtime ready"
-                    );
-                    Some(PreWarmedExtensionRuntime {
-                        manager: mgr,
-                        runtime,
-                        tools,
-                    })
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        event = "pi.extension_runtime.prewarm.failed",
-                        error = %e,
-                        "Extension runtime pre-warm failed, falling back to inline creation"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let resolved_ext_policy =
-            config.resolve_extension_policy_with_metadata(cli.extension_policy.as_deref());
-        let resolved_repair_policy =
-            config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
-        let effective_repair_policy = if resolved_repair_policy.source == "default" {
-            // Compatibility-first default for extension-heavy workloads:
-            // if the user did not choose a repair policy explicitly, prefer
-            // aggressive deterministic repairs while capability policy stays enforced.
-            pi::extensions::RepairPolicyMode::AutoStrict
-        } else {
-            resolved_repair_policy.effective_mode
-        };
-        tracing::info!(
-            event = "pi.extension_repair_policy.resolved",
-            requested = %resolved_repair_policy.requested_mode,
-            source = resolved_repair_policy.source,
-            effective = ?effective_repair_policy,
-            "Resolved extension repair policy for runtime"
-        );
-        maybe_print_extension_policy_migration_notice(&resolved_ext_policy);
-        agent_session
-            .enable_extensions_with_policy(
-                &enabled_tools,
-                &cwd,
-                Some(&config),
-                resources.extensions(),
-                Some(resolved_ext_policy.policy),
-                Some(effective_repair_policy),
-                pre_warmed,
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
-
-        if !extension_flags.is_empty() {
-            if let Some(region) = &agent_session.extensions {
-                apply_extension_cli_flags(region.manager(), &extension_flags).await?;
-            } else {
-                return Err(pi::error::Error::validation(
-                    "Extension flags were provided, but extensions are not active in this session.",
-                )
-                .into());
-            }
-        }
-
-        // Merge extension-registered providers into the model registry.
-        if let Some(region) = &agent_session.extensions {
-            let ext_entries = region.manager().extension_model_entries();
-            if !ext_entries.is_empty() {
-                // Build OAuth configs map from model entries before merging.
-                let ext_oauth_configs: std::collections::HashMap<String, pi::models::OAuthConfig> =
-                    ext_entries
-                        .iter()
-                        .filter_map(|entry| {
-                            entry
-                                .oauth_config
-                                .as_ref()
-                                .map(|cfg| (entry.model.provider.clone(), cfg.clone()))
-                        })
-                        .collect();
-
-                model_registry.merge_entries(ext_entries);
-
-                // Refresh expired OAuth tokens for extension-registered providers.
-                if !ext_oauth_configs.is_empty() {
-                    let client = pi::http::client::Client::new();
-                    if let Err(e) = auth
-                        .refresh_expired_extension_oauth_tokens(&client, &ext_oauth_configs)
-                        .await
-                    {
-                        tracing::warn!(
-                            event = "pi.auth.extension_oauth_refresh.failed",
-                            error = %e,
-                            "Failed to refresh extension OAuth tokens, continuing with existing credentials"
-                        );
-                    }
-                }
-            }
-        }
-    } else if !extension_flags.is_empty() {
-        let rendered = extension_flags
-            .iter()
-            .map(pi::cli::ExtensionCliFlag::display_name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(pi::error::Error::validation(format!(
-            "Extension flags were provided ({rendered}), but no extensions are loaded. Add extensions via --extension or remove the flags."
-        ))
-        .into());
-    }
+    activate_extensions_for_session(
+        &mut agent_session,
+        &enabled_tools,
+        &cwd,
+        &config,
+        resources.extensions(),
+        &extension_flags,
+        &mut auth,
+        &mut model_registry,
+        cli.extension_policy.as_deref(),
+        cli.repair_policy.as_deref(),
+        extension_prewarm_handle,
+    )
+    .await?;
 
     agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth.clone());
@@ -2938,93 +2679,6 @@ fn list_providers() {
         );
     }
     println!("\n{} providers available.", rows.len());
-}
-
-async fn try_run_surface_startup_setup(
-    surface_bootstrap: &pi::surface::CliSurfaceBootstrap,
-    startup_error: &StartupError,
-    auth: &mut AuthStorage,
-    cli: &mut cli::Cli,
-    models_path: &Path,
-) -> Result<SurfaceStartupRecovery> {
-    if !surface_bootstrap.can_run_interactive_setup() {
-        return Ok(SurfaceStartupRecovery::None);
-    }
-
-    if run_first_time_setup(startup_error, auth, cli, models_path).await? {
-        return Ok(SurfaceStartupRecovery::RetryAfterSetup);
-    }
-
-    Ok(SurfaceStartupRecovery::ExitQuietly)
-}
-
-async fn handle_surface_startup_error(
-    surface_bootstrap: &pi::surface::CliSurfaceBootstrap,
-    non_interactive_guard: Option<&pi::surface::NonInteractiveGuard>,
-    startup_error: &StartupError,
-    auth: &mut AuthStorage,
-    cli: &mut cli::Cli,
-    models_path: &Path,
-    non_interactive_requirement: NonInteractiveStartupRequirement<'_>,
-) -> Result<SurfaceStartupRecovery> {
-    let recovery =
-        try_run_surface_startup_setup(surface_bootstrap, startup_error, auth, cli, models_path)
-            .await?;
-    if !matches!(recovery, SurfaceStartupRecovery::None) {
-        return Ok(recovery);
-    }
-
-    if let Some(guard) = non_interactive_guard {
-        match non_interactive_requirement {
-            NonInteractiveStartupRequirement::None => {}
-            NonInteractiveStartupRequirement::Tty(operation) => {
-                guard.check_tty_required(operation)?;
-            }
-            NonInteractiveStartupRequirement::OAuth(provider) => {
-                guard.check_oauth_required(provider)?;
-            }
-        }
-    }
-
-    Ok(SurfaceStartupRecovery::None)
-}
-
-async fn recover_surface_startup_error_for_selection(
-    surface_bootstrap: &pi::surface::CliSurfaceBootstrap,
-    non_interactive_guard: Option<&pi::surface::NonInteractiveGuard>,
-    startup_error: &StartupError,
-    auth: &mut AuthStorage,
-    cli: &mut cli::Cli,
-    models_path: &Path,
-    model_registry: &mut ModelRegistry,
-    non_interactive_requirement: NonInteractiveStartupRequirement<'_>,
-) -> Result<SurfaceStartupLoopAction> {
-    match handle_surface_startup_error(
-        surface_bootstrap,
-        non_interactive_guard,
-        startup_error,
-        auth,
-        cli,
-        models_path,
-        non_interactive_requirement,
-    )
-    .await?
-    {
-        SurfaceStartupRecovery::RetryAfterSetup => {
-            *model_registry = load_model_registry_with_warning(auth, models_path);
-            Ok(SurfaceStartupLoopAction::ContinueSelection)
-        }
-        SurfaceStartupRecovery::ExitQuietly => Ok(SurfaceStartupLoopAction::ExitQuietly),
-        SurfaceStartupRecovery::None => Ok(SurfaceStartupLoopAction::Propagate),
-    }
-}
-
-fn load_model_registry_with_warning(auth: &AuthStorage, models_path: &Path) -> ModelRegistry {
-    let model_registry = ModelRegistry::load(auth, Some(models_path.to_path_buf()));
-    if let Some(error) = model_registry.error() {
-        eprintln!("Warning: models.json error: {error}");
-    }
-    model_registry
 }
 
 fn filter_models_by_pattern(models: Vec<ModelEntry>, pattern: &str) -> Vec<ModelEntry> {

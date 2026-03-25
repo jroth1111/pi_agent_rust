@@ -19,6 +19,8 @@
 
 pub mod auth_setup;
 pub mod extension_policy;
+pub mod extension_runtime;
+pub mod startup;
 
 use crate::agent::AgentSession;
 use crate::contracts::bootstrap::{
