@@ -18,6 +18,7 @@
 //! silent fallback to interactive mode.
 
 pub mod auth_setup;
+pub mod extension_policy;
 
 use crate::agent::AgentSession;
 use crate::contracts::bootstrap::{
