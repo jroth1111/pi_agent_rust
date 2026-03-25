@@ -9,8 +9,10 @@ use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
 
 use crate::agent::{Agent, AgentConfig, AgentSession};
@@ -24,10 +26,13 @@ use crate::package_manager::PackageManager;
 use crate::providers;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::session::Session;
+use crate::session_index::SessionIndex;
 use crate::surface::auth_setup::run_first_time_setup;
 use crate::surface::extension_runtime::{
     SurfaceExtensionPrewarmHandle, activate_extensions_for_session,
+    resolve_surface_extension_runtime_flavor, spawn_surface_extension_prewarm,
 };
+use crate::surface::routing::run_selected_surface_route;
 use crate::tools::ToolRegistry;
 
 pub struct StartupResources {
@@ -107,6 +112,34 @@ pub async fn load_surface_startup_resources(
     })
 }
 
+fn spawn_session_index_maintenance() {
+    const MAX_INDEX_AGE: Duration = Duration::from_secs(60 * 30);
+    let index = SessionIndex::new();
+
+    std::thread::spawn(move || {
+        crate::tools::cleanup_temp_files();
+
+        if index.should_reindex(MAX_INDEX_AGE)
+            && let Err(err) = index.reindex_all()
+        {
+            eprintln!("Warning: failed to reindex session index: {err}");
+        }
+    });
+}
+
+async fn flush_session_autosave_on_shutdown(session_handle: &Arc<Mutex<Session>>, disabled: bool) {
+    if disabled {
+        return;
+    }
+
+    let cx = crate::agent_cx::AgentCx::for_request();
+    if let Ok(mut guard) = session_handle.lock(cx.cx()).await
+        && let Err(e) = guard.flush_autosave_on_shutdown().await
+    {
+        eprintln!("Warning: Failed to flush session autosave: {e}");
+    }
+}
+
 pub async fn refresh_surface_startup_auth(auth: &mut AuthStorage) -> Result<()> {
     auth.refresh_expired_oauth_tokens().await?;
 
@@ -122,6 +155,124 @@ pub async fn refresh_surface_startup_auth(auth: &mut AuthStorage) -> Result<()> 
     }
 
     Ok(())
+}
+
+pub async fn run_cli_surface(
+    mut cli: cli::Cli,
+    extension_flags: Vec<cli::ExtensionCliFlag>,
+    runtime_handle: RuntimeHandle,
+    cwd: PathBuf,
+    list_models: fn(&ModelRegistry, Option<&str>),
+) -> Result<()> {
+    spawn_session_index_maintenance();
+    let StartupResources {
+        config,
+        resources,
+        mut auth,
+        resource_cli,
+    } = load_surface_startup_resources(&cli, &extension_flags, &cwd).await?;
+    let extension_runtime_flavor = resolve_surface_extension_runtime_flavor(&resources)?;
+
+    let extension_prewarm_handle = spawn_surface_extension_prewarm(
+        &runtime_handle,
+        &cli,
+        &config,
+        &cwd,
+        extension_runtime_flavor,
+    );
+
+    refresh_surface_startup_auth(&mut auth).await?;
+    let package_dir = Config::package_dir();
+    let Some(PreparedSurfaceInputs {
+        global_dir,
+        models_path,
+        mut model_registry,
+        initial,
+        messages,
+        surface_bootstrap,
+        mode,
+        non_interactive_guard,
+        scoped_patterns,
+    }) = prepare_surface_inputs(&mut cli, &config, &auth, &cwd, list_models).await?
+    else {
+        return Ok(());
+    };
+    let session = Box::pin(Session::new(&cli, &config)).await?;
+
+    let (selection, resolved_key) = match resolve_surface_model_selection(
+        &surface_bootstrap,
+        non_interactive_guard.as_ref(),
+        &mut auth,
+        &mut cli,
+        &models_path,
+        &mut model_registry,
+        &scoped_patterns,
+        &global_dir,
+        &config,
+        &session,
+    )
+    .await?
+    {
+        SurfaceSelectionOutcome::Selected(resolution) => {
+            (resolution.selection, resolution.resolved_key)
+        }
+        SurfaceSelectionOutcome::ExitQuietly => return Ok(()),
+    };
+
+    let enabled_tools = cli.enabled_tools();
+    let skills_prompt = if enabled_tools.contains(&"read") {
+        resources.format_skills_for_prompt()
+    } else {
+        String::new()
+    };
+    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    let agent_session = build_surface_agent_session(
+        &cli,
+        &config,
+        &cwd,
+        &selection,
+        resolved_key,
+        session,
+        &mut model_registry,
+        &mut auth,
+        &enabled_tools,
+        if skills_prompt.is_empty() {
+            None
+        } else {
+            Some(skills_prompt.as_str())
+        },
+        &global_dir,
+        &package_dir,
+        test_mode,
+        &extension_flags,
+        resources.extensions(),
+        extension_prewarm_handle,
+    )
+    .await?;
+
+    let session_handle = Arc::clone(&agent_session.session);
+
+    let result = run_selected_surface_route(
+        surface_bootstrap.route_kind,
+        agent_session,
+        &selection,
+        model_registry.get_available(),
+        initial,
+        messages,
+        resources,
+        &config,
+        auth.clone(),
+        runtime_handle.clone(),
+        resource_cli,
+        cwd.clone(),
+        !cli.no_session,
+        &mode,
+    )
+    .await;
+
+    flush_session_autosave_on_shutdown(&session_handle, cli.no_session).await;
+
+    result
 }
 
 /// Outcome of a surface startup error handling attempt.

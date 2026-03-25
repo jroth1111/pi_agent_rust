@@ -33,12 +33,10 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
 
 use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
 use pi::auth::AuthStorage;
@@ -52,22 +50,12 @@ use pi::package_manager::{
 };
 use pi::provider::InputType;
 use pi::provider_metadata::PROVIDER_METADATA;
-use pi::session::Session;
-use pi::session_index::SessionIndex;
 #[cfg(test)]
 use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::extension_policy::{
     print_resolved_extension_policy, print_resolved_repair_policy,
 };
-use pi::surface::extension_runtime::{
-    resolve_surface_extension_runtime_flavor, spawn_surface_extension_prewarm,
-};
-use pi::surface::routing::run_selected_surface_route;
-use pi::surface::startup::{
-    PreparedSurfaceInputs, StartupResources, SurfaceSelectionOutcome, build_surface_agent_session,
-    load_surface_startup_resources, prepare_surface_inputs, refresh_surface_startup_auth,
-    resolve_surface_model_selection,
-};
+use pi::surface::startup::run_cli_surface;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -323,118 +311,7 @@ async fn run(
         }
     }
 
-    spawn_session_index_maintenance();
-    let StartupResources {
-        config,
-        resources,
-        mut auth,
-        resource_cli,
-    } = load_surface_startup_resources(&cli, &extension_flags, &cwd).await?;
-    let extension_runtime_flavor = resolve_surface_extension_runtime_flavor(&resources)?;
-
-    // Pre-warm extension runtime in a background task so startup work can overlap
-    // with auth refresh, model selection, and session creation.
-    let extension_prewarm_handle = spawn_surface_extension_prewarm(
-        &runtime_handle,
-        &cli,
-        &config,
-        &cwd,
-        extension_runtime_flavor,
-    );
-
-    refresh_surface_startup_auth(&mut auth).await?;
-    let package_dir = Config::package_dir();
-    let Some(PreparedSurfaceInputs {
-        global_dir,
-        models_path,
-        mut model_registry,
-        initial,
-        messages,
-        surface_bootstrap,
-        mode,
-        non_interactive_guard,
-        scoped_patterns,
-    }) = prepare_surface_inputs(&mut cli, &config, &auth, &cwd, list_models).await?
-    else {
-        return Ok(());
-    };
-    let session = Box::pin(Session::new(&cli, &config)).await?;
-
-    let (selection, resolved_key) = match resolve_surface_model_selection(
-        &surface_bootstrap,
-        non_interactive_guard.as_ref(),
-        &mut auth,
-        &mut cli,
-        &models_path,
-        &mut model_registry,
-        &scoped_patterns,
-        &global_dir,
-        &config,
-        &session,
-    )
-    .await?
-    {
-        SurfaceSelectionOutcome::Selected(resolution) => {
-            (resolution.selection, resolution.resolved_key)
-        }
-        SurfaceSelectionOutcome::ExitQuietly => return Ok(()),
-    };
-
-    let enabled_tools = cli.enabled_tools();
-    let skills_prompt = if enabled_tools.contains(&"read") {
-        resources.format_skills_for_prompt()
-    } else {
-        String::new()
-    };
-    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
-    let agent_session = build_surface_agent_session(
-        &cli,
-        &config,
-        &cwd,
-        &selection,
-        resolved_key,
-        session,
-        &mut model_registry,
-        &mut auth,
-        &enabled_tools,
-        if skills_prompt.is_empty() {
-            None
-        } else {
-            Some(skills_prompt.as_str())
-        },
-        &global_dir,
-        &package_dir,
-        test_mode,
-        &extension_flags,
-        resources.extensions(),
-        extension_prewarm_handle,
-    )
-    .await?;
-
-    // Clone session handle for shutdown flush (ensures autosave queue is drained).
-    let session_handle = Arc::clone(&agent_session.session);
-
-    let result = run_selected_surface_route(
-        surface_bootstrap.route_kind,
-        agent_session,
-        &selection,
-        model_registry.get_available(),
-        initial,
-        messages,
-        resources,
-        &config,
-        auth.clone(),
-        runtime_handle.clone(),
-        resource_cli,
-        cwd.clone(),
-        !cli.no_session,
-        &mode,
-    )
-    .await;
-
-    flush_session_autosave_on_shutdown(&session_handle, cli.no_session).await;
-
-    result
+    run_cli_surface(cli, extension_flags, runtime_handle, cwd, list_models).await
 }
 
 async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
@@ -494,37 +371,6 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn spawn_session_index_maintenance() {
-    const MAX_INDEX_AGE: Duration = Duration::from_secs(60 * 30);
-    let index = SessionIndex::new();
-
-    // Always spawn the background thread to handle cleanup, regardless of reindexing needs.
-    // Cleanup can be slow if there are many temp files, so we don't want to block main.
-    std::thread::spawn(move || {
-        // Clean up old bash tool logs in background
-        pi::tools::cleanup_temp_files();
-
-        if index.should_reindex(MAX_INDEX_AGE) {
-            if let Err(err) = index.reindex_all() {
-                eprintln!("Warning: failed to reindex session index: {err}");
-            }
-        }
-    });
-}
-
-async fn flush_session_autosave_on_shutdown(session_handle: &Arc<Mutex<Session>>, disabled: bool) {
-    if disabled {
-        return;
-    }
-
-    let cx = pi::agent_cx::AgentCx::for_request();
-    if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
-        if let Err(e) = guard.flush_autosave_on_shutdown().await {
-            eprintln!("Warning: Failed to flush session autosave: {e}");
-        }
-    }
 }
 
 const fn scope_from_flag(local: bool) -> PackageScope {
