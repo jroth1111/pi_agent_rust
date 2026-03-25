@@ -25,6 +25,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent,
     UserMessage,
 };
+use crate::contracts::dto::SessionIdentity;
 use crate::models::ModelEntry;
 use crate::orchestration::{
     ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind,
@@ -2702,8 +2703,10 @@ async fn append_evidence_record(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    session_identity: &SessionIdentity,
     req: AppendEvidenceRequest,
 ) -> Result<EvidenceRecord> {
+    let req_for_identity = req.clone();
     let evidence = {
         let mut rel = reliability_state
             .lock(cx)
@@ -2722,7 +2725,23 @@ async fn append_evidence_record(
             .lock(cx)
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        if inner_session.header.id != session_identity.session_id {
+            return Err(Error::validation(format!(
+                "session identity mismatch for append_evidence: live session `{}` did not match typed session `{}`",
+                inner_session.header.id, session_identity.session_id
+            )));
+        }
         inner_session.append_verification_evidence_entry(evidence.clone());
+        inner_session.append_custom_entry(
+            "workflow_mutation_identity".to_string(),
+            Some(json!({
+                "mutation": "reliability.append_evidence",
+                "sessionIdentity": session_identity,
+                "taskId": req_for_identity.task_id,
+                "command": req_for_identity.command,
+                "exitCode": req_for_identity.exit_code,
+            })),
+        );
     }
     guard.persist_session().await?;
     Ok(evidence)
@@ -2735,6 +2754,7 @@ async fn submit_task_and_sync(
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     run_store: &RunStore,
+    session_identity: &SessionIdentity,
     req: SubmitTaskRequest,
 ) -> Result<SubmitTaskResponse> {
     let req_for_report = req.clone();
@@ -2757,13 +2777,25 @@ async fn submit_task_and_sync(
                 .lock(cx)
                 .await
                 .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+            if inner_session.header.id != session_identity.session_id {
+                return Err(Error::validation(format!(
+                    "session identity mismatch for submit_task: live session `{}` did not match typed session `{}`",
+                    inner_session.header.id, session_identity.session_id
+                )));
+            }
             inner_session
                 .append_close_decision_entry(result.close_payload.clone(), result.close.clone());
             inner_session.append_task_transition_entry(
                 result.task_id.clone(),
                 None,
                 result.state.clone(),
-                None,
+                Some(json!({
+                    "mutation": "reliability.submit_task",
+                    "sessionIdentity": session_identity,
+                    "leaseId": req_for_report.lease_id.clone(),
+                    "fenceToken": req_for_report.fence_token,
+                    "verifyRunId": req_for_report.verify_run_id.clone(),
+                })),
             );
         }
         guard.persist_session().await?;
@@ -2914,19 +2946,20 @@ async fn capture_dispatch_grant_execution_with_base_patches(
         snapshot.clone(),
     )?;
     workspace.prepare()?;
-    let mut layered_base = false;
-    if !base_patches.is_empty() {
+    let layered_base = if base_patches.is_empty() {
+        let parent_base_patch = repo_worktree_diff_against_snapshot(repo_root, &snapshot)?;
+        if parent_base_patch.trim().is_empty() {
+            false
+        } else {
+            workspace.apply_patch(&parent_base_patch)?;
+            true
+        }
+    } else {
         for patch in base_patches {
             workspace.apply_patch(patch)?;
         }
-        layered_base = true;
-    } else {
-        let parent_base_patch = repo_worktree_diff_against_snapshot(repo_root, &snapshot)?;
-        if !parent_base_patch.trim().is_empty() {
-            workspace.apply_patch(&parent_base_patch)?;
-            layered_base = true;
-        }
-    }
+        true
+    };
     if layered_base {
         workspace.commit_staged_changes("pi orchestration replay base")?;
     }
@@ -2995,10 +3028,12 @@ async fn finalize_captured_dispatch_execution(
     run_id: &str,
     capture: CapturedDispatchExecution,
 ) -> Result<RunStatus> {
+    let session_identity = current_session_identity(cx, session).await?;
     let evidence = match append_evidence_record(
         cx,
         session,
         reliability_state,
+        &session_identity,
         AppendEvidenceRequest {
             task_id: capture.contract.task_id.clone(),
             command: capture.verification.command.clone(),
@@ -3066,6 +3101,7 @@ async fn finalize_captured_dispatch_execution(
         reliability_state,
         orchestration_state,
         run_store,
+        &session_identity,
         SubmitTaskRequest {
             task_id: capture.grant.task_id.clone(),
             lease_id: capture.grant.lease_id.clone(),
@@ -3427,6 +3463,26 @@ async fn session_workspace_root(
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
         PathBuf::from(cwd)
+    })
+}
+
+async fn current_session_identity(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+) -> Result<SessionIdentity> {
+    let guard = session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let inner = guard
+        .session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    Ok(SessionIdentity {
+        session_id: inner.header.id.clone(),
+        name: None,
+        path: inner.path.as_ref().map(|path| path.display().to_string()),
     })
 }
 
