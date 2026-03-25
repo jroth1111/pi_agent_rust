@@ -18,7 +18,6 @@ use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
 use crate::config::{Config, ReliabilityEnforcementMode};
-use crate::contracts::dto::SessionIdentity;
 use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
@@ -26,9 +25,7 @@ use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
-use crate::orchestration::{
-    RunLifecycle, RunStatus, RunStore, RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus,
-};
+use crate::orchestration::{RunStatus, RunStore, RunVerifyStatus, WaveStatus};
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
@@ -47,13 +44,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
+use crate::contracts::dto::SessionIdentity;
+#[cfg(test)]
 use crate::orchestration::ExecutionTier;
+#[cfg(test)]
+use crate::orchestration::{RunLifecycle, SubrunPlan, TaskReport};
+#[cfg(test)]
+use std::path::Path;
 
 fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
@@ -317,11 +320,11 @@ impl RpcOrchestrationState {
 }
 
 impl RpcReliabilityState {
-    fn new(config: &Config) -> Result<Self> {
+    pub(crate) fn new(config: &Config) -> Result<Self> {
         Self::new_with_lease_provider(config, None)
     }
 
-    fn new_with_lease_provider(
+    pub(crate) fn new_with_lease_provider(
         config: &Config,
         external_provider: Option<Arc<dyn reliability::LeaseProvider>>,
     ) -> Result<Self> {
@@ -741,317 +744,313 @@ fn next_active_wave(
     run_service::next_active_wave(existing, active_task_ids)
 }
 
-fn topological_run_task_ids(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<String> {
-    run_service::topological_run_task_ids(reliability, run)
+#[cfg(test)]
+mod run_service_test_helpers {
+    use super::*;
+
+    pub(super) fn topological_run_task_ids(
+        reliability: &RpcReliabilityState,
+        run: &RunStatus,
+    ) -> Vec<String> {
+        run_service::topological_run_task_ids(reliability, run)
+    }
+
+    pub(super) fn planned_subruns(
+        reliability: &RpcReliabilityState,
+        run: &RunStatus,
+    ) -> Vec<SubrunPlan> {
+        run_service::planned_subruns(reliability, run)
+    }
+
+    pub(super) fn derive_run_lifecycle(
+        reliability: &RpcReliabilityState,
+        task_ids: &[String],
+    ) -> RunLifecycle {
+        run_service::derive_run_lifecycle(reliability, task_ids)
+    }
+
+    pub(super) fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
+        run_service::run_has_live_tasks(reliability, run)
+    }
+
+    pub(super) fn refresh_live_run_from_reliability(
+        reliability: &mut RpcReliabilityState,
+        run: &mut RunStatus,
+    ) -> bool {
+        run_service::refresh_live_run_from_reliability(reliability, run)
+    }
+
+    pub(super) fn refresh_run_from_reliability(
+        reliability: &RpcReliabilityState,
+        run: &mut RunStatus,
+    ) {
+        run_service::refresh_run_from_reliability(reliability, run);
+    }
+
+    pub(super) fn dispatch_run_wave(
+        reliability: &mut RpcReliabilityState,
+        run: &mut RunStatus,
+        agent_id_prefix: &str,
+        lease_ttl_sec: i64,
+    ) -> Result<Vec<DispatchGrant>> {
+        run_service::dispatch_run_wave(reliability, run, agent_id_prefix, lease_ttl_sec)
+    }
+
+    pub(super) fn cancel_live_run_tasks(
+        reliability: &mut RpcReliabilityState,
+        run: &mut RunStatus,
+    ) -> Vec<DispatchGrant> {
+        run_service::cancel_live_run_tasks(reliability, run)
+    }
+
+    pub(super) fn build_cancel_run_task_report(
+        reliability: &RpcReliabilityState,
+        run_id: &str,
+        task_id: &str,
+    ) -> Option<TaskReport> {
+        run_service::build_cancel_run_task_report(reliability, run_id, task_id)
+    }
+
+    pub(super) fn build_dispatch_rollback_task_report(
+        reliability: &RpcReliabilityState,
+        task_id: &str,
+        summary: &str,
+        failure_class: &str,
+    ) -> Option<TaskReport> {
+        run_service::build_dispatch_rollback_task_report(
+            reliability,
+            task_id,
+            summary,
+            failure_class,
+        )
+    }
+
+    pub(super) async fn cancel_live_run_tasks_and_sync(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+        reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        run: &mut RunStatus,
+    ) -> Result<()> {
+        run_service::cancel_live_run_tasks_and_sync(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            run,
+        )
+        .await
+    }
+
+    pub(super) fn next_recoverable_retry_delay(
+        reliability: &RpcReliabilityState,
+        run: &RunStatus,
+    ) -> Option<Duration> {
+        run_service::next_recoverable_retry_delay(reliability, run)
+    }
+
+    pub(super) fn apply_dispatch_rollback_recovery(
+        reliability: &mut RpcReliabilityState,
+        grant: &DispatchGrant,
+        failure_summary: Option<&str>,
+    ) -> String {
+        run_service::apply_dispatch_rollback_recovery(reliability, grant, failure_summary)
+    }
+
+    pub(super) async fn rollback_dispatch_grant(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+        reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        run_id: &str,
+        grant: &DispatchGrant,
+        failure_summary: Option<String>,
+    ) {
+        run_service::rollback_dispatch_grant(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            run_id,
+            grant,
+            failure_summary,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_inline_run_dispatch(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+        reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        config: &Config,
+        run: RunStatus,
+        grants: &[DispatchGrant],
+    ) -> Result<RunStatus> {
+        run_service::execute_inline_run_dispatch(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            config,
+            run,
+            grants,
+        )
+        .await
+    }
+
+    pub(super) async fn current_run_status(
+        cx: &AgentCx,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        run_id: &str,
+    ) -> Result<RunStatus> {
+        run_service::current_run_status(cx, orchestration_state, run_store, run_id).await
+    }
+
+    pub(super) async fn session_workspace_root(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+    ) -> Result<PathBuf> {
+        run_service::session_workspace_root(cx, session).await
+    }
+
+    pub(super) async fn current_session_identity(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+    ) -> Result<SessionIdentity> {
+        run_service::current_session_identity(cx, session).await
+    }
+
+    pub(super) async fn dispatch_run_until_quiescent(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+        reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        config: &Config,
+        run: RunStatus,
+        agent_id_prefix: &str,
+        lease_ttl_sec: i64,
+    ) -> Result<(RunStatus, Vec<DispatchGrant>)> {
+        run_service::dispatch_run_until_quiescent(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            config,
+            run,
+            agent_id_prefix,
+            lease_ttl_sec,
+        )
+        .await
+    }
+
+    pub(super) fn build_submit_task_report(
+        reliability: &RpcReliabilityState,
+        req: &SubmitTaskRequest,
+        result: &SubmitTaskResponse,
+    ) -> Result<TaskReport> {
+        run_service::build_submit_task_report(reliability, req, result)
+    }
+
+    pub(super) fn build_runtime_task_report(
+        reliability: &RpcReliabilityState,
+        task_id: &str,
+        summary: String,
+    ) -> Option<TaskReport> {
+        run_service::build_runtime_task_report(reliability, task_id, summary)
+    }
+
+    pub(super) fn refresh_task_runs_with_verify_scopes(
+        reliability: &RpcReliabilityState,
+        orchestration: &mut RpcOrchestrationState,
+        task_id: &str,
+        report: Option<&TaskReport>,
+    ) -> Vec<(RunStatus, Option<CompletedRunVerifyScope>)> {
+        run_service::refresh_task_runs_with_verify_scopes(
+            reliability,
+            orchestration,
+            task_id,
+            report,
+        )
+    }
+
+    pub(super) fn refresh_task_runs(
+        reliability: &RpcReliabilityState,
+        orchestration: &mut RpcOrchestrationState,
+        task_id: &str,
+        report: Option<TaskReport>,
+    ) -> Vec<RunStatus> {
+        run_service::refresh_task_runs(reliability, orchestration, task_id, report)
+    }
+
+    pub(super) fn run_verify_scope_summary(
+        scope: &CompletedRunVerifyScope,
+        ok: bool,
+        details: impl AsRef<str>,
+    ) -> String {
+        run_service::run_verify_scope_summary(scope, ok, details)
+    }
+
+    pub(super) async fn execute_run_verification(
+        cwd: &Path,
+        run: &mut RunStatus,
+        scope: &CompletedRunVerifyScope,
+    ) {
+        run_service::execute_run_verification(cwd, run, scope).await;
+    }
+
+    pub(super) async fn sync_task_runs(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+        reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        task_id: &str,
+        report: Option<TaskReport>,
+    ) -> Result<Vec<RunStatus>> {
+        run_service::sync_task_runs(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            task_id,
+            report,
+        )
+        .await
+    }
+
+    pub(super) async fn refresh_run_if_live(
+        cx: &AgentCx,
+        session: &Arc<Mutex<AgentSession>>,
+        reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        run: RunStatus,
+    ) -> Result<RunStatus> {
+        run_service::refresh_run_if_live(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            run,
+        )
+        .await
+    }
 }
 
-fn planned_subruns(reliability: &RpcReliabilityState, run: &RunStatus) -> Vec<SubrunPlan> {
-    run_service::planned_subruns(reliability, run)
-}
-
-fn derive_run_lifecycle(reliability: &RpcReliabilityState, task_ids: &[String]) -> RunLifecycle {
-    run_service::derive_run_lifecycle(reliability, task_ids)
-}
-
-fn run_has_live_tasks(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
-    run_service::run_has_live_tasks(reliability, run)
-}
-
-fn refresh_live_run_from_reliability(
-    reliability: &mut RpcReliabilityState,
-    run: &mut RunStatus,
-) -> bool {
-    run_service::refresh_live_run_from_reliability(reliability, run)
-}
-
-fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
-    run_service::refresh_run_from_reliability(reliability, run);
-}
-
-fn dispatch_run_wave(
-    reliability: &mut RpcReliabilityState,
-    run: &mut RunStatus,
-    agent_id_prefix: &str,
-    lease_ttl_sec: i64,
-) -> Result<Vec<DispatchGrant>> {
-    run_service::dispatch_run_wave(reliability, run, agent_id_prefix, lease_ttl_sec)
-}
-
-fn cancel_live_run_tasks(
-    reliability: &mut RpcReliabilityState,
-    run: &mut RunStatus,
-) -> Vec<DispatchGrant> {
-    run_service::cancel_live_run_tasks(reliability, run)
-}
-
-fn build_cancel_run_task_report(
-    reliability: &RpcReliabilityState,
-    run_id: &str,
-    task_id: &str,
-) -> Option<TaskReport> {
-    run_service::build_cancel_run_task_report(reliability, run_id, task_id)
-}
-
-fn build_dispatch_rollback_task_report(
-    reliability: &RpcReliabilityState,
-    task_id: &str,
-    summary: &str,
-    failure_class: &str,
-) -> Option<TaskReport> {
-    run_service::build_dispatch_rollback_task_report(reliability, task_id, summary, failure_class)
-}
-
-async fn cancel_live_run_tasks_and_sync(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    run: &mut RunStatus,
-) -> Result<()> {
-    run_service::cancel_live_run_tasks_and_sync(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        run,
-    )
-    .await
-}
-
-fn next_recoverable_retry_delay(
-    reliability: &RpcReliabilityState,
-    run: &RunStatus,
-) -> Option<Duration> {
-    run_service::next_recoverable_retry_delay(reliability, run)
-}
-
-fn apply_dispatch_rollback_recovery(
-    reliability: &mut RpcReliabilityState,
-    grant: &DispatchGrant,
-    failure_summary: Option<&str>,
-) -> String {
-    run_service::apply_dispatch_rollback_recovery(reliability, grant, failure_summary)
-}
-
-#[allow(dead_code)]
-async fn append_evidence_record(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    session_identity: &SessionIdentity,
-    req: AppendEvidenceRequest,
-) -> Result<EvidenceRecord> {
-    run_service::append_evidence_record(cx, session, reliability_state, session_identity, req).await
-}
-
-#[allow(dead_code)]
-async fn submit_task_and_sync(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    session_identity: &SessionIdentity,
-    req: SubmitTaskRequest,
-) -> Result<SubmitTaskResponse> {
-    run_service::submit_task_and_sync(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        session_identity,
-        req,
-    )
-    .await
-}
-
-#[allow(dead_code)]
-async fn rollback_dispatch_grant(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    run_id: &str,
-    grant: &DispatchGrant,
-    failure_summary: Option<String>,
-) {
-    run_service::rollback_dispatch_grant(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        run_id,
-        grant,
-        failure_summary,
-    )
-    .await
-}
-
-async fn execute_inline_run_dispatch(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    config: &Config,
-    run: RunStatus,
-    grants: &[DispatchGrant],
-) -> Result<RunStatus> {
-    run_service::execute_inline_run_dispatch(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        config,
-        run,
-        grants,
-    )
-    .await
-}
-
-async fn current_run_status(
-    cx: &AgentCx,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    run_id: &str,
-) -> Result<RunStatus> {
-    run_service::current_run_status(cx, orchestration_state, run_store, run_id).await
-}
-
-async fn session_workspace_root(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-) -> Result<PathBuf> {
-    run_service::session_workspace_root(cx, session).await
-}
-
-async fn current_session_identity(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-) -> Result<SessionIdentity> {
-    run_service::current_session_identity(cx, session).await
-}
-
-async fn dispatch_run_until_quiescent(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    config: &Config,
-    run: RunStatus,
-    agent_id_prefix: &str,
-    lease_ttl_sec: i64,
-) -> Result<(RunStatus, Vec<DispatchGrant>)> {
-    run_service::dispatch_run_until_quiescent(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        config,
-        run,
-        agent_id_prefix,
-        lease_ttl_sec,
-    )
-    .await
-}
-
-fn build_submit_task_report(
-    reliability: &RpcReliabilityState,
-    req: &SubmitTaskRequest,
-    result: &SubmitTaskResponse,
-) -> Result<TaskReport> {
-    run_service::build_submit_task_report(reliability, req, result)
-}
-
-fn build_runtime_task_report(
-    reliability: &RpcReliabilityState,
-    task_id: &str,
-    summary: String,
-) -> Option<TaskReport> {
-    run_service::build_runtime_task_report(reliability, task_id, summary)
-}
-
-fn refresh_task_runs_with_verify_scopes(
-    reliability: &RpcReliabilityState,
-    orchestration: &mut RpcOrchestrationState,
-    task_id: &str,
-    report: Option<&TaskReport>,
-) -> Vec<(RunStatus, Option<CompletedRunVerifyScope>)> {
-    run_service::refresh_task_runs_with_verify_scopes(reliability, orchestration, task_id, report)
-}
-
-fn refresh_task_runs(
-    reliability: &RpcReliabilityState,
-    orchestration: &mut RpcOrchestrationState,
-    task_id: &str,
-    report: Option<TaskReport>,
-) -> Vec<RunStatus> {
-    run_service::refresh_task_runs(reliability, orchestration, task_id, report)
-}
-
-fn run_verify_scope_summary(
-    scope: &CompletedRunVerifyScope,
-    ok: bool,
-    details: impl AsRef<str>,
-) -> String {
-    run_service::run_verify_scope_summary(scope, ok, details)
-}
-
-async fn execute_run_verification(
-    cwd: &Path,
-    run: &mut RunStatus,
-    scope: &CompletedRunVerifyScope,
-) {
-    run_service::execute_run_verification(cwd, run, scope).await;
-}
-
-async fn sync_task_runs(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    task_id: &str,
-    report: Option<TaskReport>,
-) -> Result<Vec<RunStatus>> {
-    run_service::sync_task_runs(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        task_id,
-        report,
-    )
-    .await
-}
-
-async fn refresh_run_if_live(
-    cx: &AgentCx,
-    session: &Arc<Mutex<AgentSession>>,
-    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
-    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
-    run_store: &RunStore,
-    run: RunStatus,
-) -> Result<RunStatus> {
-    run_service::refresh_run_if_live(
-        cx,
-        session,
-        reliability_state,
-        orchestration_state,
-        run_store,
-        run,
-    )
-    .await
-}
+#[cfg(test)]
+use run_service_test_helpers::*;
 
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
@@ -1972,18 +1971,19 @@ pub async fn run(
                         }
                     };
 
-                let session_identity = match current_session_identity(&cx, &session).await {
-                    Ok(identity) => identity,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.append_evidence",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let evidence = match append_evidence_record(
+                let session_identity =
+                    match run_service::current_session_identity(&cx, &session).await {
+                        Ok(identity) => identity,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "reliability.append_evidence",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+                let evidence = match run_service::append_evidence_record(
                     &cx,
                     &session,
                     &reliability_state,
@@ -2024,18 +2024,19 @@ pub async fn run(
                         }
                     };
 
-                let session_identity = match current_session_identity(&cx, &session).await {
-                    Ok(identity) => identity,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.submit_task",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let result = match submit_task_and_sync(
+                let session_identity =
+                    match run_service::current_session_identity(&cx, &session).await {
+                        Ok(identity) => identity,
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "reliability.submit_task",
+                                &err,
+                            ));
+                            continue;
+                        }
+                    };
+                let result = match run_service::submit_task_and_sync(
                     &cx,
                     &session,
                     &reliability_state,
