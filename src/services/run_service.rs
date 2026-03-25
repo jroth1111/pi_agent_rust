@@ -16,6 +16,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompletedRunVerifyScope {
@@ -910,4 +911,207 @@ pub(crate) async fn refresh_run_if_live(
     }
 
     Ok(run)
+}
+
+pub(crate) const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
+pub(crate) const MAX_AUTOMATED_RECOVERABLE_WAIT: Duration = Duration::from_secs(60);
+
+pub(crate) fn dispatch_run_wave(
+    reliability: &mut RpcReliabilityState,
+    run: &mut RunStatus,
+    agent_id_prefix: &str,
+    lease_ttl_sec: i64,
+) -> Result<Vec<crate::rpc::DispatchGrant>> {
+    refresh_live_run_from_reliability(reliability, run);
+    if matches!(
+        run.lifecycle,
+        RunLifecycle::Canceled | RunLifecycle::Failed | RunLifecycle::Succeeded
+    ) {
+        return Err(Error::validation(format!(
+            "run {} is not dispatchable in lifecycle {:?}",
+            run.run_id, run.lifecycle
+        )));
+    }
+
+    let dispatchable_task_ids = run
+        .active_wave
+        .as_ref()
+        .map(|wave| {
+            wave.task_ids
+                .iter()
+                .filter_map(|task_id| {
+                    let task = reliability.tasks.get(task_id)?;
+                    if matches!(task.runtime.state, crate::reliability::RuntimeState::Ready) {
+                        Some(task_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if dispatchable_task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut grants = Vec::with_capacity(dispatchable_task_ids.len());
+    for task_id in dispatchable_task_ids {
+        let agent_id = format!("{agent_id_prefix}:{task_id}");
+        match reliability.request_dispatch_existing(&task_id, &agent_id, lease_ttl_sec) {
+            Ok(grant) => grants.push(grant),
+            Err(err) => {
+                for grant in &grants {
+                    let _ = reliability.expire_dispatch_grant(grant);
+                }
+                reliability.refresh_dependency_states();
+                refresh_run_from_reliability(reliability, run);
+                return Err(err);
+            }
+        }
+    }
+
+    refresh_run_from_reliability(reliability, run);
+    Ok(grants)
+}
+
+pub(crate) fn cancel_live_run_tasks(
+    reliability: &mut RpcReliabilityState,
+    run: &mut RunStatus,
+) -> Vec<crate::rpc::DispatchGrant> {
+    let leased_grants = run
+        .task_ids
+        .iter()
+        .filter_map(|task_id| {
+            let task = reliability.tasks.get(task_id)?;
+            match &task.runtime.state {
+                crate::reliability::RuntimeState::Leased {
+                    lease_id,
+                    agent_id,
+                    fence_token,
+                    expires_at,
+                } => Some(crate::rpc::DispatchGrant {
+                    task_id: task_id.clone(),
+                    agent_id: agent_id.clone(),
+                    lease_id: lease_id.clone(),
+                    fence_token: *fence_token,
+                    expires_at: *expires_at,
+                    state: "leased".to_string(),
+                }),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for grant in &leased_grants {
+        let _ = reliability.expire_dispatch_grant(grant);
+    }
+
+    reliability.refresh_dependency_states();
+    refresh_run_from_reliability(reliability, run);
+    run.lifecycle = RunLifecycle::Canceled;
+    run.active_wave = None;
+    run.active_subrun_id = None;
+    run.touch();
+    leased_grants
+}
+
+pub(crate) fn build_cancel_run_task_report(
+    reliability: &RpcReliabilityState,
+    run_id: &str,
+    task_id: &str,
+) -> Option<TaskReport> {
+    let task = reliability.tasks.get(task_id)?;
+    let state = RpcReliabilityState::state_label(&task.runtime.state);
+    build_runtime_task_report(
+        reliability,
+        task_id,
+        format!("run {run_id} canceled dispatch for task {task_id}; task returned to {state}"),
+    )
+}
+
+pub(crate) fn build_dispatch_rollback_task_report(
+    reliability: &RpcReliabilityState,
+    task_id: &str,
+    summary: &str,
+    failure_class: &str,
+) -> Option<TaskReport> {
+    let mut report = build_runtime_task_report(reliability, task_id, summary.to_string())?;
+    report.summary = summary.to_string();
+    report.failure_class = Some(failure_class.to_string());
+    if reliability
+        .evidence_by_task
+        .get(task_id)
+        .is_none_or(|evidence| evidence.is_empty())
+    {
+        report.verify_exit_code = -1;
+    }
+    Some(report)
+}
+
+pub(crate) fn next_recoverable_retry_delay(
+    reliability: &RpcReliabilityState,
+    run: &RunStatus,
+) -> Option<Duration> {
+    let now = Utc::now();
+
+    run.task_ids
+        .iter()
+        .filter_map(|task_id| reliability.tasks.get(task_id))
+        .filter_map(|task| match &task.runtime.state {
+            crate::reliability::RuntimeState::Recoverable {
+                retry_after: Some(retry_after),
+                ..
+            } if *retry_after > now => (*retry_after - now).to_std().ok(),
+            _ => None,
+        })
+        .min()
+}
+
+pub(crate) fn apply_dispatch_rollback_recovery(
+    reliability: &mut RpcReliabilityState,
+    grant: &crate::rpc::DispatchGrant,
+    failure_summary: Option<&str>,
+) -> String {
+    let _ = reliability.expire_dispatch_grant(grant);
+
+    let fallback_state = "ready".to_string();
+    let rollback_state = {
+        let Some(task) = reliability.tasks.get_mut(&grant.task_id) else {
+            return fallback_state;
+        };
+
+        if let Some(summary) = failure_summary {
+            let failed_at = Utc::now();
+            task.runtime.attempt = task.runtime.attempt.saturating_add(1);
+            task.runtime.last_transition_at = failed_at;
+            if task.runtime.attempt < task.spec.max_attempts {
+                let retry_after =
+                    chrono::Duration::from_std(ORCHESTRATION_ROLLBACK_RETRY_DELAY).ok();
+                task.runtime.state = crate::reliability::RuntimeState::Recoverable {
+                    reason: crate::reliability::FailureClass::InfraTransient,
+                    failure_artifact: None,
+                    handoff_summary: summary.to_string(),
+                    retry_after: retry_after.map(|delay| failed_at + delay),
+                };
+            } else {
+                task.runtime.state = crate::reliability::RuntimeState::Terminal(
+                    crate::reliability::TerminalState::Failed {
+                        class: crate::reliability::FailureClass::MaxAttemptsExceeded,
+                        verify_run_id: None,
+                        failed_at,
+                    },
+                );
+            }
+        }
+
+        RpcReliabilityState::state_label(&task.runtime.state).to_string()
+    };
+
+    reliability.refresh_dependency_states();
+    reliability
+        .tasks
+        .get(&grant.task_id)
+        .map(|task| RpcReliabilityState::state_label(&task.runtime.state).to_string())
+        .unwrap_or(rollback_state)
 }
