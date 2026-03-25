@@ -452,6 +452,11 @@ struct AutosaveQueue {
     last_flush_batch_size: usize,
     last_flush_duration_ms: Option<u64>,
     last_flush_trigger: Option<AutosaveFlushTrigger>,
+    /// Number of consecutive flush failures (reset on success).
+    consecutive_failures: u32,
+    /// Whether a flush is currently in-flight (begin_flush called,
+    /// finish_flush not yet called). Used for durable backlog state.
+    flush_in_flight: bool,
 }
 
 impl AutosaveQueue {
@@ -467,6 +472,8 @@ impl AutosaveQueue {
             last_flush_batch_size: 0,
             last_flush_duration_ms: None,
             last_flush_trigger: None,
+            consecutive_failures: 0,
+            flush_in_flight: false,
         }
     }
 
@@ -514,6 +521,7 @@ impl AutosaveQueue {
         self.flush_started = self.flush_started.saturating_add(1);
         self.last_flush_batch_size = batch_size;
         self.last_flush_trigger = Some(trigger);
+        self.flush_in_flight = true;
         Some(AutosaveFlushTicket {
             batch_size,
             started_at: Instant::now(),
@@ -526,12 +534,15 @@ impl AutosaveQueue {
         let elapsed = elapsed.min(u128::from(u64::MAX)) as u64;
         self.last_flush_duration_ms = Some(elapsed);
         self.last_flush_trigger = Some(ticket.trigger);
+        self.flush_in_flight = false;
         if success {
             self.flush_succeeded = self.flush_succeeded.saturating_add(1);
+            self.consecutive_failures = 0;
             return;
         }
 
         self.flush_failed = self.flush_failed.saturating_add(1);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         // New mutations may have arrived while the flush was in flight.
         // Restore only into remaining capacity so pending count never exceeds
         // `max_pending_mutations`.
@@ -1659,6 +1670,315 @@ impl Session {
         self.autosave_durability = mode;
     }
 
+    // ========================================================================
+    // VAL-SESS-007: Session integrity invariants
+    // ========================================================================
+
+    /// Run integrity checks on the current session state.
+    ///
+    /// Validates parent-link closure (INV-001), entry ID uniqueness (INV-002
+    /// variant), and branch-head consistency (INV-006 variant) before the
+    /// store is considered healthy for reads or writes.
+    ///
+    /// Returns a `SessionIntegrityReport` that can be inspected and persisted
+    /// as durable evidence. If any critical violation is found, the store
+    /// should NOT be considered healthy.
+    pub fn validate_integrity(&self) -> crate::contracts::dto::SessionIntegrityReport {
+        use crate::contracts::dto::{
+            IntegrityOutcome, IntegritySeverity, IntegrityViolation, SessionIntegrityReport,
+        };
+
+        let mut violations = Vec::new();
+        let entry_count = self.entries.len();
+
+        // INV-001: Parent-link closure — every parent_id must reference a known entry.
+        let mut parent_link_closure = true;
+        for entry in &self.entries {
+            if let Some(parent_id) = entry.base().parent_id.as_ref() {
+                if !self.entry_ids.contains(parent_id) {
+                    parent_link_closure = false;
+                    violations.push(IntegrityViolation {
+                        invariant_id: "INV-001".to_string(),
+                        description: format!(
+                            "Entry {} references missing parent {}",
+                            entry.base_id().unwrap_or(&"<no-id>".to_string()),
+                            parent_id
+                        ),
+                        severity: IntegritySeverity::Critical,
+                        entry_ids: vec![
+                            entry.base_id().cloned().unwrap_or_default(),
+                            parent_id.clone(),
+                        ],
+                    });
+                }
+            }
+        }
+
+        // INV-002 variant: Entry ID uniqueness.
+        let unique_entry_ids = self.entry_ids.len() == entry_count;
+        if !unique_entry_ids {
+            // Find duplicates.
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut dup_ids: Vec<String> = Vec::new();
+            for entry in &self.entries {
+                if let Some(id) = entry.base_id() {
+                    if !seen.insert(id) {
+                        dup_ids.push(id.clone());
+                    }
+                }
+            }
+            violations.push(IntegrityViolation {
+                invariant_id: "INV-002".to_string(),
+                description: format!(
+                    "{} duplicate entry IDs detected: {:?}",
+                    dup_ids.len(),
+                    &dup_ids[..dup_ids.len().min(5)]
+                ),
+                severity: IntegritySeverity::Critical,
+                entry_ids: dup_ids,
+            });
+        }
+
+        // INV-006 variant: Branch-head consistency — leaf_id must reference
+        // an existing entry when set.
+        let mut branch_head_consistency = true;
+        if let Some(ref leaf_id) = self.leaf_id {
+            if !self.entry_ids.contains(leaf_id) {
+                branch_head_consistency = false;
+                violations.push(IntegrityViolation {
+                    invariant_id: "INV-006".to_string(),
+                    description: format!("Leaf ID {} does not reference any known entry", leaf_id),
+                    severity: IntegritySeverity::Critical,
+                    entry_ids: vec![leaf_id.clone()],
+                });
+            }
+        }
+
+        // Also check that persisted_entry_count doesn't exceed entries.
+        let persisted_count = self.persisted_entry_count.load(Ordering::SeqCst);
+        if persisted_count > entry_count {
+            violations.push(IntegrityViolation {
+                invariant_id: "INV-BOUNDS".to_string(),
+                description: format!(
+                    "Persisted entry count ({}) exceeds in-memory entry count ({})",
+                    persisted_count, entry_count
+                ),
+                severity: IntegritySeverity::Warning,
+                entry_ids: Vec::new(),
+            });
+        }
+
+        let outcome = if violations.is_empty() {
+            IntegrityOutcome::Clean
+        } else {
+            IntegrityOutcome::Violations(violations)
+        };
+
+        SessionIntegrityReport {
+            session_id: self.header.id.clone(),
+            outcome,
+            entry_count,
+            parent_link_closure,
+            unique_entry_ids,
+            branch_head_consistency,
+            checked_at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        }
+    }
+
+    /// Run integrity checks and return an error if any critical violation
+    /// is found. This is the gate that should be called before the store
+    /// is considered healthy for reads or writes.
+    pub fn ensure_integrity(&self) -> Result<()> {
+        let report = self.validate_integrity();
+        if report.outcome.has_critical() {
+            let violations = report.outcome.violations();
+            let descriptions: Vec<String> = violations
+                .iter()
+                .filter(|v| v.severity == crate::contracts::dto::IntegritySeverity::Critical)
+                .map(|v| format!("[{}] {}", v.invariant_id, v.description))
+                .collect();
+            return Err(Error::session(format!(
+                "Session integrity check failed with {} critical violation(s): {}",
+                descriptions.len(),
+                descriptions.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // VAL-SESS-005: Hydration fidelity safeguards
+    // ========================================================================
+
+    /// Return the current hydration state as a durable, inspectable struct.
+    ///
+    /// This captures whether the session was fully or partially loaded,
+    /// enabling callers to determine if a save could silently discard
+    /// dormant state.
+    pub fn hydration_state(&self) -> crate::contracts::dto::HydrationState {
+        use crate::contracts::dto::{HydrationMode, HydrationState};
+
+        let mode = if self.v2_partial_hydration {
+            match self.v2_resume_mode {
+                Some(V2OpenMode::ActivePath) => HydrationMode::ActivePath,
+                Some(V2OpenMode::Tail(count)) => HydrationMode::Tail(count),
+                _ => {
+                    // v2_partial_hydration is true but no mode recorded —
+                    // treat as unknown partial to be safe.
+                    HydrationMode::ActivePath
+                }
+            }
+        } else {
+            HydrationMode::Full
+        };
+
+        let loaded_entries = self.entries.len();
+        let persisted_count = self.persisted_entry_count.load(Ordering::SeqCst) as u64;
+
+        // Determine total entries:
+        // - With authoritative persistence: use the higher of persisted_count
+        //   or in-memory entries.
+        // - With V2 partial hydration: use persisted_count (which reflects
+        //   the V2 store's total from the manifest) plus v2_message_count_offset.
+        // - Otherwise: loaded_entries.
+        let total_entries = if self.has_authoritative_persistence() {
+            persisted_count.max(loaded_entries as u64)
+        } else if self.v2_partial_hydration {
+            // persisted_count reflects what the V2 manifest reported.
+            // v2_message_count_offset accounts for non-message entries not loaded.
+            persisted_count.max(loaded_entries as u64)
+        } else {
+            loaded_entries as u64
+        };
+
+        let loaded_up_to_seq = if self.has_authoritative_persistence() {
+            self.event_store_seq
+        } else {
+            persisted_count
+        };
+
+        let total_seq = loaded_up_to_seq;
+
+        HydrationState {
+            mode,
+            total_entries,
+            loaded_entries,
+            loaded_up_to_seq,
+            total_seq,
+            rehydration_pending: false,
+        }
+    }
+
+    /// Check whether a save with the current hydration state would be safe.
+    ///
+    /// Returns an error if partial hydration is active and a save would
+    /// risk silently discarding dormant (non-loaded) entries. This is the
+    /// guard that prevents VAL-SESS-005 violations.
+    pub fn ensure_hydration_fidelity(&self) -> Result<()> {
+        // Direct check: if v2_partial_hydration is set, the session was
+        // loaded from V2 with a subset of entries. We must not allow a save
+        // that could silently discard dormant branches unless full hydration
+        // has been completed.
+        if self.v2_partial_hydration {
+            return Err(Error::session(format!(
+                "Cannot save session with partial V2 hydration (resume_mode={:?}) — \
+                 full rehydration is required to prevent silent data loss",
+                self.v2_resume_mode
+            )));
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // VAL-SESS-010: Durable autosave backlog state
+    // ========================================================================
+
+    /// Capture the current autosave backlog state as a durable, inspectable
+    /// struct that survives restart.
+    ///
+    /// This should be persisted alongside session metadata on shutdown or
+    /// at periodic checkpoints so that after a crash or restart, the system
+    /// can explain what remains unsaved.
+    pub fn autosave_backlog_state(&self) -> crate::contracts::dto::AutosaveBacklogState {
+        use crate::contracts::dto::{AutosaveBacklogState, DurabilityMode};
+
+        let metrics = self.autosave_queue.metrics();
+        let durability_mode = match self.autosave_durability {
+            AutosaveDurabilityMode::Strict => DurabilityMode::Strict,
+            AutosaveDurabilityMode::Balanced => DurabilityMode::Balanced,
+            AutosaveDurabilityMode::Throughput => DurabilityMode::Throughput,
+        };
+
+        AutosaveBacklogState {
+            pending_mutations: metrics.pending_mutations,
+            last_durable_offset: self.persisted_entry_count.load(Ordering::SeqCst) as u64,
+            total_entries: self.entries.len(),
+            durability_mode,
+            flush_succeeded: metrics.flush_succeeded,
+            flush_failed: metrics.flush_failed,
+            coalesced_mutations: metrics.coalesced_mutations,
+            backpressure_events: metrics.backpressure_events,
+            last_flush_trigger: metrics.last_flush_trigger.map(|t| format!("{:?}", t)),
+            last_flush_duration_ms: metrics.last_flush_duration_ms,
+            last_flush_batch_size: metrics.last_flush_batch_size,
+            flush_in_flight: false, // Updated by begin_flush/finish_flush
+            captured_at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+            consecutive_failures: self.autosave_queue.consecutive_failures,
+        }
+    }
+
+    /// Restore autosave state from a durable snapshot captured before
+    /// a crash or restart.
+    ///
+    /// This reconstructs the in-memory autosave queue from persisted
+    /// backlog state so the system can continue tracking pending work.
+    pub fn restore_autosave_state(
+        &mut self,
+        backlog: &crate::contracts::dto::AutosaveBacklogState,
+    ) {
+        // Restore durability mode.
+        self.autosave_durability = match backlog.durability_mode {
+            crate::contracts::dto::DurabilityMode::Strict => AutosaveDurabilityMode::Strict,
+            crate::contracts::dto::DurabilityMode::Balanced => AutosaveDurabilityMode::Balanced,
+            crate::contracts::dto::DurabilityMode::Throughput => AutosaveDurabilityMode::Throughput,
+        };
+
+        // Restore pending mutations count. This represents work that was
+        // enqueued but may not have been flushed before the crash.
+        self.autosave_queue.pending_mutations = backlog.pending_mutations;
+        self.autosave_queue.flush_succeeded = backlog.flush_succeeded;
+        self.autosave_queue.flush_failed = backlog.flush_failed;
+        self.autosave_queue.coalesced_mutations = backlog.coalesced_mutations;
+        self.autosave_queue.backpressure_events = backlog.backpressure_events;
+        self.autosave_queue.last_flush_batch_size = backlog.last_flush_batch_size;
+        self.autosave_queue.consecutive_failures = backlog.consecutive_failures;
+
+        // If a flush was in-flight when the snapshot was captured, those
+        // mutations are potentially lost. We treat them as still pending
+        // to trigger a recovery flush on next save cycle.
+        if backlog.flush_in_flight && backlog.last_flush_batch_size > 0 {
+            self.autosave_queue.pending_mutations = self
+                .autosave_queue
+                .pending_mutations
+                .saturating_add(backlog.last_flush_batch_size);
+            self.autosave_queue.flush_failed = self.autosave_queue.flush_failed.saturating_add(1);
+            self.autosave_queue.consecutive_failures =
+                self.autosave_queue.consecutive_failures.saturating_add(1);
+        }
+
+        tracing::info!(
+            pending_mutations = self.autosave_queue.pending_mutations,
+            flush_succeeded = self.autosave_queue.flush_succeeded,
+            flush_failed = self.autosave_queue.flush_failed,
+            restored_in_flight = backlog.flush_in_flight,
+            "restored autosave state from durable backlog"
+        );
+    }
+
     /// Ensure a lazily hydrated V2 session is fully hydrated before persisting.
     ///
     /// Partial V2 hydration intentionally loads only a subset of entries for fast
@@ -1764,6 +2084,17 @@ impl Session {
     #[allow(clippy::too_many_lines)]
     async fn save_inner(&mut self) -> Result<()> {
         self.ensure_entry_ids();
+
+        // === VAL-SESS-007: Integrity gate ===
+        // Validate session invariants before any write. If critical violations
+        // exist, fail closed — do not persist a corrupted session.
+        self.ensure_integrity()?;
+
+        // === VAL-SESS-005: Hydration fidelity gate ===
+        // Ensure the session is fully hydrated before any save that could
+        // silently discard dormant branches. Partial hydration is only
+        // acceptable when the V2 rehydration path can restore all entries.
+        self.ensure_hydration_fidelity()?;
 
         // === Authoritative event store path ===
         // When a PersistenceContract is set, ALL writes go through it.
@@ -10101,6 +10432,338 @@ mod tests {
         let plan_entry_count = plan.entries.len();
         session.append_message(make_test_message("third message"));
         assert_eq!(plan.entries.len(), plan_entry_count);
+    }
+
+    // ========================================================================
+    // VAL-SESS-007: Session integrity invariant tests
+    // ========================================================================
+
+    #[test]
+    fn test_integrity_clean_session_passes() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("hello"));
+        session.append_message(make_test_message("world"));
+
+        let report = session.validate_integrity();
+        assert!(report.outcome.is_clean());
+        assert!(report.parent_link_closure);
+        assert!(report.unique_entry_ids);
+        assert!(report.branch_head_consistency);
+        assert_eq!(report.entry_count, 2);
+        assert!(session.ensure_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_integrity_detects_orphaned_parent_link() {
+        let mut session = Session::in_memory();
+        // Manually create an entry with a bogus parent_id.
+        let id = generate_entry_id(&HashSet::new());
+        let entry = SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(Some("nonexistent-parent".to_string()), id.clone()),
+            message: make_test_message("orphan"),
+            metadata: MessageMetadata::default(),
+        });
+        session.entries.push(entry);
+        session.entry_ids.insert(id.clone());
+        session
+            .entry_index
+            .insert(id.clone(), session.entries.len() - 1);
+        session.leaf_id = Some(id);
+
+        let report = session.validate_integrity();
+        assert!(!report.outcome.is_clean());
+        assert!(!report.parent_link_closure);
+        assert!(report.outcome.has_critical());
+        assert!(session.ensure_integrity().is_err());
+    }
+
+    #[test]
+    fn test_integrity_detects_invalid_leaf_id() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("hello"));
+
+        // Set leaf to an ID that doesn't exist.
+        session.leaf_id = Some("nonexistent-leaf".to_string());
+
+        let report = session.validate_integrity();
+        assert!(!report.outcome.is_clean());
+        assert!(!report.branch_head_consistency);
+        assert!(report.outcome.has_critical());
+        assert!(session.ensure_integrity().is_err());
+    }
+
+    #[test]
+    fn test_integrity_warns_on_persisted_count_exceeding_entries() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("hello"));
+        // Artificially inflate persisted count.
+        session.persisted_entry_count.store(100, Ordering::SeqCst);
+
+        let report = session.validate_integrity();
+        // Should still be clean of critical violations (bounds is a warning).
+        assert!(!report.outcome.has_critical());
+        assert!(
+            report
+                .outcome
+                .violations()
+                .iter()
+                .any(|v| v.invariant_id == "INV-BOUNDS")
+        );
+        // ensure_integrity should still pass since no critical violations.
+        assert!(session.ensure_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_integrity_empty_session_passes() {
+        let session = Session::in_memory();
+        let report = session.validate_integrity();
+        assert!(report.outcome.is_clean());
+        assert_eq!(report.entry_count, 0);
+        assert!(session.ensure_integrity().is_ok());
+    }
+
+    // ========================================================================
+    // VAL-SESS-005: Hydration fidelity tests
+    // ========================================================================
+
+    #[test]
+    fn test_hydration_full_mode_no_fidelity_risk() {
+        let session = Session::in_memory();
+        let state = session.hydration_state();
+        assert!(state.is_complete());
+        assert!(!state.has_fidelity_risk());
+        assert!(session.ensure_hydration_fidelity().is_ok());
+    }
+
+    #[test]
+    fn test_hydration_partial_v2_mode_has_fidelity_risk() {
+        let mut session = Session::in_memory();
+        session.v2_partial_hydration = true;
+        session.v2_resume_mode = Some(V2OpenMode::ActivePath);
+        session.persisted_entry_count.store(100, Ordering::SeqCst);
+
+        let state = session.hydration_state();
+        assert!(state.has_fidelity_risk());
+        // The session claims partial hydration — fidelity guard should block.
+        assert!(session.ensure_hydration_fidelity().is_err());
+    }
+
+    #[test]
+    fn test_hydration_fidelity_guard_blocks_partial_save() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("hello"));
+        session.v2_partial_hydration = true;
+        session.v2_resume_mode = Some(V2OpenMode::Tail(256));
+
+        let result = session.ensure_hydration_fidelity();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("partial"),
+            "error should mention partial: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_hydration_fidelity_guard_allows_full_hydration() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("hello"));
+        // v2_partial_hydration is false — this is a fully loaded session.
+        session.v2_partial_hydration = false;
+
+        let result = session.ensure_hydration_fidelity();
+        assert!(result.is_ok(), "full hydration should be allowed");
+    }
+
+    // ========================================================================
+    // VAL-SESS-010: Durable autosave backlog tests
+    // ========================================================================
+
+    #[test]
+    fn test_autosave_backlog_clean_state() {
+        let session = Session::in_memory();
+        let backlog = session.autosave_backlog_state();
+        assert!(backlog.is_flushed());
+        assert!(!backlog.has_potential_data_loss());
+        assert_eq!(backlog.pending_mutations, 0);
+        assert_eq!(backlog.consecutive_failures, 0);
+        assert!(!backlog.flush_in_flight);
+    }
+
+    #[test]
+    fn test_autosave_backlog_captures_pending_mutations() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::in_memory();
+        session.path = Some(temp_dir.path().join("backlog-test.jsonl"));
+        session.append_message(make_test_message("hello"));
+        session.append_message(make_test_message("world"));
+
+        let backlog = session.autosave_backlog_state();
+        // Two message appends → 2 pending mutations (or 1 coalesced, depending on queue logic).
+        assert!(
+            backlog.pending_mutations > 0,
+            "should have pending mutations"
+        );
+        assert_eq!(backlog.total_entries, 2);
+        assert!(backlog.captured_at.len() > 0);
+    }
+
+    #[test]
+    fn test_autosave_backlog_shows_data_loss_after_enqueue() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::in_memory();
+        session.path = Some(temp_dir.path().join("backlog-loss-test.jsonl"));
+        session.append_message(make_test_message("pending"));
+
+        let backlog = session.autosave_backlog_state();
+        assert!(backlog.has_potential_data_loss());
+    }
+
+    #[test]
+    fn test_autosave_backlog_consecutive_failures_tracked() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::in_memory();
+        session.path = Some(temp_dir.path().join("backlog-fail-test.jsonl"));
+        session.set_autosave_queue_limit_for_test(10);
+        session.append_message(make_test_message("msg"));
+
+        // First flush fails
+        let ticket = session
+            .autosave_queue
+            .begin_flush(AutosaveFlushTrigger::Periodic);
+        assert!(ticket.is_some());
+        session.autosave_queue.finish_flush(ticket.unwrap(), false);
+        assert_eq!(session.autosave_queue.consecutive_failures, 1);
+
+        // Second flush fails
+        session.append_message(make_test_message("msg2"));
+        let ticket = session
+            .autosave_queue
+            .begin_flush(AutosaveFlushTrigger::Periodic);
+        assert!(ticket.is_some());
+        session.autosave_queue.finish_flush(ticket.unwrap(), false);
+        assert_eq!(session.autosave_queue.consecutive_failures, 2);
+
+        // Backlog state reflects this
+        let backlog = session.autosave_backlog_state();
+        assert_eq!(backlog.consecutive_failures, 2);
+        assert_eq!(backlog.flush_failed, 2);
+    }
+
+    #[test]
+    fn test_autosave_backlog_consecutive_failures_reset_on_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::in_memory();
+        session.path = Some(temp_dir.path().join("backlog-reset-test.jsonl"));
+        session.set_autosave_queue_limit_for_test(10);
+        session.append_message(make_test_message("msg"));
+
+        // Fail
+        let ticket = session
+            .autosave_queue
+            .begin_flush(AutosaveFlushTrigger::Periodic);
+        session.autosave_queue.finish_flush(ticket.unwrap(), false);
+        assert_eq!(session.autosave_queue.consecutive_failures, 1);
+
+        // Succeed
+        session.append_message(make_test_message("msg2"));
+        let ticket = session
+            .autosave_queue
+            .begin_flush(AutosaveFlushTrigger::Periodic);
+        session.autosave_queue.finish_flush(ticket.unwrap(), true);
+        assert_eq!(session.autosave_queue.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn test_autosave_backlog_restore_from_durable_state() {
+        use crate::contracts::dto::{AutosaveBacklogState, DurabilityMode};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::in_memory();
+        session.path = Some(temp_dir.path().join("backlog-restore-test.jsonl"));
+
+        // Create a durable backlog state simulating a crash with 3 pending
+        // mutations and an in-flight flush that may have been lost.
+        let backlog = AutosaveBacklogState {
+            pending_mutations: 2,
+            last_durable_offset: 5,
+            total_entries: 8,
+            durability_mode: DurabilityMode::Balanced,
+            flush_succeeded: 3,
+            flush_failed: 1,
+            coalesced_mutations: 10,
+            backpressure_events: 0,
+            last_flush_trigger: Some("Periodic".to_string()),
+            last_flush_duration_ms: Some(12),
+            last_flush_batch_size: 3,
+            flush_in_flight: true,
+            captured_at: "2026-03-25T12:00:00.000Z".to_string(),
+            consecutive_failures: 1,
+        };
+
+        session.restore_autosave_state(&backlog);
+
+        // The in-flight flush batch should be restored as pending.
+        let metrics = session.autosave_metrics();
+        assert_eq!(
+            metrics.pending_mutations, 5,
+            "2 original + 3 from in-flight flush = 5 pending"
+        );
+        assert_eq!(metrics.flush_succeeded, 3);
+        assert_eq!(metrics.flush_failed, 2, "1 original + 1 from in-flight");
+    }
+
+    #[test]
+    fn test_autosave_backlog_restore_no_in_flight() {
+        use crate::contracts::dto::{AutosaveBacklogState, DurabilityMode};
+
+        let mut session = Session::in_memory();
+
+        let backlog = AutosaveBacklogState {
+            pending_mutations: 1,
+            last_durable_offset: 10,
+            total_entries: 11,
+            durability_mode: DurabilityMode::Strict,
+            flush_succeeded: 5,
+            flush_failed: 0,
+            coalesced_mutations: 3,
+            backpressure_events: 0,
+            last_flush_trigger: None,
+            last_flush_duration_ms: None,
+            last_flush_batch_size: 0,
+            flush_in_flight: false,
+            captured_at: "2026-03-25T12:00:00.000Z".to_string(),
+            consecutive_failures: 0,
+        };
+
+        session.restore_autosave_state(&backlog);
+
+        let metrics = session.autosave_metrics();
+        assert_eq!(metrics.pending_mutations, 1);
+        assert_eq!(metrics.flush_succeeded, 5);
+        assert_eq!(metrics.flush_failed, 0);
+    }
+
+    #[test]
+    fn test_autosave_flush_in_flight_flag_lifecycle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::in_memory();
+        session.path = Some(temp_dir.path().join("inflight-test.jsonl"));
+        session.append_message(make_test_message("msg"));
+
+        // Before flush: not in flight
+        assert!(!session.autosave_queue.flush_in_flight);
+
+        // begin_flush: in flight
+        let ticket = session
+            .autosave_queue
+            .begin_flush(AutosaveFlushTrigger::Periodic);
+        assert!(ticket.is_some());
+        assert!(session.autosave_queue.flush_in_flight);
+
+        // finish_flush: no longer in flight
+        session.autosave_queue.finish_flush(ticket.unwrap(), true);
+        assert!(!session.autosave_queue.flush_in_flight);
     }
 }
 

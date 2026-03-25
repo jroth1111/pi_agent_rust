@@ -23,15 +23,16 @@ pub use bootstrap::{
 pub use boundary::{ContractBoundary, SurfaceBoundary, assert_surface_boundary};
 pub use dto::{
     AdmissionControl, AdmissionDecision, AdmissionGrant, ApprovalChoice, ApprovalControl,
-    ApprovalDecision, ApprovalPrompt, BranchContinuityState, CompactionContinuity,
-    CompactionFileTracking, ContextBudget, ContextFreshness, ContextPack, ContextProvenance,
-    DurabilityMode, InferenceReceipt, InterruptControl, InterruptReason, InterruptResult,
-    LegacyImportRequest, LegacyStoreRole, LegacyStoreValidation, MissingSkill, ModelControl,
-    ModelSelection, PersistenceSnapshot, PersistenceStoreKind, QueueControl, QueueDrainResult,
-    QueueEnqueueResult, QueueKind, QueueMode, ResourceRequest, SessionControl, SessionEvent,
-    SessionEventPayload, SessionIdentity, SessionProjection, SkillActivation, SkillActivationSet,
-    SkillActivationValidation, SkillSource, ThinkingLevel, WorkerLaunchEnvelope, WorkerRuntimeKind,
-    WorkloadClass, WorkspaceSnapshot,
+    ApprovalDecision, ApprovalPrompt, AutosaveBacklogState, BranchContinuityState,
+    CompactionContinuity, CompactionFileTracking, ContextBudget, ContextFreshness, ContextPack,
+    ContextProvenance, DurabilityMode, HydrationMode, HydrationState, InferenceReceipt,
+    IntegrityOutcome, IntegritySeverity, IntegrityViolation, InterruptControl, InterruptReason,
+    InterruptResult, LegacyImportRequest, LegacyStoreRole, LegacyStoreValidation, MissingSkill,
+    ModelControl, ModelSelection, PersistenceSnapshot, PersistenceStoreKind, QueueControl,
+    QueueDrainResult, QueueEnqueueResult, QueueKind, QueueMode, ResourceRequest, SessionControl,
+    SessionEvent, SessionEventPayload, SessionIdentity, SessionIntegrityReport, SessionProjection,
+    SkillActivation, SkillActivationSet, SkillActivationValidation, SkillSource, ThinkingLevel,
+    WorkerLaunchEnvelope, WorkerRuntimeKind, WorkloadClass, WorkspaceSnapshot,
 };
 pub use engine::{
     AppendEvidenceRequest, ConversationContract, DispatchOptions, LeaseGrant, PersistenceContract,

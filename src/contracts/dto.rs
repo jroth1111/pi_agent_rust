@@ -736,3 +736,277 @@ pub enum WorkerRuntimeKind {
     NativeRust,
     Wasm,
 }
+
+// ============================================================================
+// Session integrity (VAL-SESS-007): typed integrity check results that are
+// enforced before the store is considered healthy for reads or writes.
+// ============================================================================
+
+/// Severity level for an integrity violation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum IntegritySeverity {
+    /// Non-critical: the session can still be served with a warning.
+    Warning,
+    /// Critical: the session must not be served until repaired.
+    Critical,
+}
+
+/// A single integrity violation detected during session validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrityViolation {
+    /// Machine-readable invariant ID (e.g., "INV-001").
+    pub invariant_id: String,
+    /// Human-readable description of the violation.
+    pub description: String,
+    /// Severity level.
+    pub severity: IntegritySeverity,
+    /// The entry ID(s) involved in the violation, if applicable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_ids: Vec<String>,
+}
+
+/// Outcome of an integrity check — either clean or contains violations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntegrityOutcome {
+    /// All invariants passed.
+    Clean,
+    /// One or more violations detected.
+    Violations(Vec<IntegrityViolation>),
+}
+
+impl IntegrityOutcome {
+    /// Returns true if all invariants passed.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, IntegrityOutcome::Clean)
+    }
+
+    /// Returns true if any critical violation exists.
+    pub fn has_critical(&self) -> bool {
+        matches!(
+            self,
+            IntegrityOutcome::Violations(violations) if violations.iter().any(|v| v.severity == IntegritySeverity::Critical)
+        )
+    }
+
+    /// Returns the list of violations, or an empty vec if clean.
+    pub fn violations(&self) -> Vec<IntegrityViolation> {
+        match self {
+            IntegrityOutcome::Clean => Vec::new(),
+            IntegrityOutcome::Violations(v) => v.clone(),
+        }
+    }
+}
+
+/// Full integrity report for a session, produced before the store is
+/// considered healthy for reads or writes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIntegrityReport {
+    /// The session ID this report covers.
+    pub session_id: String,
+    /// The overall outcome.
+    pub outcome: IntegrityOutcome,
+    /// Total number of entries checked.
+    pub entry_count: usize,
+    /// Whether parent-link closure holds (INV-001).
+    pub parent_link_closure: bool,
+    /// Whether entry IDs are unique (INV-002 variant).
+    pub unique_entry_ids: bool,
+    /// Whether branch-head indexing is consistent (INV-006 variant).
+    pub branch_head_consistency: bool,
+    /// ISO 8601 timestamp when the check was performed.
+    pub checked_at: String,
+}
+
+// ============================================================================
+// Hydration fidelity (VAL-SESS-005): typed state that prevents silent data
+// loss during partial hydration and fast resume.
+// ============================================================================
+
+/// Hydration mode describing how a session was loaded into memory.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HydrationMode {
+    /// All entries loaded — no fidelity risk.
+    Full,
+    /// Only the active path (root to leaf) was loaded.
+    /// Dormant (non-active) branches are NOT in memory.
+    ActivePath,
+    /// Only the most recent N entries were loaded.
+    /// Older entries and dormant branches are NOT in memory.
+    Tail(u64),
+}
+
+impl HydrationMode {
+    /// Returns true if this hydration mode loaded all entries.
+    pub const fn is_full(&self) -> bool {
+        matches!(self, HydrationMode::Full)
+    }
+
+    /// Returns true if this is a partial hydration that may be missing
+    /// dormant branches or older entries.
+    pub const fn is_partial(&self) -> bool {
+        !self.is_full()
+    }
+}
+
+/// Durable hydration state that is persisted and restored across restarts.
+///
+/// This ensures that after a fast resume with partial hydration, the system
+/// knows exactly what subset of the session is in memory and can enforce
+/// safeguards before any save that could silently discard dormant state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HydrationState {
+    /// The hydration mode used when the session was loaded.
+    pub mode: HydrationMode,
+    /// Total number of entries in the authoritative store (not just loaded).
+    pub total_entries: u64,
+    /// Number of entries currently loaded in memory.
+    pub loaded_entries: usize,
+    /// The event store sequence number up to which entries are loaded.
+    /// Entries after this seq are NOT loaded.
+    pub loaded_up_to_seq: u64,
+    /// The total event store sequence (last event seq).
+    pub total_seq: u64,
+    /// Whether a full rehydration has been requested but not yet completed.
+    pub rehydration_pending: bool,
+}
+
+impl HydrationState {
+    /// Create a full-hydration state (no fidelity risk).
+    pub fn full(entry_count: usize, seq: u64) -> Self {
+        let entry_count = entry_count as u64;
+        Self {
+            mode: HydrationMode::Full,
+            total_entries: entry_count,
+            loaded_entries: entry_count as usize,
+            loaded_up_to_seq: seq,
+            total_seq: seq,
+            rehydration_pending: false,
+        }
+    }
+
+    /// Create a partial-hydration state with fidelity risk.
+    pub fn partial(
+        mode: HydrationMode,
+        total_entries: u64,
+        loaded_entries: usize,
+        loaded_up_to_seq: u64,
+        total_seq: u64,
+    ) -> Self {
+        Self {
+            mode,
+            total_entries,
+            loaded_entries,
+            loaded_up_to_seq,
+            total_seq,
+            rehydration_pending: false,
+        }
+    }
+
+    /// Returns true if all entries are loaded (no fidelity risk).
+    pub const fn is_complete(&self) -> bool {
+        self.loaded_entries as u64 >= self.total_entries
+    }
+
+    /// Returns true if this state represents a partial hydration.
+    pub const fn has_fidelity_risk(&self) -> bool {
+        self.mode.is_partial()
+    }
+}
+
+// ============================================================================
+// Durable autosave backlog (VAL-SESS-010): typed state that survives restart
+// and makes autosave lag, flush outcomes, and retry state inspectable.
+// ============================================================================
+
+/// Durable autosave backlog state persisted alongside session metadata.
+///
+/// Unlike `AutosaveQueueMetrics` (ephemeral runtime counters), this struct
+/// captures the state that must survive process restart so the system can
+/// explain what remains unsaved after interruption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutosaveBacklogState {
+    /// Number of mutations pending persistence at the time of the snapshot.
+    pub pending_mutations: usize,
+    /// The last durable offset (event store seq or file entry count) that
+    /// was successfully persisted.
+    pub last_durable_offset: u64,
+    /// Total number of entries in the session at snapshot time.
+    pub total_entries: usize,
+    /// The durability mode in effect when this state was captured.
+    pub durability_mode: DurabilityMode,
+    /// Cumulative count of successful flushes since session creation.
+    pub flush_succeeded: u64,
+    /// Cumulative count of failed flushes since session creation.
+    pub flush_failed: u64,
+    /// Cumulative count of coalesced (batched) mutations.
+    pub coalesced_mutations: u64,
+    /// Cumulative count of backpressure events (queue overflow).
+    pub backpressure_events: u64,
+    /// Trigger of the most recent flush attempt.
+    pub last_flush_trigger: Option<String>,
+    /// Duration of the most recent flush in milliseconds.
+    pub last_flush_duration_ms: Option<u64>,
+    /// Batch size of the most recent flush.
+    pub last_flush_batch_size: usize,
+    /// Whether a flush was in-flight when the state was captured.
+    /// If true, the flush outcome is unknown and the mutations should
+    /// be considered potentially lost.
+    pub flush_in_flight: bool,
+    /// ISO 8601 timestamp when this state was captured.
+    pub captured_at: String,
+    /// Number of consecutive flush failures (for retry/backoff logic).
+    pub consecutive_failures: u32,
+}
+
+impl AutosaveBacklogState {
+    /// Create a clean backlog state (nothing pending).
+    pub fn clean(
+        last_durable_offset: u64,
+        total_entries: usize,
+        durability_mode: DurabilityMode,
+    ) -> Self {
+        Self {
+            pending_mutations: 0,
+            last_durable_offset,
+            total_entries,
+            durability_mode,
+            flush_succeeded: 0,
+            flush_failed: 0,
+            coalesced_mutations: 0,
+            backpressure_events: 0,
+            last_flush_trigger: None,
+            last_flush_duration_ms: None,
+            last_flush_batch_size: 0,
+            flush_in_flight: false,
+            captured_at: chrono_utc_now(),
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Returns true if there are no pending mutations.
+    pub const fn is_flushed(&self) -> bool {
+        self.pending_mutations == 0 && !self.flush_in_flight
+    }
+
+    /// Returns true if there is work that may have been lost.
+    pub const fn has_potential_data_loss(&self) -> bool {
+        self.pending_mutations > 0 || self.flush_in_flight
+    }
+}
+
+/// Returns an ISO 8601 UTC timestamp string.
+fn chrono_utc_now() -> String {
+    // Use a simple approach that doesn't require pulling in chrono as a
+    // direct dependency in the DTO module — callers in session.rs can
+    // provide timestamps from chrono directly.
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
