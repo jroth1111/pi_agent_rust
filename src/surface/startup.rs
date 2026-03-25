@@ -5,7 +5,6 @@
 //! Lives in the surface layer because it is purely startup I/O coordination —
 //! no inference, session state, or business-rule ownership.
 
-use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,12 +18,13 @@ use crate::auth::AuthStorage;
 use crate::cli;
 use crate::compaction::ResolvedCompactionSettings;
 use crate::config::Config;
-use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
 use crate::models::ModelRegistry;
 use crate::providers;
 use crate::session::Session;
 use crate::surface::auth_setup::run_first_time_setup;
-use crate::surface::extension_runtime::activate_extensions_for_session;
+use crate::surface::extension_runtime::{
+    SurfaceExtensionPrewarmHandle, activate_extensions_for_session,
+};
 use crate::tools::ToolRegistry;
 
 /// Outcome of a surface startup error handling attempt.
@@ -292,7 +292,7 @@ pub async fn resolve_surface_model_selection(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn build_surface_agent_session<J>(
+pub async fn build_surface_agent_session(
     cli: &cli::Cli,
     config: &Config,
     cwd: &Path,
@@ -308,11 +308,8 @@ pub async fn build_surface_agent_session<J>(
     test_mode: bool,
     extension_flags: &[cli::ExtensionCliFlag],
     extension_entries: &[PathBuf],
-    extension_prewarm_handle: Option<(ExtensionManager, Arc<ToolRegistry>, J)>,
-) -> Result<AgentSession>
-where
-    J: Future<Output = anyhow::Result<ExtensionRuntimeHandle>>,
-{
+    extension_prewarm_handle: Option<SurfaceExtensionPrewarmHandle>,
+) -> Result<AgentSession> {
     crate::app::update_session_for_selection(&mut session, selection);
 
     if let Some(message) = &selection.fallback_message {

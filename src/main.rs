@@ -47,11 +47,6 @@ use pi::cli;
 use pi::config::Config;
 use pi::config::SettingsScope;
 use pi::extension_index::ExtensionIndexStore;
-use pi::extensions::{
-    ExtensionLoadSpec, ExtensionRuntimeHandle, JsExtensionRuntimeHandle,
-    NativeRustExtensionRuntimeHandle, resolve_extension_load_spec,
-};
-use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::{AssistantMessage, ContentBlock, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{
@@ -67,11 +62,13 @@ use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::extension_policy::{
     print_resolved_extension_policy, print_resolved_repair_policy,
 };
+use pi::surface::extension_runtime::{
+    resolve_surface_extension_runtime_flavor, spawn_surface_extension_prewarm,
+};
 use pi::surface::startup::{
     SurfaceSelectionOutcome, build_surface_agent_session, load_model_registry_with_warning,
     resolve_surface_model_selection,
 };
-use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -315,12 +312,6 @@ struct StartupResources {
     resource_cli: ResourceCliOptions,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtensionRuntimeFlavor {
-    Js,
-    NativeRust,
-}
-
 struct PreparedSurfaceInputs {
     global_dir: PathBuf,
     models_path: PathBuf,
@@ -392,35 +383,6 @@ async fn load_startup_resources(
         auth: auth_result?,
         resource_cli,
     })
-}
-
-fn resolve_extension_runtime_flavor(
-    resources: &ResourceLoader,
-) -> Result<Option<ExtensionRuntimeFlavor>> {
-    let mut has_js_extensions = false;
-    let mut has_native_extensions = false;
-    for entry in resources.extensions() {
-        match resolve_extension_load_spec(entry) {
-            Ok(ExtensionLoadSpec::NativeRust(_)) => has_native_extensions = true,
-            Ok(ExtensionLoadSpec::Js(_)) => has_js_extensions = true,
-            #[cfg(feature = "wasm-host")]
-            Ok(ExtensionLoadSpec::Wasm(_)) => {}
-            Err(err) => {
-                return Err(anyhow::Error::new(err));
-            }
-        }
-    }
-
-    match (has_js_extensions, has_native_extensions) {
-        (true, true) => Err(pi::error::Error::validation(
-            "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
-                .to_string(),
-        )
-        .into()),
-        (true, false) => Ok(Some(ExtensionRuntimeFlavor::Js)),
-        (false, true) => Ok(Some(ExtensionRuntimeFlavor::NativeRust)),
-        (false, false) => Ok(None),
-    }
 }
 
 async fn refresh_startup_auth(auth: &mut AuthStorage) -> Result<()> {
@@ -545,105 +507,17 @@ async fn run(
         mut auth,
         resource_cli,
     } = load_startup_resources(&cli, &extension_flags, &cwd).await?;
-    let extension_runtime_flavor = resolve_extension_runtime_flavor(&resources)?;
-
-    let prewarm_policy = config
-        .resolve_extension_policy_with_metadata(cli.extension_policy.as_deref())
-        .policy;
-    let prewarm_repair = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
-    let prewarm_repair_mode = if prewarm_repair.source == "default" {
-        pi::extensions::RepairPolicyMode::AutoStrict
-    } else {
-        prewarm_repair.effective_mode
-    };
-    let prewarm_memory_limit_bytes =
-        (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
+    let extension_runtime_flavor = resolve_surface_extension_runtime_flavor(&resources)?;
 
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
-    let extension_prewarm_handle = if matches!(
+    let extension_prewarm_handle = spawn_surface_extension_prewarm(
+        &runtime_handle,
+        &cli,
+        &config,
+        &cwd,
         extension_runtime_flavor,
-        None | Some(ExtensionRuntimeFlavor::Js)
-    ) {
-        if extension_runtime_flavor.is_none() {
-            None
-        } else {
-            let pre_enabled_tools = cli.enabled_tools();
-            let pre_mgr = pi::extensions::ExtensionManager::new();
-            pre_mgr.set_cwd(cwd.display().to_string());
-
-            let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
-
-            let resolved_risk = config.resolve_extension_risk_with_metadata();
-            pre_mgr.set_runtime_risk_config(resolved_risk.settings);
-
-            let pre_mgr_for_runtime = pre_mgr.clone();
-            let pre_tools_for_runtime = Arc::clone(&pre_tools);
-            let prewarm_policy_for_runtime = prewarm_policy.clone();
-            let prewarm_cwd = cwd.display().to_string();
-            Some((
-                pre_mgr,
-                pre_tools,
-                runtime_handle.spawn(async move {
-                    let mut js_config = PiJsRuntimeConfig {
-                        cwd: prewarm_cwd,
-                        repair_mode: AgentSession::runtime_repair_mode_from_policy_mode(
-                            prewarm_repair_mode,
-                        ),
-                        ..PiJsRuntimeConfig::default()
-                    };
-                    js_config.limits.memory_limit_bytes =
-                        Some(prewarm_memory_limit_bytes).filter(|bytes| *bytes > 0);
-                    let runtime = JsExtensionRuntimeHandle::start_with_policy(
-                        js_config,
-                        pre_tools_for_runtime,
-                        pre_mgr_for_runtime,
-                        prewarm_policy_for_runtime,
-                    )
-                    .await
-                    .map(ExtensionRuntimeHandle::Js)
-                    .map_err(anyhow::Error::new)?;
-                    tracing::info!(
-                        event = "pi.extension_runtime.engine_decision",
-                        stage = "main_prewarm",
-                        requested = "quickjs",
-                        selected = "quickjs",
-                        fallback = false,
-                        "Extension runtime engine selected for prewarm (legacy JS/TS)"
-                    );
-                    Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
-                }),
-            ))
-        }
-    } else {
-        let pre_enabled_tools = cli.enabled_tools();
-        let pre_mgr = pi::extensions::ExtensionManager::new();
-        pre_mgr.set_cwd(cwd.display().to_string());
-        let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
-
-        let resolved_risk = config.resolve_extension_risk_with_metadata();
-        pre_mgr.set_runtime_risk_config(resolved_risk.settings);
-
-        Some((
-            pre_mgr,
-            pre_tools,
-            runtime_handle.spawn(async move {
-                let runtime = NativeRustExtensionRuntimeHandle::start()
-                    .await
-                    .map(ExtensionRuntimeHandle::NativeRust)
-                    .map_err(anyhow::Error::new)?;
-                tracing::info!(
-                    event = "pi.extension_runtime.engine_decision",
-                    stage = "main_prewarm",
-                    requested = "native-rust",
-                    selected = "native-rust",
-                    fallback = false,
-                    "Extension runtime engine selected for prewarm (native-rust)"
-                );
-                Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
-            }),
-        ))
-    };
+    );
 
     refresh_startup_auth(&mut auth).await?;
     let package_dir = Config::package_dir();
