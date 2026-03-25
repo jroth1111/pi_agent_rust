@@ -860,7 +860,8 @@ async fn prepare_surface_inputs(
 
     if let Some(export_path) = cli.export.clone() {
         let output = cli.message_args().first().map(ToString::to_string);
-        let output_path = export_session(&export_path, output.as_deref()).await?;
+        let output_path =
+            pi::surface::export_session_html(&export_path, output.as_deref()).await?;
         println!("Exported to: {}", output_path.display());
         return Ok(None);
     }
@@ -3792,25 +3793,6 @@ fn prompt_line(prompt: &str) -> Result<Option<String>> {
     Ok(Some(input.trim().to_string()))
 }
 
-async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<PathBuf> {
-    let input = Path::new(input_path);
-    if !input.exists() {
-        bail!("File not found: {input_path}");
-    }
-
-    let session = Session::open(input_path).await?;
-    let html = pi::app::render_session_html(&session);
-    let output_path = output_path.map_or_else(|| default_export_path(input), PathBuf::from);
-
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(&output_path, html)?;
-    Ok(output_path)
-}
-
 async fn run_rpc_mode(
     session: AgentSession,
     resources: ResourceLoader,
@@ -4426,14 +4408,6 @@ fn fuzzy_match(pattern: &str, value: &str) -> bool {
         }
     }
     true
-}
-
-fn default_export_path(input: &Path) -> PathBuf {
-    let basename = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session");
-    PathBuf::from(format!("pi-session-{basename}.html"))
 }
 
 #[cfg(test)]

@@ -22,9 +22,12 @@ use crate::contracts::bootstrap::{
 };
 use crate::error::Result;
 use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
+use crate::session::Session;
 use crate::agent::AgentSession;
 use asupersync::runtime::RuntimeHandle;
 use serde_json::Value;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -224,6 +227,41 @@ impl CliSurfaceBootstrap {
     pub const fn can_run_interactive_setup(&self) -> bool {
         self.is_interactive() && self.has_tty_access()
     }
+}
+
+/// Export a session transcript to HTML for CLI surface flows.
+///
+/// # Errors
+///
+/// Returns an error when the input session path does not exist, the session
+/// cannot be opened, or the output file cannot be written.
+pub async fn export_session_html(input_path: &str, output_path: Option<&str>) -> Result<PathBuf> {
+    let input = Path::new(input_path);
+    if !input.exists() {
+        return Err(crate::error::Error::validation(format!(
+            "File not found: {input_path}"
+        )));
+    }
+
+    let session = Session::open(input_path).await?;
+    let html = crate::app::render_session_html(&session);
+    let output_path = output_path.map_or_else(|| default_export_path(input), PathBuf::from);
+
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&output_path, html)?;
+    Ok(output_path)
+}
+
+fn default_export_path(input: &Path) -> PathBuf {
+    let basename = input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("session");
+    PathBuf::from(format!("pi-session-{basename}.html"))
 }
 
 /// Install a fail-closed bridge for extension UI on non-interactive routes.
