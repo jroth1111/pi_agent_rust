@@ -270,3 +270,131 @@ impl WorkflowContract for RpcWorkflowAdapter {
             .await
     }
 }
+
+/// TUI conversation adapter that provides ConversationContract for the interactive terminal.
+/// This adapter wires TUI operations through the shared contract instead of direct state mutation.
+pub struct TuiConversationAdapter {
+    session_handle: Arc<Mutex<crate::session::Session>>,
+    config_handle: Arc<Mutex<crate::config::Config>>,
+    next_seq: AtomicU64,
+    is_streaming: Arc<AtomicBool>,
+    is_compacting: Arc<AtomicBool>,
+}
+
+impl TuiConversationAdapter {
+    #[must_use]
+    pub(crate) const fn new(
+        session_handle: Arc<Mutex<crate::session::Session>>,
+        config_handle: Arc<Mutex<crate::config::Config>>,
+        is_streaming: Arc<AtomicBool>,
+        is_compacting: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            session_handle,
+            config_handle,
+            next_seq: AtomicU64::new(1),
+            is_streaming,
+            is_compacting,
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ConversationContract for TuiConversationAdapter {
+    async fn session_identity(&self) -> Result<SessionIdentity> {
+        let session = self
+            .session_handle
+            .lock()
+            .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
+        Ok(SessionIdentity {
+            session_id: session.header.id.clone(),
+            name: None,
+            path: session.path.as_ref().map(|path| path.display().to_string()),
+        })
+    }
+
+    async fn model_control(&self) -> Result<ModelControl> {
+        let session = self
+            .session_handle
+            .lock()
+            .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
+        Ok(ModelControl {
+            model_id: session.header.model_id.clone().unwrap_or_default(),
+            provider: session.header.provider.clone().unwrap_or_default(),
+            thinking_level: session
+                .header
+                .thinking_level
+                .as_ref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            thinking_budget_tokens: None,
+        })
+    }
+
+    async fn set_model_control(&self, control: ModelControl) -> Result<()> {
+        let mut session = self
+            .session_handle
+            .lock()
+            .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
+        session.header.model_id = Some(control.model_id);
+        session.header.provider = Some(control.provider);
+        session.header.thinking_level = Some(control.thinking_level.to_string());
+        Ok(())
+    }
+
+    async fn queue_control(&self) -> Result<QueueControl> {
+        // TUI uses default one-at-a-time mode
+        Ok(QueueControl {
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            pending_steering: 0,
+            pending_follow_up: 0,
+        })
+    }
+
+    async fn set_queue_control(&self, _control: QueueControl) -> Result<()> {
+        // Queue control settings are not persisted in TUI mode
+        Ok(())
+    }
+
+    async fn enqueue_steering(&self, _message: String) -> Result<QueueEnqueueResult> {
+        // TUI handles steering via input queue
+        Ok(QueueEnqueueResult {
+            seq: self.next_seq(),
+            queue: QueueKind::Steering,
+        })
+    }
+
+    async fn enqueue_follow_up(&self, _message: String) -> Result<QueueEnqueueResult> {
+        // TUI handles follow-up via input queue
+        Ok(QueueEnqueueResult {
+            seq: self.next_seq(),
+            queue: QueueKind::FollowUp,
+        })
+    }
+
+    async fn interrupt(&self, reason: InterruptReason) -> Result<InterruptResult> {
+        // TUI handles interrupt via abort handle
+        Ok(InterruptResult {
+            success: true,
+            reason,
+            cancelled_count: 0,
+        })
+    }
+
+    async fn current_context(&self) -> Result<Option<ContextPack>> {
+        Ok(None)
+    }
+
+    async fn is_streaming(&self) -> bool {
+        self.is_streaming.load(Ordering::SeqCst)
+    }
+
+    async fn is_compacting(&self) -> bool {
+        self.is_compacting.load(Ordering::SeqCst)
+    }
+}

@@ -36,6 +36,33 @@ pub enum ThinkingLevel {
     XHigh,
 }
 
+impl std::str::FromStr for ThinkingLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "0" => Ok(Self::Off),
+            "low" | "l" => Ok(Self::Low),
+            "medium" | "med" | "m" => Ok(Self::Medium),
+            "high" | "h" => Ok(Self::High),
+            "xhigh" | "x-high" | "xh" => Ok(Self::XHigh),
+            _ => Err(format!("invalid thinking level: {s}")),
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+            Self::XHigh => write!(f, "xhigh"),
+        }
+    }
+}
+
 /// Session identity for surface operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]

@@ -15,7 +15,7 @@ pub mod kernel;
 pub mod plane;
 pub mod runtime;
 
-pub use adapter::{RpcConversationAdapter, RpcWorkflowAdapter};
+pub use adapter::{RpcConversationAdapter, RpcWorkflowAdapter, TuiConversationAdapter};
 pub use bootstrap::{
     BootstrapPaths, BootstrapProfile, BootstrapRequest, InteractionMode, ResumeTarget,
     SurfaceCapabilities, SurfaceKind,
