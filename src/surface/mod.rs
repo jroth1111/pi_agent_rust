@@ -17,13 +17,15 @@
 //! fail closed when they would require interactive approval flows. This prevents
 //! silent fallback to interactive mode.
 
+pub mod auth_setup;
+
+use crate::agent::AgentSession;
 use crate::contracts::bootstrap::{
     BootstrapRequest, InteractionMode, SurfaceCapabilities, SurfaceKind,
 };
 use crate::error::Result;
 use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
 use crate::session::Session;
-use crate::agent::AgentSession;
 use asupersync::runtime::RuntimeHandle;
 use serde_json::Value;
 use std::fs;
