@@ -6,6 +6,7 @@
 //! concerns such as inference, context, workspace, host execution, identity,
 //! capability approval, and admission.
 
+pub mod adapter;
 pub mod bootstrap;
 pub mod boundary;
 pub mod dto;
@@ -14,6 +15,7 @@ pub mod kernel;
 pub mod plane;
 pub mod runtime;
 
+pub use adapter::{RpcConversationAdapter, RpcWorkflowAdapter};
 pub use bootstrap::{
     BootstrapPaths, BootstrapProfile, BootstrapRequest, InteractionMode, ResumeTarget,
     SurfaceCapabilities, SurfaceKind,

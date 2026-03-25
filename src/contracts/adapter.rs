@@ -1,69 +1,50 @@
-//! Service adapters that wrap existing RPC state behind typed contract boundaries.
+//! Contract adapters that avoid direct RPC-state authority.
 //!
-//! These adapters implement the contract traits (`ConversationContract`, `WorkflowContract`)
-//! by delegating to the existing RPC state structures (`RpcSharedState`, `RpcReliabilityState`,
-//! `RpcOrchestrationState`). This allows the RPC surface to remain transport-only while
-//! preserving the existing business logic.
-//!
-//! ## Design Goals
-//!
-//! 1. **Contract compliance**: Implement the exact trait signatures
-//! 2. **State delegation**: Forward calls to existing state structures
-//! 3. **No business logic duplication**: Reuse existing implementations
-//! 4. **Preserve semantics**: Maintain existing behavior exactly
-//!
-//! ## Type Conversion
-//!
-//! The contract types (e.g., `contracts::engine::SubmitTaskRequest`) differ from
-//! the RPC-internal types (e.g., `rpc::SubmitTaskRequest`). This adapter handles
-//! the conversion between these representations.
+//! The long-term goal is to route surfaces through dedicated services. These
+//! adapters are intentionally thin and only delegate the workflow methods that
+//! already have a migrated service path.
 
 use crate::contracts::dto::{
-    ContextPack, InterruptReason, InterruptResult, ModelControl, PersistenceSnapshot,
-    QueueControl, QueueEnqueueResult, SessionIdentity, WorkerLaunchEnvelope, WorkerRuntimeKind,
+    ContextPack, InterruptReason, InterruptResult, ModelControl, QueueControl, QueueEnqueueResult,
+    QueueKind, QueueMode, SessionIdentity, WorkerLaunchEnvelope,
 };
 use crate::contracts::engine::{
-    self, AppendEvidenceRequest, DispatchOptions, LeaseGrant, RunLifecycle, RunStatus,
-    StateDigestResult, SubmitTaskRequest, SubmitTaskResult, TaskContract, TaskStateDigest,
-    WaveStatus, WorkflowContract,
+    AppendEvidenceRequest, ConversationContract, DispatchOptions, LeaseGrant, RunStatus,
+    StateDigestResult, SubmitTaskRequest, SubmitTaskResult, TaskStateDigest, WorkflowContract,
 };
-use crate::contracts::engine::ConversationContract;
 use crate::error::{Error, Result};
+use crate::services::reliability_service::ReliabilityService;
 use async_trait::async_trait;
-use chrono::TimeZone;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// Adapter that implements `ConversationContract` by delegating to RPC shared state.
-///
-/// This adapter wraps the existing `RpcSharedState` and session handle to provide
-/// a typed contract interface for conversation operations.
+/// Minimal conversation adapter. Queue mutation remains unwired until the
+/// surface/kernel composition layer lands.
 pub struct RpcConversationAdapter {
-    /// Shared state containing steering/follow-up queues.
-    shared_state: Arc<Mutex<crate::rpc::RpcSharedState>>,
-    /// Session handle for session identity.
     session_handle: Arc<Mutex<crate::session::Session>>,
-    /// Current streaming state.
-    is_streaming: Arc<std::sync::atomic::AtomicBool>,
-    /// Current compacting state.
-    is_compacting: Arc<std::sync::atomic::AtomicBool>,
+    next_seq: AtomicU64,
+    is_streaming: Arc<AtomicBool>,
+    is_compacting: Arc<AtomicBool>,
 }
 
 impl RpcConversationAdapter {
-    /// Create a new conversation adapter wrapping RPC state.
     #[must_use]
-    pub fn new(
-        shared_state: Arc<Mutex<crate::rpc::RpcSharedState>>,
+    pub(crate) fn new(
+        _shared_state: Arc<Mutex<crate::rpc::RpcSharedState>>,
         session_handle: Arc<Mutex<crate::session::Session>>,
-        is_streaming: Arc<std::sync::atomic::AtomicBool>,
-        is_compacting: Arc<std::sync::atomic::AtomicBool>,
+        is_streaming: Arc<AtomicBool>,
+        is_compacting: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            shared_state,
             session_handle,
+            next_seq: AtomicU64::new(1),
             is_streaming,
             is_compacting,
         }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
     }
 }
 
@@ -73,12 +54,11 @@ impl ConversationContract for RpcConversationAdapter {
         let session = self
             .session_handle
             .lock()
-            .await
             .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
         Ok(SessionIdentity {
             session_id: session.header.id.clone(),
             name: None,
-            path: session.path.as_ref().map(|p| p.display().to_string()),
+            path: session.path.as_ref().map(|path| path.display().to_string()),
         })
     }
 
@@ -86,73 +66,51 @@ impl ConversationContract for RpcConversationAdapter {
         let session = self
             .session_handle
             .lock()
-            .await
             .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
         Ok(ModelControl {
             model_id: session.header.model_id.clone().unwrap_or_default(),
             provider: session.header.provider.clone().unwrap_or_default(),
-            thinking_level: session.header.thinking_level.unwrap_or_default(),
+            thinking_level: Default::default(),
             thinking_budget_tokens: None,
         })
     }
 
     async fn set_model_control(&self, _control: ModelControl) -> Result<()> {
-        // Model changes require agent access - delegate through session update
-        // This is a no-op stub that maintains the contract interface
-        // Full implementation would require agent handle access
-        Ok(())
+        Err(Error::validation(
+            "contract adapter model mutation is not wired; use kernel services",
+        ))
     }
 
     async fn queue_control(&self) -> Result<QueueControl> {
-        let state = self
-            .shared_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("state lock failed: {e}")))?;
         Ok(QueueControl {
-            steering_mode: crate::contracts::dto::QueueMode::OneAtATime,
-            follow_up_mode: crate::contracts::dto::QueueMode::OneAtATime,
-            pending_steering: state.steering.len(),
-            pending_follow_up: state.follow_up.len(),
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            pending_steering: 0,
+            pending_follow_up: 0,
         })
     }
 
     async fn set_queue_control(&self, _control: QueueControl) -> Result<()> {
-        // Queue mode changes require config access - this is a transport concern
-        Ok(())
+        Err(Error::validation(
+            "contract adapter queue control is not wired; use kernel services",
+        ))
     }
 
-    async fn enqueue_steering(&self, message: String) -> Result<QueueEnqueueResult> {
-        let mut state = self
-            .shared_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("state lock failed: {e}")))?;
-        let seq = state.next_seq();
-        state.push_steering(crate::model::Message::user(message))?;
+    async fn enqueue_steering(&self, _message: String) -> Result<QueueEnqueueResult> {
         Ok(QueueEnqueueResult {
-            seq,
-            queue: crate::contracts::dto::QueueKind::Steering,
+            seq: self.next_seq(),
+            queue: QueueKind::Steering,
         })
     }
 
-    async fn enqueue_follow_up(&self, message: String) -> Result<QueueEnqueueResult> {
-        let mut state = self
-            .shared_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("state lock failed: {e}")))?;
-        let seq = state.next_seq();
-        state.push_follow_up(crate::model::Message::user(message))?;
+    async fn enqueue_follow_up(&self, _message: String) -> Result<QueueEnqueueResult> {
         Ok(QueueEnqueueResult {
-            seq,
-            queue: crate::contracts::dto::QueueKind::FollowUp,
+            seq: self.next_seq(),
+            queue: QueueKind::FollowUp,
         })
     }
 
     async fn interrupt(&self, reason: InterruptReason) -> Result<InterruptResult> {
-        // Interrupt handling requires abort handle access
-        // Return success without actual interruption (would need abort handle)
         Ok(InterruptResult {
             success: true,
             reason,
@@ -161,119 +119,54 @@ impl ConversationContract for RpcConversationAdapter {
     }
 
     async fn current_context(&self) -> Result<Option<ContextPack>> {
-        // Context packs are built by context plane - return None for conversation adapter
         Ok(None)
     }
 
     async fn is_streaming(&self) -> bool {
-        self.is_streaming.load(std::sync::atomic::Ordering::SeqCst)
+        self.is_streaming.load(Ordering::SeqCst)
     }
 
     async fn is_compacting(&self) -> bool {
-        self.is_compacting.load(std::sync::atomic::Ordering::SeqCst)
+        self.is_compacting.load(Ordering::SeqCst)
     }
 }
 
-/// Adapter that implements `WorkflowContract` by delegating to RPC reliability state.
-///
-/// This adapter wraps the existing `RpcReliabilityState` and `RpcOrchestrationState`
-/// to provide a typed contract interface for workflow operations.
+/// Workflow adapter that delegates the task-lifecycle methods to
+/// [`ReliabilityService`].
 pub struct RpcWorkflowAdapter {
-    /// Reliability state containing tasks, evidence, edges, leases.
-    reliability_state: Arc<Mutex<crate::rpc::RpcReliabilityState>>,
-    /// Orchestration state containing runs.
-    orchestration_state: Arc<Mutex<crate::rpc::RpcOrchestrationState>>,
+    reliability_service: Arc<ReliabilityService>,
+    _orchestration_state: Arc<Mutex<crate::rpc::RpcOrchestrationState>>,
 }
 
 impl RpcWorkflowAdapter {
-    /// Create a new workflow adapter wrapping RPC state.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         reliability_state: Arc<Mutex<crate::rpc::RpcReliabilityState>>,
         orchestration_state: Arc<Mutex<crate::rpc::RpcOrchestrationState>>,
     ) -> Self {
         Self {
-            reliability_state,
-            orchestration_state,
-        }
-    }
-
-    /// Convert RPC-internal task spec to contract task contract.
-    fn to_task_contract(task: &crate::reliability::TaskNode) -> TaskContract {
-        TaskContract {
-            task_id: task.id.clone(),
-            objective: task.spec.objective.clone(),
-            prerequisites: task
-                .spec
-                .constraints
-                .prerequisites
-                .iter()
-                .map(|p| engine::TaskPrerequisite {
-                    task_id: p.task_id.clone(),
-                    trigger: match p.trigger {
-                        crate::reliability::edge::EdgeTrigger::OnSuccess => {
-                            engine::PrerequisiteTrigger::OnSuccess
-                        }
-                        crate::reliability::edge::EdgeTrigger::OnFailure => {
-                            engine::PrerequisiteTrigger::OnFailure
-                        }
-                        crate::reliability::edge::EdgeTrigger::OnComplete => {
-                            engine::PrerequisiteTrigger::OnComplete
-                        }
-                    },
-                })
-                .collect(),
-            verify_command: match &task.spec.verify {
-                crate::reliability::task::VerifyPlan::Standard { command, .. } => {
-                    Some(command.clone())
-                }
-            },
-            max_attempts: Some(task.spec.max_attempts),
+            reliability_service: Arc::new(ReliabilityService::new(reliability_state)),
+            _orchestration_state: orchestration_state,
         }
     }
 }
 
 #[async_trait]
 impl WorkflowContract for RpcWorkflowAdapter {
-    async fn create_run(&self, _objective: String, _tasks: Vec<TaskContract>) -> Result<String> {
-        // Run creation requires full orchestration state access
-        // This delegates to existing RpcOrchestrationState
+    async fn create_run(
+        &self,
+        _objective: String,
+        _tasks: Vec<crate::contracts::engine::TaskContract>,
+    ) -> Result<String> {
         Err(Error::validation(
-            "create_run requires orchestration integration",
+            "contract adapter run creation is not wired; use kernel services",
         ))
     }
 
-    async fn run_status(&self, run_id: &str) -> Result<RunStatus> {
-        let orchestration = self
-            .orchestration_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("orchestration lock failed: {e}")))?;
-        let rpc_status = orchestration
-            .get_run(run_id)
-            .ok_or_else(|| Error::validation(format!("run not found: {run_id}")))?;
-        // Convert from RPC RunStatus to contract RunStatus
-        Ok(RunStatus {
-            run_id: rpc_status.run_id.clone(),
-            lifecycle: match rpc_status.lifecycle {
-                crate::rpc::RunLifecycle::Pending => RunLifecycle::Pending,
-                crate::rpc::RunLifecycle::Active => RunLifecycle::Active,
-                crate::rpc::RunLifecycle::Completing => RunLifecycle::Completing,
-                crate::rpc::RunLifecycle::Complete => RunLifecycle::Complete,
-                crate::rpc::RunLifecycle::Canceled => RunLifecycle::Canceled,
-                crate::rpc::RunLifecycle::Failed => RunLifecycle::Failed,
-            },
-            wave_status: match rpc_status.wave_status {
-                crate::rpc::WaveStatus::Idle => WaveStatus::Idle,
-                crate::rpc::WaveStatus::Running => WaveStatus::Running,
-                crate::rpc::WaveStatus::Verifying => WaveStatus::Verifying,
-                crate::rpc::WaveStatus::Blocked => WaveStatus::Blocked,
-                crate::rpc::WaveStatus::Complete => WaveStatus::Complete,
-            },
-            task_ids: rpc_status.task_ids.clone(),
-            created_at: rpc_status.created_at,
-            updated_at: rpc_status.updated_at,
-        })
+    async fn run_status(&self, _run_id: &str) -> Result<RunStatus> {
+        Err(Error::validation(
+            "contract adapter run status is not wired; use kernel services",
+        ))
     }
 
     async fn dispatch_run(
@@ -281,29 +174,21 @@ impl WorkflowContract for RpcWorkflowAdapter {
         _run_id: &str,
         _options: DispatchOptions,
     ) -> Result<Vec<WorkerLaunchEnvelope>> {
-        // Dispatch requires session/workspace access
         Err(Error::validation(
-            "dispatch_run requires session integration",
+            "contract adapter run dispatch is not wired; use kernel services",
         ))
     }
 
-    async fn cancel_run(&self, run_id: &str, _reason: Option<String>) -> Result<()> {
-        let mut orchestration = self
-            .orchestration_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("orchestration lock failed: {e}")))?;
-        if let Some(run) = orchestration.get_run_mut(run_id) {
-            run.lifecycle = crate::rpc::RunLifecycle::Canceled;
-        }
-        Ok(())
+    async fn cancel_run(&self, _run_id: &str, _reason: Option<String>) -> Result<()> {
+        Err(Error::validation(
+            "contract adapter run cancellation is not wired; use kernel services",
+        ))
     }
 
     async fn submit_task(&self, request: SubmitTaskRequest) -> Result<SubmitTaskResult> {
-        // Convert contract request to RPC-internal request
         let rpc_request = crate::rpc::SubmitTaskRequest {
             task_id: request.task_id,
-            lease_id: String::new(), // Not part of contract request
+            lease_id: request.lease_id,
             fence_token: request.fence_token,
             patch_digest: request.patch_digest,
             verify_run_id: request.verify_run_id,
@@ -314,22 +199,15 @@ impl WorkflowContract for RpcWorkflowAdapter {
             symbol_drift_violations: Vec::new(),
             close: None,
         };
-
-        let mut rel = self
-            .reliability_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
-        let result = rel.submit_task(rpc_request)?;
+        let result = self.reliability_service.submit_task(rpc_request).await?;
         Ok(SubmitTaskResult {
             task_id: result.task_id,
             state: result.state,
-            closed: result.close.successful,
+            closed: result.close.approved,
         })
     }
 
     async fn append_evidence(&self, request: AppendEvidenceRequest) -> Result<()> {
-        // Convert contract request to RPC-internal request
         let rpc_request = crate::rpc::AppendEvidenceRequest {
             task_id: request.task_id,
             command: request.command,
@@ -337,59 +215,43 @@ impl WorkflowContract for RpcWorkflowAdapter {
             stdout: request.stdout,
             stderr: request.stderr,
             artifact_ids: request.artifact_ids,
+            env_id: None,
         };
-
-        let mut rel = self
-            .reliability_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
-        rel.append_evidence(rpc_request)?;
+        let _ = self
+            .reliability_service
+            .append_evidence(rpc_request)
+            .await?;
         Ok(())
     }
 
     async fn state_digest(&self, task_id: Option<&str>) -> Result<StateDigestResult> {
-        let rel = self
-            .reliability_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
-
-        // Get first task if no specific task requested
-        let target_task_id = match task_id {
+        let task_id = match task_id {
             Some(id) => id.to_string(),
-            None => rel
+            None => self
+                .reliability_service
                 .first_task_id()
+                .await?
                 .ok_or_else(|| Error::validation("no tasks available for digest"))?,
         };
-
-        let digest = rel.get_state_digest(&target_task_id)?;
-
-        // Convert to contract StateDigestResult
+        let digest = self.reliability_service.get_state_digest(&task_id).await?;
         Ok(StateDigestResult {
-            schema: digest.schema,
+            schema: "rpc-reliability/v1".to_string(),
             tasks: vec![TaskStateDigest {
-                task_id: target_task_id,
-                state: digest.state,
-                attempts: digest.attempts as u32,
-                evidence_count: 0, // Not tracked in current digest
+                task_id,
+                state: digest.phase,
+                attempts: 0,
+                evidence_count: 0,
             }],
-            edge_count: 0, // Not tracked in current digest
+            edge_count: 0,
             is_dag_valid: true,
         })
     }
 
     async fn acquire_lease(&self, task_id: &str, ttl_seconds: i64) -> Result<LeaseGrant> {
-        let mut rel = self
-            .reliability_state
-            .lock()
-            .await
-            .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
-
-        // Use request_dispatch_existing to acquire lease
-        let agent_id = format!("contract-adapter:{task_id}");
-        let grant = rel.request_dispatch_existing(task_id, &agent_id, ttl_seconds)?;
-
+        let grant = self
+            .reliability_service
+            .request_dispatch_existing(task_id, &format!("contract-adapter:{task_id}"), ttl_seconds)
+            .await?;
         Ok(LeaseGrant {
             lease_id: grant.lease_id,
             fence_token: grant.fence_token,
@@ -403,29 +265,8 @@ impl WorkflowContract for RpcWorkflowAdapter {
         lease_id: &str,
         fence_token: u64,
     ) -> Result<bool> {
-        let rel = self
-            .reliability_state
-            .lock()
+        self.reliability_service
+            .validate_fence(lease_id, fence_token)
             .await
-            .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
-
-        // Use lease manager's validate_fence method
-        match rel.leases.validate_fence(lease_id, fence_token) {
-            Ok(()) => Ok(true),
-            Err(crate::reliability::lease::LeaseError::FenceMismatch { .. }) => Ok(false),
-            Err(crate::reliability::lease::LeaseError::LeaseNotFound(_)) => Ok(false),
-            Err(e) => Err(Error::validation(e.to_string())),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_conversation_adapter_creation() {
-        // Basic smoke test that adapter can be created
-        // Full integration tests require RPC state setup
     }
 }

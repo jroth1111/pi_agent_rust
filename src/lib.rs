@@ -158,6 +158,7 @@ pub mod rpc;
 pub mod sandbox;
 pub mod scheduler;
 pub mod sdk;
+pub mod services;
 pub mod session;
 pub mod session_index;
 pub mod session_metrics;

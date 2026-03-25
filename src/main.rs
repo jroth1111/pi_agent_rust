@@ -45,7 +45,7 @@ use pi::agent::{
     AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, PreWarmedExtensionRuntime,
 };
 use pi::app::StartupError;
-use pi::auth::{AuthCredential, AuthStorage};
+use pi::auth::AuthStorage;
 use pi::cli;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
@@ -62,15 +62,14 @@ use pi::package_manager::{
     PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
 };
 use pi::provider::InputType;
-use pi::provider_metadata::{self, PROVIDER_METADATA};
+use pi::provider_metadata::PROVIDER_METADATA;
 use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
-use pi::surface::auth_setup::{
-    PROVIDER_CHOICES, ProviderChoice, SetupCredentialKind, prompt_line,
-    provider_choice_default_for_provider, provider_choice_from_token, run_first_time_setup,
-};
+use pi::surface::auth_setup::run_first_time_setup;
+#[cfg(test)]
+use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::extension_policy::{
     maybe_print_extension_policy_migration_notice, print_resolved_extension_policy,
     print_resolved_repair_policy,

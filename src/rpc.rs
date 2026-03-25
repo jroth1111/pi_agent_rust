@@ -18,6 +18,7 @@ use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
 use crate::config::{Config, ReliabilityEnforcementMode};
+use crate::contracts::dto::SessionIdentity;
 use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
@@ -25,7 +26,6 @@ use crate::model::{
     AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent,
     UserMessage,
 };
-use crate::contracts::dto::SessionIdentity;
 use crate::models::ModelEntry;
 use crate::orchestration::{
     ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind,
@@ -38,6 +38,7 @@ use crate::reliability;
 use crate::reliability::ArtifactStore;
 use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
+use crate::services::reliability_service::ReliabilityService;
 use crate::session::{Session, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
@@ -165,7 +166,7 @@ pub struct BlockerReport {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AppendEvidenceRequest {
+pub(crate) struct AppendEvidenceRequest {
     pub task_id: String,
     pub command: String,
     pub exit_code: i32,
@@ -181,7 +182,7 @@ struct AppendEvidenceRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SubmitTaskRequest {
+pub(crate) struct SubmitTaskRequest {
     pub task_id: String,
     pub lease_id: String,
     pub fence_token: u64,
@@ -203,11 +204,11 @@ struct SubmitTaskRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SubmitTaskResponse {
-    task_id: String,
-    state: String,
-    close_payload: ClosePayload,
-    close: reliability::CloseResult,
+pub(crate) struct SubmitTaskResponse {
+    pub(crate) task_id: String,
+    pub(crate) state: String,
+    pub(crate) close_payload: ClosePayload,
+    pub(crate) close: reliability::CloseResult,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,26 +257,26 @@ struct DispatchRunRequest {
 }
 
 #[derive(Debug)]
-struct RpcReliabilityState {
-    enabled: bool,
-    enforcement_mode: ReliabilityEnforcementMode,
-    require_evidence_for_close: bool,
-    default_max_attempts: u8,
-    verify_timeout_sec_default: u32,
-    max_touched_files: u16,
-    allow_open_ended_defer: bool,
-    tasks: HashMap<String, reliability::TaskNode>,
-    evidence_by_task: HashMap<String, Vec<EvidenceRecord>>,
-    latest_digest_by_task: HashMap<String, StateDigest>,
-    edges: Vec<reliability::ReliabilityEdge>,
-    symbol_drift_required_by_task: HashMap<String, bool>,
-    parent_goal_trace_by_task: HashMap<String, String>,
-    leases: reliability::LeaseManager,
-    artifacts: reliability::FsArtifactStore,
+pub(crate) struct RpcReliabilityState {
+    pub(crate) enabled: bool,
+    pub(crate) enforcement_mode: ReliabilityEnforcementMode,
+    pub(crate) require_evidence_for_close: bool,
+    pub(crate) default_max_attempts: u8,
+    pub(crate) verify_timeout_sec_default: u32,
+    pub(crate) max_touched_files: u16,
+    pub(crate) allow_open_ended_defer: bool,
+    pub(crate) tasks: HashMap<String, reliability::TaskNode>,
+    pub(crate) evidence_by_task: HashMap<String, Vec<EvidenceRecord>>,
+    pub(crate) latest_digest_by_task: HashMap<String, StateDigest>,
+    pub(crate) edges: Vec<reliability::ReliabilityEdge>,
+    pub(crate) symbol_drift_required_by_task: HashMap<String, bool>,
+    pub(crate) parent_goal_trace_by_task: HashMap<String, String>,
+    pub(crate) leases: reliability::LeaseManager,
+    pub(crate) artifacts: reliability::FsArtifactStore,
 }
 
 #[derive(Debug, Default)]
-struct RpcOrchestrationState {
+pub(crate) struct RpcOrchestrationState {
     runs: HashMap<String, RunStatus>,
     task_runs: HashMap<String, HashSet<String>>,
 }
@@ -301,6 +302,10 @@ impl RpcOrchestrationState {
 
     fn get_run(&self, run_id: &str) -> Option<RunStatus> {
         self.runs.get(run_id).cloned()
+    }
+
+    pub(crate) fn get_run_mut(&mut self, run_id: &str) -> Option<&mut RunStatus> {
+        self.runs.get_mut(run_id)
     }
 
     fn update_run(&mut self, run: RunStatus) {
@@ -370,24 +375,12 @@ impl RpcReliabilityState {
         self.leases.set_external_provider(provider);
     }
 
-    const fn mode_blocks(&self) -> bool {
-        matches!(self.enforcement_mode, ReliabilityEnforcementMode::Hard)
+    fn mode_blocks(&self) -> bool {
+        ReliabilityService::mode_blocks(self)
     }
 
     fn is_synthetic_trace_parent(trace_parent: &str) -> bool {
-        let normalized = trace_parent.trim().to_ascii_lowercase();
-        matches!(
-            normalized.as_str(),
-            "" | "rpc:auto"
-                | "auto"
-                | "default"
-                | "unknown"
-                | "none"
-                | "n/a"
-                | "na"
-                | "todo"
-                | "tbd"
-        )
+        ReliabilityService::is_synthetic_trace_parent(trace_parent)
     }
 
     fn validate_close_trace_chain(
@@ -395,42 +388,10 @@ impl RpcReliabilityState {
         task_id: &str,
         close_payload: &ClosePayload,
     ) -> Result<()> {
-        let trace_parent = close_payload
-            .trace_parent
-            .as_ref()
-            .map(|trace| trace.trim())
-            .filter(|trace| !trace.is_empty())
-            .ok_or_else(|| {
-                Error::validation("close payload missing parent-goal trace reference")
-            })?;
-
-        if Self::is_synthetic_trace_parent(trace_parent) {
-            return Err(Error::validation(format!(
-                "close trace_parent `{trace_parent}` is synthetic; provide real parent-goal trace ID"
-            )));
-        }
-
-        let expected = self
-            .parent_goal_trace_by_task
-            .get(task_id)
-            .map(|trace| trace.trim())
-            .filter(|trace| !trace.is_empty())
-            .ok_or_else(|| {
-                Error::validation(format!(
-                    "task `{task_id}` missing parent_goal_trace_id in dispatch contract"
-                ))
-            })?;
-
-        if expected != trace_parent {
-            return Err(Error::validation(format!(
-                "trace chain mismatch: task `{task_id}` expects parent-goal trace `{expected}`, got `{trace_parent}`"
-            )));
-        }
-
-        Ok(())
+        ReliabilityService::validate_close_trace_chain(self, task_id, close_payload)
     }
 
-    fn ensure_enabled(&self) -> Result<()> {
+    pub(crate) fn ensure_enabled(&self) -> Result<()> {
         if self.enabled {
             Ok(())
         } else {
@@ -438,74 +399,15 @@ impl RpcReliabilityState {
         }
     }
 
-    const fn state_label(state: &reliability::RuntimeState) -> &'static str {
-        match state {
-            reliability::RuntimeState::Blocked { .. } => "blocked",
-            reliability::RuntimeState::Ready => "ready",
-            reliability::RuntimeState::Leased { .. } => "leased",
-            reliability::RuntimeState::Verifying { .. } => "verifying",
-            reliability::RuntimeState::Recoverable { .. } => "recoverable",
-            reliability::RuntimeState::AwaitingHuman { .. } => "awaiting_human",
-            reliability::RuntimeState::Terminal(_) => "terminal",
-        }
+    fn state_label(state: &reliability::RuntimeState) -> &'static str {
+        ReliabilityService::state_label(state)
     }
 
     fn get_or_create_task(
         &mut self,
         contract: &TaskContract,
     ) -> Result<&mut reliability::TaskNode> {
-        let verify_command = if contract.verify_command.trim().is_empty() {
-            "cargo test".to_string()
-        } else {
-            contract.verify_command.clone()
-        };
-        let spec = reliability::TaskSpec {
-            objective: contract.objective.clone(),
-            constraints: reliability::TaskConstraintSet {
-                invariants: contract.invariants.clone(),
-                max_touched_files: contract.max_touched_files.or(Some(self.max_touched_files)),
-                forbid_paths: contract.forbid_paths.clone(),
-                network_access: reliability::NetworkPolicy::Offline,
-            },
-            verify: reliability::VerifyPlan::Standard {
-                audit_diff: true,
-                command: verify_command,
-                timeout_sec: contract
-                    .verify_timeout_sec
-                    .unwrap_or(self.verify_timeout_sec_default),
-            },
-            max_attempts: contract.max_attempts.unwrap_or(self.default_max_attempts),
-            input_snapshot: contract
-                .input_snapshot
-                .clone()
-                .unwrap_or_else(|| "rpc-dispatch".to_string()),
-            acceptance_ids: contract.acceptance_ids.clone(),
-            planned_touches: contract.planned_touches.clone(),
-        };
-        spec.validate()
-            .map_err(|err| Error::validation(err.to_string()))?;
-
-        let entry = self
-            .tasks
-            .entry(contract.task_id.clone())
-            .or_insert_with(|| reliability::TaskNode::new(contract.task_id.clone(), spec.clone()));
-        entry.spec = spec;
-        self.symbol_drift_required_by_task.insert(
-            contract.task_id.clone(),
-            contract.enforce_symbol_drift_check,
-        );
-        if let Some(parent_trace) = contract
-            .parent_goal_trace_id
-            .as_ref()
-            .map(|trace| trace.trim())
-            .filter(|trace| !trace.is_empty())
-        {
-            self.parent_goal_trace_by_task
-                .insert(contract.task_id.clone(), parent_trace.to_string());
-        } else {
-            self.parent_goal_trace_by_task.remove(&contract.task_id);
-        }
-        Ok(entry)
+        ReliabilityService::get_or_create_task(self, contract)
     }
 
     fn task_counts_for(&self, task_ids: &[String]) -> BTreeMap<String, usize> {
@@ -551,7 +453,7 @@ impl RpcReliabilityState {
         }
     }
 
-    fn reconcile_prerequisites(&mut self, contract: &TaskContract) -> Result<()> {
+    pub(crate) fn reconcile_prerequisites(&mut self, contract: &TaskContract) -> Result<()> {
         let previous_edges = self.edges.clone();
         self.edges.retain(|edge| {
             !(edge.to == contract.task_id
@@ -624,7 +526,7 @@ impl RpcReliabilityState {
         waiting_on
     }
 
-    fn project_waiting_on_for_task(&mut self, task_id: &str) -> Vec<String> {
+    pub(crate) fn project_waiting_on_for_task(&mut self, task_id: &str) -> Vec<String> {
         let waiting_on = self.waiting_on_for_task(task_id);
         let Some(task) = self.tasks.get_mut(task_id) else {
             return waiting_on;
@@ -691,7 +593,7 @@ impl RpcReliabilityState {
         promoted
     }
 
-    fn refresh_dependency_states(&mut self) {
+    pub(crate) fn refresh_dependency_states(&mut self) {
         self.promote_recoverable_due();
         self.evaluate_dag_unblock();
 
@@ -708,12 +610,7 @@ impl RpcReliabilityState {
         agent_id: &str,
         ttl_seconds: i64,
     ) -> Result<DispatchGrant> {
-        self.ensure_enabled()?;
-        let task_id = contract.task_id.clone();
-        self.get_or_create_task(contract)?;
-        self.reconcile_prerequisites(contract)?;
-        self.refresh_dependency_states();
-        self.request_dispatch_existing(&task_id, agent_id, ttl_seconds)
+        ReliabilityService::request_dispatch(self, contract, agent_id, ttl_seconds)
     }
 
     fn request_dispatch_existing(
@@ -722,73 +619,7 @@ impl RpcReliabilityState {
         agent_id: &str,
         ttl_seconds: i64,
     ) -> Result<DispatchGrant> {
-        self.ensure_enabled()?;
-        let waiting_on = self.project_waiting_on_for_task(task_id);
-        if !waiting_on.is_empty() {
-            return Err(Error::validation(format!(
-                "task {task_id} is blocked by prerequisites: {}",
-                waiting_on.join(", ")
-            )));
-        }
-        if let Some(task) = self.tasks.get(task_id) {
-            if let reliability::RuntimeState::Recoverable { retry_after, .. } = &task.runtime.state
-            {
-                let retry_note = retry_after
-                    .map(|ts| format!("retry after {}", ts.to_rfc3339()))
-                    .unwrap_or_else(|| "retry window not yet promoted".to_string());
-                return Err(Error::validation(format!(
-                    "task {task_id} is recoverable and not ready to dispatch ({retry_note})"
-                )));
-            }
-        }
-
-        let grant = self
-            .leases
-            .issue_lease(task_id, agent_id, ttl_seconds)
-            .map_err(|err| Error::validation(err.to_string()))?;
-
-        let event = reliability::TransitionEvent::Dispatch {
-            lease_id: grant.lease_id.clone(),
-            agent_id: grant.agent_id.clone(),
-            fence_token: grant.fence_token,
-            expires_at: grant.expires_at,
-        };
-
-        let mode_blocks = self.mode_blocks();
-        let (task_id, state) = {
-            let Some(task) = self.tasks.get_mut(task_id) else {
-                return Err(Error::validation("task disappeared during dispatch"));
-            };
-
-            if let Err(err) =
-                reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
-            {
-                let _ = self.leases.expire_lease(&grant.lease_id);
-                if mode_blocks {
-                    return Err(Error::validation(format!(
-                        "dispatch transition rejected: {err}"
-                    )));
-                }
-                task.runtime.state = reliability::RuntimeState::Ready;
-                reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
-                    .map_err(|inner| {
-                        Error::validation(format!("dispatch transition recovery failed: {inner}"))
-                    })?;
-            }
-            (
-                task.id.clone(),
-                Self::state_label(&task.runtime.state).to_string(),
-            )
-        };
-
-        Ok(DispatchGrant {
-            task_id,
-            agent_id: grant.agent_id,
-            lease_id: grant.lease_id,
-            fence_token: grant.fence_token,
-            expires_at: grant.expires_at,
-            state,
-        })
+        ReliabilityService::request_dispatch_existing_state(self, task_id, agent_id, ttl_seconds)
     }
 
     fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
@@ -810,255 +641,11 @@ impl RpcReliabilityState {
     }
 
     fn append_evidence(&mut self, req: AppendEvidenceRequest) -> Result<EvidenceRecord> {
-        self.ensure_enabled()?;
-
-        let mut artifact_ids = req.artifact_ids;
-        if !req.stdout.is_empty() {
-            let id = self
-                .artifacts
-                .put_text(&req.task_id, "stdout", &req.stdout)
-                .map_err(|err| Error::session(format!("store stdout artifact failed: {err}")))?;
-            artifact_ids.push(id);
-        }
-        if !req.stderr.is_empty() {
-            let id = self
-                .artifacts
-                .put_text(&req.task_id, "stderr", &req.stderr)
-                .map_err(|err| Error::session(format!("store stderr artifact failed: {err}")))?;
-            artifact_ids.push(id);
-        }
-
-        let evidence = EvidenceRecord::from_command_output_with_env(
-            req.task_id.clone(),
-            req.command,
-            req.exit_code,
-            &req.stdout,
-            &req.stderr,
-            artifact_ids,
-            req.env_id,
-        );
-        self.evidence_by_task
-            .entry(req.task_id)
-            .or_default()
-            .push(evidence.clone());
-        Ok(evidence)
+        ReliabilityService::append_evidence_state(self, req)
     }
 
     fn submit_task(&mut self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse> {
-        self.ensure_enabled()?;
-        let SubmitTaskRequest {
-            task_id,
-            lease_id,
-            fence_token,
-            patch_digest,
-            verify_run_id,
-            verify_passed,
-            verify_timed_out,
-            failure_class,
-            changed_files,
-            symbol_drift_violations,
-            close,
-        } = req;
-
-        let evidence = self
-            .evidence_by_task
-            .get(&task_id)
-            .cloned()
-            .unwrap_or_default();
-        let has_pass = evidence.iter().any(EvidenceRecord::is_success);
-        let verify_passed = verify_passed.unwrap_or(has_pass);
-        let mode_blocks = self.mode_blocks();
-        let lease_id_for_release = lease_id.clone();
-
-        if verify_passed && self.require_evidence_for_close {
-            let verify_evidence = reliability::Verifier::ensure_evidence(&evidence, 1)
-                .map_err(|err| Error::validation(err.to_string()))?;
-            if mode_blocks && !verify_evidence.ok {
-                return Err(Error::validation(verify_evidence.violations.join("; ")));
-            }
-        }
-
-        let mut verifier_policy_violations = Vec::new();
-        {
-            let Some(task) = self.tasks.get(&task_id) else {
-                return Err(Error::validation(format!(
-                    "Unknown reliability task: {task_id}"
-                )));
-            };
-
-            let scope_result = reliability::Verifier::audit_scope_with_constraints(
-                &changed_files,
-                &task.spec.constraints,
-            )
-            .map_err(|err| Error::validation(err.to_string()))?;
-            if !scope_result.ok {
-                verifier_policy_violations.extend(scope_result.violations);
-            }
-
-            if verify_timed_out {
-                verifier_policy_violations.push(format!(
-                    "verification timed out (configured timeout={}s)",
-                    match &task.spec.verify {
-                        reliability::VerifyPlan::Standard { timeout_sec, .. } => timeout_sec,
-                    }
-                ));
-            }
-
-            if self
-                .symbol_drift_required_by_task
-                .get(&task_id)
-                .copied()
-                .unwrap_or(false)
-                && !symbol_drift_violations.is_empty()
-            {
-                verifier_policy_violations.push(format!(
-                    "symbol/API drift detected: {}",
-                    symbol_drift_violations.join("; ")
-                ));
-            }
-        }
-        if mode_blocks && !verifier_policy_violations.is_empty() {
-            return Err(Error::validation(verifier_policy_violations.join("; ")));
-        }
-
-        let mut state = {
-            let Some(task) = self.tasks.get_mut(&task_id) else {
-                return Err(Error::validation(format!(
-                    "Unknown reliability task: {task_id}"
-                )));
-            };
-            reliability::apply_transition(
-                &mut task.runtime,
-                &reliability::TransitionEvent::Submit {
-                    lease_id,
-                    fence_token,
-                    patch_digest: patch_digest.clone(),
-                    verify_run_id: verify_run_id.clone(),
-                },
-                task.spec.max_attempts,
-            )
-            .map_err(|err| Error::validation(format!("submit transition rejected: {err}")))?;
-
-            if verify_passed {
-                reliability::apply_transition(
-                    &mut task.runtime,
-                    &reliability::TransitionEvent::VerifySuccess {
-                        verify_run_id,
-                        patch_digest,
-                    },
-                    task.spec.max_attempts,
-                )
-                .map_err(|err| {
-                    Error::validation(format!("verify success transition rejected: {err}"))
-                })?;
-            } else {
-                reliability::apply_transition(
-                    &mut task.runtime,
-                    &reliability::TransitionEvent::VerifyFail {
-                        class: failure_class
-                            .unwrap_or(reliability::FailureClass::VerificationFailed),
-                        verify_run_id: Some(verify_run_id),
-                        failure_artifact: None,
-                        handoff_summary: "Verification failed during RPC submit_task".to_string(),
-                    },
-                    task.spec.max_attempts,
-                )
-                .map_err(|err| {
-                    Error::validation(format!("verify fail transition rejected: {err}"))
-                })?;
-            }
-
-            if !self.allow_open_ended_defer
-                && matches!(
-                    task.runtime.state,
-                    reliability::RuntimeState::Recoverable { .. }
-                )
-            {
-                reliability::RecoveryManager::set_retry_after(task, 60);
-            }
-
-            Self::state_label(&task.runtime.state).to_string()
-        };
-        let _ = self.leases.expire_lease(&lease_id_for_release);
-        self.refresh_dependency_states();
-        if let Some(task) = self.tasks.get(&task_id) {
-            state = Self::state_label(&task.runtime.state).to_string();
-        }
-
-        let strict_close_trace_chain = mode_blocks && (verify_passed || close.is_some());
-        let mut close_payload = close.unwrap_or_else(|| ClosePayload {
-            task_id: task_id.clone(),
-            outcome: "submitted via rpc".to_string(),
-            outcome_kind: Some(reliability::CloseOutcomeKind::Success),
-            acceptance_ids: if strict_close_trace_chain {
-                Vec::new()
-            } else {
-                vec!["rpc:auto".to_string()]
-            },
-            evidence_ids: Vec::new(),
-            trace_parent: if strict_close_trace_chain {
-                None
-            } else {
-                Some("rpc:auto".to_string())
-            },
-        });
-        if close_payload.task_id.trim().is_empty() {
-            close_payload.task_id.clone_from(&task_id);
-        }
-        if close_payload
-            .trace_parent
-            .as_ref()
-            .is_none_or(|trace| trace.trim().is_empty())
-            && !strict_close_trace_chain
-        {
-            close_payload.trace_parent = Some("rpc:auto".to_string());
-        }
-        if close_payload.acceptance_ids.is_empty() && !strict_close_trace_chain {
-            close_payload.acceptance_ids = vec!["rpc:auto".to_string()];
-        }
-        if close_payload.evidence_ids.is_empty() {
-            close_payload.evidence_ids =
-                evidence.iter().map(|rec| rec.evidence_id.clone()).collect();
-        }
-        if strict_close_trace_chain {
-            self.validate_close_trace_chain(&task_id, &close_payload)?;
-        }
-
-        let mapping = reliability::Verifier::ensure_acceptance_mapped(
-            &close_payload.acceptance_ids,
-            &close_payload.evidence_ids,
-        );
-        if mode_blocks && !mapping.ok {
-            return Err(Error::validation(mapping.violations.join("; ")));
-        }
-
-        let mut close = reliability::CloseResult::evaluate(
-            &close_payload,
-            &evidence,
-            self.require_evidence_for_close,
-        )
-        .map_err(|err| Error::validation(err.to_string()))?;
-        if !mapping.ok {
-            close.approved = false;
-            close.violations.extend(mapping.violations);
-        }
-        if !verifier_policy_violations.is_empty() {
-            close.approved = false;
-            close.violations.extend(verifier_policy_violations);
-        }
-
-        if mode_blocks {
-            close
-                .ensure_approved()
-                .map_err(|err| Error::validation(err.to_string()))?;
-        }
-
-        Ok(SubmitTaskResponse {
-            task_id,
-            state,
-            close_payload,
-            close,
-        })
+        ReliabilityService::submit_task_state(self, req)
     }
 
     fn resolve_blocker(&mut self, report: BlockerReport) -> Result<String> {
@@ -1151,68 +738,12 @@ impl RpcReliabilityState {
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
-    fn first_task_id(&self) -> Option<String> {
+    pub(crate) fn first_task_id(&self) -> Option<String> {
         self.tasks.keys().next().cloned()
     }
 
     fn get_state_digest(&mut self, task_id: &str) -> Result<StateDigest> {
-        self.ensure_enabled()?;
-        self.refresh_dependency_states();
-        let Some(task) = self.tasks.get(task_id) else {
-            return Err(Error::validation(format!(
-                "Unknown reliability task: {task_id}"
-            )));
-        };
-
-        let mut digest = StateDigest::new(
-            task.spec.objective.clone(),
-            Self::state_label(&task.runtime.state),
-        );
-        digest
-            .recent_actions
-            .push(format!("attempt={}", task.runtime.attempt));
-        digest
-            .recent_actions
-            .push(format!("max_attempts={}", task.spec.max_attempts));
-
-        match &task.runtime.state {
-            reliability::RuntimeState::Blocked { waiting_on } => {
-                digest.blockers.clone_from(waiting_on);
-                digest.next_action = Some("Resolve blockers".to_string());
-            }
-            reliability::RuntimeState::AwaitingHuman { question, .. } => {
-                digest.blockers.push(question.clone());
-                digest.next_action = Some("Resolve human blocker".to_string());
-            }
-            reliability::RuntimeState::Recoverable { retry_after, .. } => {
-                digest.next_action = Some(retry_after.as_ref().map_or_else(
-                    || "Promote recoverable task".to_string(),
-                    |ts| format!("Retry after {}", ts.to_rfc3339()),
-                ));
-            }
-            reliability::RuntimeState::Ready => {
-                digest.next_action = Some("Request dispatch".to_string());
-            }
-            reliability::RuntimeState::Leased { .. } => {
-                digest.next_action = Some("Submit task for verification".to_string());
-            }
-            reliability::RuntimeState::Verifying { .. } => {
-                digest.next_action = Some("Finalize verify result".to_string());
-            }
-            reliability::RuntimeState::Terminal(term) => {
-                let terminal = match term {
-                    reliability::TerminalState::Succeeded { .. } => "succeeded",
-                    reliability::TerminalState::Failed { .. } => "failed",
-                    reliability::TerminalState::Superseded { .. } => "superseded",
-                    reliability::TerminalState::Canceled { .. } => "canceled",
-                };
-                digest.next_action = Some(format!("Terminal: {terminal}"));
-            }
-        }
-
-        self.latest_digest_by_task
-            .insert(task_id.to_string(), digest.clone());
-        Ok(digest)
+        ReliabilityService::get_state_digest_state(self, task_id)
     }
 }
 
@@ -3921,7 +3452,7 @@ fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) 
 }
 
 #[derive(Debug)]
-struct RpcSharedState {
+pub(crate) struct RpcSharedState {
     steering: VecDeque<Message>,
     follow_up: VecDeque<Message>,
     steering_mode: QueueMode,
