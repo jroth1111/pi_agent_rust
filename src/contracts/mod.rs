@@ -23,13 +23,15 @@ pub use bootstrap::{
 pub use boundary::{ContractBoundary, SurfaceBoundary, assert_surface_boundary};
 pub use dto::{
     AdmissionControl, AdmissionDecision, AdmissionGrant, ApprovalChoice, ApprovalControl,
-    ApprovalDecision, ApprovalPrompt, ContextBudget, ContextFreshness, ContextPack,
-    ContextProvenance, DurabilityMode, InferenceReceipt, InterruptControl, InterruptReason,
-    InterruptResult, LegacyImportRequest, LegacyStoreRole, LegacyStoreValidation, ModelControl,
+    ApprovalDecision, ApprovalPrompt, BranchContinuityState, CompactionContinuity,
+    CompactionFileTracking, ContextBudget, ContextFreshness, ContextPack, ContextProvenance,
+    DurabilityMode, InferenceReceipt, InterruptControl, InterruptReason, InterruptResult,
+    LegacyImportRequest, LegacyStoreRole, LegacyStoreValidation, MissingSkill, ModelControl,
     ModelSelection, PersistenceSnapshot, PersistenceStoreKind, QueueControl, QueueDrainResult,
     QueueEnqueueResult, QueueKind, QueueMode, ResourceRequest, SessionControl, SessionEvent,
-    SessionEventPayload, SessionIdentity, SessionProjection, ThinkingLevel, WorkerLaunchEnvelope,
-    WorkerRuntimeKind, WorkloadClass, WorkspaceSnapshot,
+    SessionEventPayload, SessionIdentity, SessionProjection, SkillActivation, SkillActivationSet,
+    SkillActivationValidation, SkillSource, ThinkingLevel, WorkerLaunchEnvelope, WorkerRuntimeKind,
+    WorkloadClass, WorkspaceSnapshot,
 };
 pub use engine::{
     AppendEvidenceRequest, ConversationContract, DispatchOptions, LeaseGrant, PersistenceContract,

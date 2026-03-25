@@ -11,9 +11,10 @@
 
 use crate::config::Config;
 use crate::contracts::dto::{
-    LegacyImportRequest, LegacyStoreRole, LegacyStoreValidation, ModelControl, PersistenceSnapshot,
-    PersistenceStoreKind, SessionEvent, SessionEventPayload, SessionIdentity, SessionProjection,
-    ThinkingLevel,
+    BranchContinuityState, CompactionContinuity, LegacyImportRequest, LegacyStoreRole,
+    LegacyStoreValidation, ModelControl, PersistenceSnapshot, PersistenceStoreKind, SessionEvent,
+    SessionEventPayload, SessionIdentity, SessionProjection, SkillActivation, SkillActivationSet,
+    SkillSource, ThinkingLevel,
 };
 use crate::contracts::engine::PersistenceContract;
 use crate::error::{Error, Result};
@@ -120,21 +121,49 @@ impl SessionEventStore {
                 compacted_entry_count,
                 original_message_count,
                 continuity,
-            } => (
-                "compaction".to_string(),
-                serde_json::json!({
+            } => {
+                let mut obj = serde_json::json!({
                     "summary": summary,
                     "compactedEntryCount": compacted_entry_count,
                     "originalMessageCount": original_message_count,
-                    "continuity": continuity,
-                }),
-            ),
+                });
+                if let Some(cont) = continuity {
+                    obj["continuity"] = serde_json::to_value(cont).unwrap_or(Value::Null);
+                }
+                ("compaction".to_string(), obj)
+            }
             SessionEventPayload::BranchSummary {
                 summary,
                 from_leaf_id,
             } => (
                 "branch_summary".to_string(),
                 serde_json::json!({ "summary": summary, "fromLeafId": from_leaf_id }),
+            ),
+            SessionEventPayload::SkillActivation {
+                skill_name,
+                source,
+                file_path,
+                disable_model_invocation,
+                description,
+            } => (
+                "skill_activation".to_string(),
+                serde_json::json!({
+                    "skillName": skill_name,
+                    "source": source,
+                    "filePath": file_path,
+                    "disableModelInvocation": disable_model_invocation,
+                    "description": description,
+                }),
+            ),
+            SessionEventPayload::SkillActivationSnapshot {
+                skills_disabled,
+                skills,
+            } => (
+                "skill_activation_snapshot".to_string(),
+                serde_json::json!({
+                    "skillsDisabled": skills_disabled,
+                    "skills": skills,
+                }),
             ),
             SessionEventPayload::Label {
                 label,
@@ -248,7 +277,15 @@ impl SessionEventStore {
                     .get("originalMessageCount")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let continuity = value.get("continuity").cloned();
+                // Parse typed continuity when present; fall back to None for
+                // legacy events that used the ad hoc Value blob.
+                let continuity = value.get("continuity").and_then(|v| {
+                    if v.is_object() {
+                        serde_json::from_value(v.clone()).ok()
+                    } else {
+                        None
+                    }
+                });
                 Ok(SessionEventPayload::Compaction {
                     summary,
                     compacted_entry_count,
@@ -269,6 +306,83 @@ impl SessionEventStore {
                 Ok(SessionEventPayload::BranchSummary {
                     summary,
                     from_leaf_id,
+                })
+            }
+            "skill_activation" => {
+                let skill_name = value
+                    .get("skillName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let source = value
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("path");
+                let source = match source {
+                    "user" => SkillSource::User,
+                    "project" => SkillSource::Project,
+                    _ => SkillSource::Path,
+                };
+                let file_path = value
+                    .get("filePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let disable_model_invocation = value
+                    .get("disableModelInvocation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let description = value
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(SessionEventPayload::SkillActivation {
+                    skill_name,
+                    source,
+                    file_path,
+                    disable_model_invocation,
+                    description,
+                })
+            }
+            "skill_activation_snapshot" => {
+                let skills_disabled = value
+                    .get("skillsDisabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let skills = value
+                    .get("skills")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                Some(SkillActivation {
+                                    skill_name: item.get("skillName")?.as_str()?.to_string(),
+                                    source: match item.get("source")?.as_str()? {
+                                        "user" => SkillSource::User,
+                                        "project" => SkillSource::Project,
+                                        _ => SkillSource::Path,
+                                    },
+                                    file_path: item
+                                        .get("filePath")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    disable_model_invocation: item
+                                        .get("disableModelInvocation")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                    description: item
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(SessionEventPayload::SkillActivationSnapshot {
+                    skills_disabled,
+                    skills,
                 })
             }
             "label" => {
@@ -315,6 +429,7 @@ impl SessionEventStore {
         events: &[SessionEvent],
     ) -> SessionProjection {
         let mut leaf_event_id = None;
+        let mut root_event_id = None;
         let mut message_count: u64 = 0;
         let mut session_name = None;
         let mut current_provider = None;
@@ -322,14 +437,24 @@ impl SessionEventStore {
         let mut current_thinking_level = None;
         let mut entry_ids = std::collections::HashSet::new();
         let mut parent_map: HashMap<String, String> = HashMap::new();
-        let mut is_linear = true;
         let mut children_count: HashMap<String, usize> = HashMap::new();
+        let mut is_linear = true;
+        let mut compaction_continuity: Option<CompactionContinuity> = None;
+        let mut skill_activations: Vec<SkillActivation> = Vec::new();
+        let mut skills_disabled = false;
+        let mut seen_skill_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for event in events {
             entry_ids.insert(event.event_id.clone());
             if let Some(ref parent_id) = event.parent_event_id {
                 parent_map.insert(event.event_id.clone(), parent_id.clone());
                 *children_count.entry(parent_id.clone()).or_insert(0) += 1;
+            }
+
+            // Track root: the first event with no parent
+            if root_event_id.is_none() && event.parent_event_id.is_none() {
+                root_event_id = Some(event.event_id.clone());
             }
 
             // Track leaf: the last event in sequence is the leaf
@@ -351,6 +476,52 @@ impl SessionEventStore {
                         session_name = value.as_str().map(|s| s.to_string());
                     }
                 }
+                SessionEventPayload::Compaction { continuity, .. } => {
+                    if let Some(cont) = continuity {
+                        compaction_continuity = Some(cont.clone());
+                    }
+                }
+                SessionEventPayload::SkillActivation {
+                    skill_name,
+                    source,
+                    file_path,
+                    disable_model_invocation,
+                    description,
+                } => {
+                    // Deduplicate: keep the latest activation for each skill name
+                    if seen_skill_names.insert(skill_name.clone()) {
+                        skill_activations.push(SkillActivation {
+                            skill_name: skill_name.clone(),
+                            source: *source,
+                            file_path: file_path.clone(),
+                            disable_model_invocation: *disable_model_invocation,
+                            description: description.clone(),
+                        });
+                    } else {
+                        // Update existing entry to latest activation
+                        if let Some(existing) = skill_activations
+                            .iter_mut()
+                            .find(|s| s.skill_name == *skill_name)
+                        {
+                            existing.source = *source;
+                            existing.file_path.clone_from(file_path);
+                            existing.disable_model_invocation = *disable_model_invocation;
+                            existing.description.clone_from(description);
+                        }
+                    }
+                }
+                SessionEventPayload::SkillActivationSnapshot {
+                    skills_disabled: sd,
+                    skills,
+                } => {
+                    skills_disabled = *sd;
+                    // A snapshot replaces the accumulated skill set entirely
+                    skill_activations.clone_from(skills);
+                    seen_skill_names = skill_activations
+                        .iter()
+                        .map(|s| s.skill_name.clone())
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -362,6 +533,37 @@ impl SessionEventStore {
                 break;
             }
         }
+
+        // Build branch continuity state
+        let branch_continuity = leaf_event_id.as_ref().map(|leaf| {
+            // Find fork points: entries with more than one child
+            let fork_points: Vec<String> = children_count
+                .iter()
+                .filter(|&(_, &count)| count > 1)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            // Find branch heads: entries that are children of fork points
+            // and have their own descendants (or are leaf-like)
+            let branch_heads: Vec<String> = fork_points
+                .iter()
+                .flat_map(|fork_id| {
+                    events
+                        .iter()
+                        .filter(|e| e.parent_event_id.as_deref() == Some(fork_id.as_str()))
+                        .map(|e| e.event_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            BranchContinuityState {
+                leaf_event_id: leaf.clone(),
+                root_event_id: root_event_id.clone(),
+                is_linear,
+                branch_heads,
+                fork_points,
+            }
+        });
 
         let current_model = current_provider
             .zip(current_model_id)
@@ -377,6 +579,16 @@ impl SessionEventStore {
 
         let built_from_offset = events.last().map_or(0, |e| e.seq);
 
+        // Build skill activation set if any skills were activated
+        let skill_set = if !skill_activations.is_empty() || skills_disabled {
+            Some(SkillActivationSet {
+                skills: skill_activations,
+                skills_disabled,
+            })
+        } else {
+            None
+        };
+
         SessionProjection {
             session_id: session_id.to_string(),
             event_count: events.len() as u64,
@@ -387,6 +599,9 @@ impl SessionEventStore {
             current_model,
             current_thinking_level,
             built_from_offset,
+            branch_continuity,
+            compaction_continuity,
+            skill_activations: skill_set,
         }
     }
 
@@ -522,11 +737,16 @@ impl PersistenceContract for SessionEventStore {
         let store = self.open_store(session_id)?;
         let parent_event_id = store.head().map(|h| h.entry_id);
 
+        // Parse typed continuity from Value if possible; otherwise store None.
+        let typed_continuity: Option<CompactionContinuity> = continuity
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
         let payload = SessionEventPayload::Compaction {
             summary,
             compacted_entry_count,
             original_message_count,
-            continuity,
+            continuity: typed_continuity,
         };
 
         self.append_event(session_id, payload, parent_event_id)
@@ -748,12 +968,21 @@ impl SessionEventStore {
             SessionEntry::ThinkingLevelChange(tl) => SessionEventPayload::ThinkingLevelChange {
                 thinking_level: tl.thinking_level.clone(),
             },
-            SessionEntry::Compaction(c) => SessionEventPayload::Compaction {
-                summary: c.summary.clone(),
-                compacted_entry_count: 0,
-                original_message_count: 0,
-                continuity: c.details.clone(),
-            },
+            SessionEntry::Compaction(c) => {
+                // Attempt to parse typed continuity from the CompactionEntry details.
+                // Legacy entries may have ad hoc JSON blobs that don't conform;
+                // those will yield None, which is safe.
+                let typed_continuity = c
+                    .details
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value::<CompactionContinuity>(v.clone()).ok());
+                SessionEventPayload::Compaction {
+                    summary: c.summary.clone(),
+                    compacted_entry_count: 0,
+                    original_message_count: 0,
+                    continuity: typed_continuity,
+                }
+            }
             SessionEntry::BranchSummary(bs) => SessionEventPayload::BranchSummary {
                 summary: bs.summary.clone(),
                 from_leaf_id: Some(bs.from_id.clone()),
@@ -774,6 +1003,84 @@ impl SessionEventStore {
         };
 
         (event_id, parent_event_id, payload)
+    }
+}
+
+/// Validate skill activations from a session projection against available skills.
+///
+/// This is the fail-closed path for VAL-SESS-009: when a session is resumed
+/// and the event store contains skill activations, each referenced skill is
+/// validated against the currently available skills. Missing skills produce
+/// explicit `MissingSkill` records and cause `is_valid` to be `false`.
+pub fn validate_skill_activations(
+    projection: &SessionProjection,
+    available_skill_paths: &[std::path::PathBuf],
+) -> crate::contracts::dto::SkillActivationValidation {
+    use crate::contracts::dto::{MissingSkill, SkillActivationValidation};
+
+    let Some(ref activation_set) = projection.skill_activations else {
+        // No skills were active — validation passes trivially.
+        return SkillActivationValidation {
+            found_skills: Vec::new(),
+            missing_skills: Vec::new(),
+            is_valid: true,
+        };
+    };
+
+    if activation_set.skills_disabled {
+        // Skills were explicitly disabled — validation passes.
+        return SkillActivationValidation {
+            found_skills: Vec::new(),
+            missing_skills: Vec::new(),
+            is_valid: true,
+        };
+    }
+
+    // Build a set of available skill names from the provided paths.
+    // A skill is considered available if any provided path's stem matches
+    // the skill name AND the path exists on disk, OR if the activation's
+    // file_path matches any provided path (covers direct path matches).
+    let mut available_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut existing_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for path in available_skill_paths {
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if !name.is_empty() && path.exists() {
+            available_names.insert(name.to_string());
+        }
+        // Also track the path string itself for direct file_path matching.
+        if let Some(path_str) = path.to_str() {
+            existing_paths.insert(path_str.to_string());
+        }
+    }
+
+    let mut found_skills = Vec::new();
+    let mut missing_skills = Vec::new();
+
+    for activation in &activation_set.skills {
+        // A skill is available if:
+        // 1. Its name appears in the available names set (path exists), OR
+        // 2. Its recorded file_path appears in the existing paths set.
+        let name_available = available_names.contains(&activation.skill_name);
+        let path_available = existing_paths.contains(&activation.file_path);
+        let is_available = name_available || path_available;
+        if is_available {
+            found_skills.push(activation.skill_name.clone());
+        } else {
+            missing_skills.push(MissingSkill {
+                skill_name: activation.skill_name.clone(),
+                expected_file_path: activation.file_path.clone(),
+                source: activation.source,
+            });
+        }
+    }
+
+    let is_valid = missing_skills.is_empty();
+
+    SkillActivationValidation {
+        found_skills,
+        missing_skills,
+        is_valid,
     }
 }
 
@@ -915,11 +1222,22 @@ mod tests {
 
     #[test]
     fn payload_roundtrip_compaction() {
+        let continuity = CompactionContinuity {
+            first_kept_entry_id: "entry-42".to_string(),
+            compaction_leaf_event_id: "leaf-99".to_string(),
+            pre_compaction_entry_count: 30,
+            pre_compaction_message_count: 20,
+            compacted_entry_count: 10,
+            file_tracking: crate::contracts::dto::CompactionFileTracking {
+                read_files: vec!["src/main.rs".to_string()],
+                modified_files: vec![],
+            },
+        };
         let payload = SessionEventPayload::Compaction {
             summary: "compressed context".to_string(),
             compacted_entry_count: 10,
             original_message_count: 20,
-            continuity: Some(serde_json::json!({"kept_entries": 5})),
+            continuity: Some(continuity.clone()),
         };
         let (entry_type, value) = SessionEventStore::payload_to_entry_value(&payload);
         assert_eq!(entry_type, "compaction");
@@ -937,6 +1255,10 @@ mod tests {
             assert_eq!(compacted_entry_count, 10);
             assert_eq!(original_message_count, 20);
             assert!(continuity.is_some());
+            let cont = continuity.unwrap();
+            assert_eq!(cont.first_kept_entry_id, "entry-42");
+            assert_eq!(cont.compaction_leaf_event_id, "leaf-99");
+            assert_eq!(cont.file_tracking.read_files.len(), 1);
         } else {
             panic!("expected Compaction payload");
         }
@@ -961,5 +1283,518 @@ mod tests {
         };
         assert!(!validation.is_valid);
         assert!(!validation.errors.is_empty());
+    }
+
+    // ========================================================================
+    // Branch continuity tests (VAL-SESS-002)
+    // ========================================================================
+
+    #[test]
+    fn branch_continuity_linear_session() {
+        let events = vec![
+            SessionEvent {
+                seq: 1,
+                event_id: "e1".to_string(),
+                parent_event_id: None,
+                payload: SessionEventPayload::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hello"),
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                payload_checksum: "a".to_string(),
+            },
+            SessionEvent {
+                seq: 2,
+                event_id: "e2".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("world"),
+                },
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                payload_checksum: "b".to_string(),
+            },
+        ];
+        let proj = SessionEventStore::build_projection_from_events("sess-1", &events);
+        assert!(proj.is_linear);
+        let bc = proj
+            .branch_continuity
+            .as_ref()
+            .expect("branch continuity should exist");
+        assert_eq!(bc.leaf_event_id, "e2");
+        assert_eq!(bc.root_event_id.as_deref(), Some("e1"));
+        assert!(bc.is_linear);
+        assert!(bc.fork_points.is_empty());
+        assert!(bc.branch_heads.is_empty());
+    }
+
+    #[test]
+    fn branch_continuity_forked_session() {
+        let events = vec![
+            SessionEvent {
+                seq: 1,
+                event_id: "e1".to_string(),
+                parent_event_id: None,
+                payload: SessionEventPayload::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("root"),
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                payload_checksum: "a".to_string(),
+            },
+            SessionEvent {
+                seq: 2,
+                event_id: "e2".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("branch-a"),
+                },
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                payload_checksum: "b".to_string(),
+            },
+            SessionEvent {
+                seq: 3,
+                event_id: "e3".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("branch-b"),
+                },
+                timestamp: "2026-01-01T00:00:02Z".to_string(),
+                payload_checksum: "c".to_string(),
+            },
+        ];
+        let proj = SessionEventStore::build_projection_from_events("sess-2", &events);
+        assert!(!proj.is_linear);
+        let bc = proj
+            .branch_continuity
+            .as_ref()
+            .expect("branch continuity should exist");
+        assert_eq!(bc.leaf_event_id, "e3");
+        assert_eq!(bc.root_event_id.as_deref(), Some("e1"));
+        assert!(!bc.is_linear);
+        assert_eq!(bc.fork_points, vec!["e1"]);
+        assert!(bc.branch_heads.contains(&"e2".to_string()));
+        assert!(bc.branch_heads.contains(&"e3".to_string()));
+    }
+
+    // ========================================================================
+    // Compaction continuity tests (VAL-SESS-003)
+    // ========================================================================
+
+    #[test]
+    fn compaction_continuity_survives_projection() {
+        let continuity = CompactionContinuity {
+            first_kept_entry_id: "entry-50".to_string(),
+            compaction_leaf_event_id: "entry-100".to_string(),
+            pre_compaction_entry_count: 100,
+            pre_compaction_message_count: 60,
+            compacted_entry_count: 49,
+            file_tracking: crate::contracts::dto::CompactionFileTracking {
+                read_files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+                modified_files: vec!["src/lib.rs".to_string()],
+            },
+        };
+        let events = vec![
+            SessionEvent {
+                seq: 1,
+                event_id: "e1".to_string(),
+                parent_event_id: None,
+                payload: SessionEventPayload::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("before"),
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                payload_checksum: "a".to_string(),
+            },
+            SessionEvent {
+                seq: 2,
+                event_id: "e2".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::Compaction {
+                    summary: "compacted".to_string(),
+                    compacted_entry_count: 49,
+                    original_message_count: 60,
+                    continuity: Some(continuity.clone()),
+                },
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                payload_checksum: "b".to_string(),
+            },
+            SessionEvent {
+                seq: 3,
+                event_id: "e3".to_string(),
+                parent_event_id: Some("e2".to_string()),
+                payload: SessionEventPayload::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("after"),
+                },
+                timestamp: "2026-01-01T00:00:02Z".to_string(),
+                payload_checksum: "c".to_string(),
+            },
+        ];
+        let proj = SessionEventStore::build_projection_from_events("sess-3", &events);
+        let cc = proj
+            .compaction_continuity
+            .as_ref()
+            .expect("compaction continuity should survive projection");
+        assert_eq!(cc.first_kept_entry_id, "entry-50");
+        assert_eq!(cc.compaction_leaf_event_id, "entry-100");
+        assert_eq!(cc.pre_compaction_entry_count, 100);
+        assert_eq!(cc.pre_compaction_message_count, 60);
+        assert_eq!(cc.compacted_entry_count, 49);
+        assert_eq!(cc.file_tracking.read_files.len(), 2);
+        assert_eq!(cc.file_tracking.modified_files.len(), 1);
+    }
+
+    #[test]
+    fn compaction_continuity_legacy_fallback() {
+        // A compaction event with no typed continuity should produce None.
+        let events = vec![SessionEvent {
+            seq: 1,
+            event_id: "e1".to_string(),
+            parent_event_id: None,
+            payload: SessionEventPayload::Compaction {
+                summary: "legacy compact".to_string(),
+                compacted_entry_count: 10,
+                original_message_count: 5,
+                continuity: None,
+            },
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            payload_checksum: "a".to_string(),
+        }];
+        let proj = SessionEventStore::build_projection_from_events("sess-legacy", &events);
+        assert!(proj.compaction_continuity.is_none());
+    }
+
+    // ========================================================================
+    // Skill continuity tests (VAL-SESS-009)
+    // ========================================================================
+
+    #[test]
+    fn skill_activation_survives_projection() {
+        let events = vec![
+            SessionEvent {
+                seq: 1,
+                event_id: "e1".to_string(),
+                parent_event_id: None,
+                payload: SessionEventPayload::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hello"),
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                payload_checksum: "a".to_string(),
+            },
+            SessionEvent {
+                seq: 2,
+                event_id: "e2".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::SkillActivation {
+                    skill_name: "code-review".to_string(),
+                    source: SkillSource::Project,
+                    file_path: ".pi/skills/code-review/SKILL.md".to_string(),
+                    disable_model_invocation: false,
+                    description: Some("Review code for quality".to_string()),
+                },
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                payload_checksum: "b".to_string(),
+            },
+            SessionEvent {
+                seq: 3,
+                event_id: "e3".to_string(),
+                parent_event_id: Some("e2".to_string()),
+                payload: SessionEventPayload::SkillActivation {
+                    skill_name: "security-scan".to_string(),
+                    source: SkillSource::User,
+                    file_path: "/home/user/.pi/skills/security-scan/SKILL.md".to_string(),
+                    disable_model_invocation: false,
+                    description: None,
+                },
+                timestamp: "2026-01-01T00:00:02Z".to_string(),
+                payload_checksum: "c".to_string(),
+            },
+        ];
+        let proj = SessionEventStore::build_projection_from_events("sess-skills", &events);
+        let skill_set = proj
+            .skill_activations
+            .as_ref()
+            .expect("skill activations should survive projection");
+        assert!(!skill_set.skills_disabled);
+        assert_eq!(skill_set.skills.len(), 2);
+        assert_eq!(skill_set.skills[0].skill_name, "code-review");
+        assert_eq!(skill_set.skills[1].skill_name, "security-scan");
+    }
+
+    #[test]
+    fn skill_activation_snapshot_replaces_accumulated() {
+        let events = vec![
+            SessionEvent {
+                seq: 1,
+                event_id: "e1".to_string(),
+                parent_event_id: None,
+                payload: SessionEventPayload::SkillActivation {
+                    skill_name: "old-skill".to_string(),
+                    source: SkillSource::Project,
+                    file_path: ".pi/skills/old-skill/SKILL.md".to_string(),
+                    disable_model_invocation: false,
+                    description: None,
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                payload_checksum: "a".to_string(),
+            },
+            SessionEvent {
+                seq: 2,
+                event_id: "e2".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::SkillActivationSnapshot {
+                    skills_disabled: false,
+                    skills: vec![SkillActivation {
+                        skill_name: "new-skill".to_string(),
+                        source: SkillSource::User,
+                        file_path: "/home/user/.pi/skills/new-skill/SKILL.md".to_string(),
+                        disable_model_invocation: true,
+                        description: Some("New skill".to_string()),
+                    }],
+                },
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                payload_checksum: "b".to_string(),
+            },
+        ];
+        let proj = SessionEventStore::build_projection_from_events("sess-snapshot", &events);
+        let skill_set = proj
+            .skill_activations
+            .as_ref()
+            .expect("skill activations should exist");
+        // Snapshot replaces accumulated — only new-skill should remain.
+        assert_eq!(skill_set.skills.len(), 1);
+        assert_eq!(skill_set.skills[0].skill_name, "new-skill");
+        assert!(skill_set.skills[0].disable_model_invocation);
+    }
+
+    #[test]
+    fn skill_activation_deduplication() {
+        let events = vec![
+            SessionEvent {
+                seq: 1,
+                event_id: "e1".to_string(),
+                parent_event_id: None,
+                payload: SessionEventPayload::SkillActivation {
+                    skill_name: "dup-skill".to_string(),
+                    source: SkillSource::Project,
+                    file_path: ".pi/skills/dup-skill/SKILL.md".to_string(),
+                    disable_model_invocation: false,
+                    description: Some("original".to_string()),
+                },
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                payload_checksum: "a".to_string(),
+            },
+            SessionEvent {
+                seq: 2,
+                event_id: "e2".to_string(),
+                parent_event_id: Some("e1".to_string()),
+                payload: SessionEventPayload::SkillActivation {
+                    skill_name: "dup-skill".to_string(),
+                    source: SkillSource::Path,
+                    file_path: "/other/path/SKILL.md".to_string(),
+                    disable_model_invocation: true,
+                    description: Some("updated".to_string()),
+                },
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                payload_checksum: "b".to_string(),
+            },
+        ];
+        let proj = SessionEventStore::build_projection_from_events("sess-dedup", &events);
+        let skill_set = proj
+            .skill_activations
+            .as_ref()
+            .expect("skill activations should exist");
+        // Duplicate should be deduplicated — latest wins.
+        assert_eq!(skill_set.skills.len(), 1);
+        assert_eq!(skill_set.skills[0].skill_name, "dup-skill");
+        assert_eq!(skill_set.skills[0].source, SkillSource::Path);
+        assert!(skill_set.skills[0].disable_model_invocation);
+        assert_eq!(skill_set.skills[0].description.as_deref(), Some("updated"));
+    }
+
+    // ========================================================================
+    // Skill validation (fail-closed) tests (VAL-SESS-009)
+    // ========================================================================
+
+    #[test]
+    fn validate_skill_activations_all_found() {
+        use std::path::PathBuf;
+        let proj = SessionProjection {
+            session_id: "test".to_string(),
+            event_count: 1,
+            leaf_event_id: Some("e1".to_string()),
+            is_linear: true,
+            message_count: 0,
+            session_name: None,
+            current_model: None,
+            current_thinking_level: None,
+            built_from_offset: 1,
+            branch_continuity: None,
+            compaction_continuity: None,
+            skill_activations: Some(SkillActivationSet {
+                skills: vec![SkillActivation {
+                    skill_name: "code-review".to_string(),
+                    source: SkillSource::Project,
+                    file_path: ".pi/skills/code-review/SKILL.md".to_string(),
+                    disable_model_invocation: false,
+                    description: None,
+                }],
+                skills_disabled: false,
+            }),
+        };
+        // Provide a path whose stem matches the skill name and that exists.
+        // We use the activation's own file_path to test the path-based match.
+        let available = vec![PathBuf::from(".pi/skills/code-review/SKILL.md")];
+        let validation = validate_skill_activations(&proj, &available);
+        assert!(validation.is_valid);
+        assert_eq!(validation.found_skills, vec!["code-review"]);
+        assert!(validation.missing_skills.is_empty());
+    }
+
+    #[test]
+    fn validate_skill_activations_missing_skill_fails_closed() {
+        let proj = SessionProjection {
+            session_id: "test".to_string(),
+            event_count: 1,
+            leaf_event_id: Some("e1".to_string()),
+            is_linear: true,
+            message_count: 0,
+            session_name: None,
+            current_model: None,
+            current_thinking_level: None,
+            built_from_offset: 1,
+            branch_continuity: None,
+            compaction_continuity: None,
+            skill_activations: Some(SkillActivationSet {
+                skills: vec![SkillActivation {
+                    skill_name: "deleted-skill".to_string(),
+                    source: SkillSource::User,
+                    file_path: "/home/user/.pi/skills/deleted-skill/SKILL.md".to_string(),
+                    disable_model_invocation: false,
+                    description: None,
+                }],
+                skills_disabled: false,
+            }),
+        };
+        // No available skills — the activated one is missing.
+        let validation = validate_skill_activations(&proj, &[]);
+        assert!(!validation.is_valid);
+        assert!(validation.found_skills.is_empty());
+        assert_eq!(validation.missing_skills.len(), 1);
+        assert_eq!(validation.missing_skills[0].skill_name, "deleted-skill");
+        assert_eq!(validation.missing_skills[0].source, SkillSource::User);
+    }
+
+    #[test]
+    fn validate_skill_activations_disabled_passes() {
+        let proj = SessionProjection {
+            session_id: "test".to_string(),
+            event_count: 1,
+            leaf_event_id: Some("e1".to_string()),
+            is_linear: true,
+            message_count: 0,
+            session_name: None,
+            current_model: None,
+            current_thinking_level: None,
+            built_from_offset: 1,
+            branch_continuity: None,
+            compaction_continuity: None,
+            skill_activations: Some(SkillActivationSet {
+                skills: vec![],
+                skills_disabled: true,
+            }),
+        };
+        let validation = validate_skill_activations(&proj, &[]);
+        assert!(validation.is_valid);
+    }
+
+    #[test]
+    fn validate_skill_activations_no_skills_passes() {
+        let proj = SessionProjection {
+            session_id: "test".to_string(),
+            event_count: 0,
+            leaf_event_id: None,
+            is_linear: true,
+            message_count: 0,
+            session_name: None,
+            current_model: None,
+            current_thinking_level: None,
+            built_from_offset: 0,
+            branch_continuity: None,
+            compaction_continuity: None,
+            skill_activations: None,
+        };
+        let validation = validate_skill_activations(&proj, &[]);
+        assert!(validation.is_valid);
+    }
+
+    // ========================================================================
+    // Skill activation event roundtrip
+    // ========================================================================
+
+    #[test]
+    fn skill_activation_event_roundtrip() {
+        let payload = SessionEventPayload::SkillActivation {
+            skill_name: "my-skill".to_string(),
+            source: SkillSource::Project,
+            file_path: ".pi/skills/my-skill/SKILL.md".to_string(),
+            disable_model_invocation: false,
+            description: Some("A test skill".to_string()),
+        };
+        let (entry_type, value) = SessionEventStore::payload_to_entry_value(&payload);
+        assert_eq!(entry_type, "skill_activation");
+
+        let roundtrip =
+            SessionEventStore::value_to_session_event_payload(&entry_type, &value).unwrap();
+        if let SessionEventPayload::SkillActivation {
+            skill_name,
+            source,
+            file_path,
+            disable_model_invocation,
+            description,
+        } = roundtrip
+        {
+            assert_eq!(skill_name, "my-skill");
+            assert_eq!(source, SkillSource::Project);
+            assert_eq!(file_path, ".pi/skills/my-skill/SKILL.md");
+            assert!(!disable_model_invocation);
+            assert_eq!(description.as_deref(), Some("A test skill"));
+        } else {
+            panic!("expected SkillActivation payload");
+        }
+    }
+
+    #[test]
+    fn skill_activation_snapshot_event_roundtrip() {
+        let payload = SessionEventPayload::SkillActivationSnapshot {
+            skills_disabled: true,
+            skills: vec![SkillActivation {
+                skill_name: "test".to_string(),
+                source: SkillSource::User,
+                file_path: "/home/.pi/skills/test/SKILL.md".to_string(),
+                disable_model_invocation: true,
+                description: None,
+            }],
+        };
+        let (entry_type, value) = SessionEventStore::payload_to_entry_value(&payload);
+        assert_eq!(entry_type, "skill_activation_snapshot");
+
+        let roundtrip =
+            SessionEventStore::value_to_session_event_payload(&entry_type, &value).unwrap();
+        if let SessionEventPayload::SkillActivationSnapshot {
+            skills_disabled,
+            skills,
+        } = roundtrip
+        {
+            assert!(skills_disabled);
+            assert_eq!(skills.len(), 1);
+            assert_eq!(skills[0].skill_name, "test");
+        } else {
+            panic!("expected SkillActivationSnapshot payload");
+        }
     }
 }

@@ -1232,11 +1232,22 @@ impl Session {
                     continuity,
                     ..
                 } => {
+                    // Convert typed continuity back to Value for the session entry's
+                    // details field. If continuity is present, serialize it; otherwise None.
+                    let details: Option<Value> = continuity
+                        .as_ref()
+                        .and_then(|c| serde_json::to_value(c).ok());
                     session.append_compaction(
                         summary.clone(),
-                        String::new(), // first_kept_entry_id — not available in event
-                        0,             // tokens_before — not available in event
-                        continuity.clone(),
+                        continuity
+                            .as_ref()
+                            .map(|c| c.first_kept_entry_id.clone())
+                            .unwrap_or_default(),
+                        continuity
+                            .as_ref()
+                            .map(|c| c.pre_compaction_entry_count)
+                            .unwrap_or(0),
+                        details,
                         None, // from_hook
                     );
                 }
@@ -2087,12 +2098,18 @@ impl Session {
                 SessionEntry::ThinkingLevelChange(tl) => SessionEventPayload::ThinkingLevelChange {
                     thinking_level: tl.thinking_level.clone(),
                 },
-                SessionEntry::Compaction(c) => SessionEventPayload::Compaction {
-                    summary: c.summary.clone(),
-                    compacted_entry_count: 0,
-                    original_message_count: 0,
-                    continuity: c.details.clone(),
-                },
+                SessionEntry::Compaction(c) => {
+                    // Attempt to parse typed continuity from the CompactionEntry details.
+                    let typed_continuity = c.details.as_ref().and_then(|v| {
+                        crate::contracts::dto::CompactionContinuity::deserialize(v).ok()
+                    });
+                    SessionEventPayload::Compaction {
+                        summary: c.summary.clone(),
+                        compacted_entry_count: 0,
+                        original_message_count: 0,
+                        continuity: typed_continuity,
+                    }
+                }
                 SessionEntry::BranchSummary(bs) => SessionEventPayload::BranchSummary {
                     summary: bs.summary.clone(),
                     from_leaf_id: Some(bs.from_id.clone()),

@@ -426,11 +426,33 @@ pub enum SessionEventPayload {
         compacted_entry_count: u64,
         #[serde(default)]
         original_message_count: u64,
-        continuity: Option<serde_json::Value>,
+        /// Typed compaction continuity state. When present, replaces the
+        /// legacy ad hoc `continuity: Option<Value>` blob with a structured
+        /// record that can be deterministically replayed on resume.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuity: Option<CompactionContinuity>,
     },
     BranchSummary {
         summary: String,
         from_leaf_id: Option<String>,
+    },
+    /// Records the activation of a single skill during the session.
+    SkillActivation {
+        skill_name: String,
+        source: SkillSource,
+        file_path: String,
+        #[serde(default)]
+        disable_model_invocation: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Records the complete active skill set at a point in session time.
+    /// Emitted when skills are loaded or when the skill set changes.
+    SkillActivationSnapshot {
+        #[serde(default)]
+        skills_disabled: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skills: Vec<SkillActivation>,
     },
     Label {
         label: String,
@@ -472,6 +494,161 @@ pub enum SessionEventPayload {
     },
 }
 
+// ============================================================================
+// Continuity state: typed durable state that survives save, resume, fork,
+// and compaction without depending on prompt luck or ad hoc blobs.
+// ============================================================================
+
+/// Typed compaction continuity state persisted alongside compaction events.
+///
+/// This replaces the previous ad hoc `Option<serde_json::Value>` continuity
+/// field. The typed structure ensures that compaction context can be
+/// deterministically reconstructed on resume without relying on narrative
+/// summary text alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionContinuity {
+    /// Entry ID of the first entry retained after compaction.
+    /// Entries before this boundary were summarized and removed.
+    pub first_kept_entry_id: String,
+    /// The event ID of the leaf at the time of compaction.
+    /// Preserves branch identity across compaction boundaries.
+    pub compaction_leaf_event_id: String,
+    /// Total number of entries that existed before compaction.
+    pub pre_compaction_entry_count: u64,
+    /// Total message count before compaction.
+    pub pre_compaction_message_count: u64,
+    /// Number of entries removed by this compaction.
+    pub compacted_entry_count: u64,
+    /// Cumulative file tracking state carried forward for next compaction.
+    #[serde(default, skip_serializing_if = "CompactionFileTracking::is_empty")]
+    pub file_tracking: CompactionFileTracking,
+}
+
+/// Cumulative file tracking state persisted through compaction boundaries.
+///
+/// This ensures that progressive file tracking (read/modified files) survives
+/// compaction and resume, enabling the next compaction to make correct
+/// decisions based on the full history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionFileTracking {
+    /// Files read across the session lifetime (including pre-compaction).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_files: Vec<String>,
+    /// Files modified across the session lifetime (including pre-compaction).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified_files: Vec<String>,
+}
+
+impl CompactionFileTracking {
+    /// Returns true if both file lists are empty.
+    pub fn is_empty(&self) -> bool {
+        self.read_files.is_empty() && self.modified_files.is_empty()
+    }
+}
+
+/// Typed branch continuity state that survives save, resume, and fork.
+///
+/// The event store's parent_id links already provide the tree structure,
+/// but this typed struct captures the *semantic* branch identity needed
+/// for correct reconstruction without re-walking the entire event tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchContinuityState {
+    /// The current leaf event ID (active position in the tree).
+    pub leaf_event_id: String,
+    /// The root event ID (first event in the session).
+    pub root_event_id: Option<String>,
+    /// Whether the tree is strictly linear (no branching).
+    pub is_linear: bool,
+    /// All known branch head event IDs (entries that have children but
+    /// whose parent has multiple children — i.e., fork points).
+    /// Empty when the session is linear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branch_heads: Vec<String>,
+    /// Event IDs of fork points where the tree diverged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fork_points: Vec<String>,
+}
+
+/// A single skill activation record persisted as a session event.
+///
+/// When a skill is loaded during a session, a `SkillActivation` event is
+/// appended to the event store. This ensures that the active skill set
+/// survives compaction and resume as canonical typed state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillActivation {
+    /// Unique name of the skill (matches the skill file/directory name).
+    pub skill_name: String,
+    /// Source category where the skill was discovered.
+    pub source: SkillSource,
+    /// File path where the skill was loaded from.
+    pub file_path: String,
+    /// Whether the skill disables model invocation.
+    #[serde(default)]
+    pub disable_model_invocation: bool,
+    /// Description from the skill's frontmatter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Source category for a skill activation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillSource {
+    /// Loaded from the user's agent directory (~/.pi/skills).
+    User,
+    /// Loaded from the project's .pi/skills directory.
+    Project,
+    /// Loaded from an explicit --skill path argument.
+    Path,
+}
+
+/// The complete active skill set at a point in session time.
+///
+/// Emitted as a `SkillActivationSnapshot` event when the skill set changes,
+/// and reconstructed from the event store on resume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillActivationSet {
+    /// All currently active skill activations.
+    pub skills: Vec<SkillActivation>,
+    /// Whether the `--no-skills` flag was set (suppresses all skill loading).
+    #[serde(default)]
+    pub skills_disabled: bool,
+}
+
+/// Result of validating skill activations on session resume.
+///
+/// When a session is resumed and the event store contains skill activations,
+/// each referenced skill is validated against the currently available skills.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillActivationValidation {
+    /// Skills that were found and are still available.
+    pub found_skills: Vec<String>,
+    /// Skills that were in the activation set but are no longer available.
+    /// This triggers fail-closed behavior — the session cannot be used for
+    /// model invocation until the issue is resolved.
+    pub missing_skills: Vec<MissingSkill>,
+    /// Whether validation passed (all skills found, or no skills were active).
+    pub is_valid: bool,
+}
+
+/// A skill that was activated in the session but is missing on resume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingSkill {
+    /// The skill name that was activated.
+    pub skill_name: String,
+    /// The file path the skill was loaded from (may no longer exist).
+    pub expected_file_path: String,
+    /// The source category of the missing skill.
+    pub source: SkillSource,
+}
+
 /// Rebuildable projection of session state derived from the event store.
 ///
 /// Projections are *never* co-equal truth. They are derived from the
@@ -497,6 +674,18 @@ pub struct SessionProjection {
     pub current_thinking_level: Option<String>,
     /// The event store offset this projection was built from.
     pub built_from_offset: u64,
+    /// Typed branch continuity state derived from the event tree.
+    /// None when the session has no events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_continuity: Option<BranchContinuityState>,
+    /// The most recent compaction continuity state from the latest compaction
+    /// event. None when no compaction has occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_continuity: Option<CompactionContinuity>,
+    /// The active skill set derived from SkillActivation and
+    /// SkillActivationSnapshot events. None when no skills were activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_activations: Option<SkillActivationSet>,
 }
 
 /// Result of validating a legacy session store for migration/import.
