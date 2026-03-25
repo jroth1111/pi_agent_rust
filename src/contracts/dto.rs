@@ -103,6 +103,24 @@ pub enum QueueMode {
     OneAtATime,
 }
 
+impl QueueMode {
+    /// Convert from agent::QueueMode.
+    pub const fn from_agent(mode: crate::agent::QueueMode) -> Self {
+        match mode {
+            crate::agent::QueueMode::All => Self::All,
+            crate::agent::QueueMode::OneAtATime => Self::OneAtATime,
+        }
+    }
+
+    /// Convert to agent::QueueMode.
+    pub const fn to_agent(self) -> crate::agent::QueueMode {
+        match self {
+            Self::All => crate::agent::QueueMode::All,
+            Self::OneAtATime => crate::agent::QueueMode::OneAtATime,
+        }
+    }
+}
+
 /// Message queue kind.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

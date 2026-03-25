@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -98,6 +99,14 @@ impl Message {
     /// Convenience constructor: wraps an [`AssistantMessage`] in [`Arc`].
     pub fn assistant(msg: AssistantMessage) -> Self {
         Self::Assistant(Arc::new(msg))
+    }
+
+    /// Convenience constructor: creates a user message with text content.
+    pub fn user(content: String) -> Self {
+        Self::User(UserMessage {
+            content: UserContent::Text(content),
+            timestamp: Utc::now().timestamp_millis(),
+        })
     }
 
     /// Convenience constructor: wraps a [`ToolResultMessage`] in [`Arc`].

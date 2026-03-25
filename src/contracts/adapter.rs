@@ -14,6 +14,7 @@ use crate::contracts::engine::{
 };
 use crate::error::{Error, Result};
 use crate::services::reliability_service::ReliabilityService;
+use asupersync::Cx;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,6 +280,8 @@ pub struct TuiConversationAdapter {
     next_seq: AtomicU64,
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
+    agent: Arc<asupersync::sync::Mutex<crate::agent::Agent>>,
+    abort_handle: Arc<asupersync::sync::Mutex<Option<crate::agent::AbortHandle>>>,
 }
 
 impl TuiConversationAdapter {
@@ -288,6 +291,8 @@ impl TuiConversationAdapter {
         config_handle: Arc<Mutex<crate::config::Config>>,
         is_streaming: Arc<AtomicBool>,
         is_compacting: Arc<AtomicBool>,
+        agent: Arc<asupersync::sync::Mutex<crate::agent::Agent>>,
+        abort_handle: Arc<asupersync::sync::Mutex<Option<crate::agent::AbortHandle>>>,
     ) -> Self {
         Self {
             session_handle,
@@ -295,6 +300,8 @@ impl TuiConversationAdapter {
             next_seq: AtomicU64::new(1),
             is_streaming,
             is_compacting,
+            agent,
+            abort_handle,
         }
     }
 
@@ -347,40 +354,76 @@ impl ConversationContract for TuiConversationAdapter {
     }
 
     async fn queue_control(&self) -> Result<QueueControl> {
-        // TUI uses default one-at-a-time mode
-        Ok(QueueControl {
-            steering_mode: QueueMode::OneAtATime,
-            follow_up_mode: QueueMode::OneAtATime,
-            pending_steering: 0,
-            pending_follow_up: 0,
-        })
+        let cx = Cx::for_request();
+        let agent = self
+            .agent
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("agent lock failed: {e}")))?;
+        Ok(agent.queue_control())
     }
 
-    async fn set_queue_control(&self, _control: QueueControl) -> Result<()> {
-        // Queue control settings are not persisted in TUI mode
+    async fn set_queue_control(&self, control: QueueControl) -> Result<()> {
+        let cx = Cx::for_request();
+        let mut agent = self
+            .agent
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("agent lock failed: {e}")))?;
+        agent.set_queue_modes(
+            control.steering_mode.to_agent(),
+            control.follow_up_mode.to_agent(),
+        );
         Ok(())
     }
 
-    async fn enqueue_steering(&self, _message: String) -> Result<QueueEnqueueResult> {
-        // TUI handles steering via input queue
+    async fn enqueue_steering(&self, message: String) -> Result<QueueEnqueueResult> {
+        let cx = Cx::for_request();
+        let mut agent = self
+            .agent
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("agent lock failed: {e}")))?;
+        let msg = crate::model::Message::user(message);
+        let seq = agent.queue_steering(msg);
         Ok(QueueEnqueueResult {
-            seq: self.next_seq(),
+            seq,
             queue: QueueKind::Steering,
         })
     }
 
-    async fn enqueue_follow_up(&self, _message: String) -> Result<QueueEnqueueResult> {
-        // TUI handles follow-up via input queue
+    async fn enqueue_follow_up(&self, message: String) -> Result<QueueEnqueueResult> {
+        let cx = Cx::for_request();
+        let mut agent = self
+            .agent
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("agent lock failed: {e}")))?;
+        let msg = crate::model::Message::user(message);
+        let seq = agent.queue_follow_up(msg);
         Ok(QueueEnqueueResult {
-            seq: self.next_seq(),
+            seq,
             queue: QueueKind::FollowUp,
         })
     }
 
     async fn interrupt(&self, reason: InterruptReason) -> Result<InterruptResult> {
-        // TUI handles interrupt via abort handle
+        let cx = Cx::for_request();
+        let abort_guard = self
+            .abort_handle
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("abort_handle lock failed: {e}")))?;
+
+        let success = if let Some(handle) = abort_guard.as_ref() {
+            handle.abort();
+            true
+        } else {
+            false
+        };
+
         Ok(InterruptResult {
-            success: true,
+            success,
             reason,
             cancelled_count: 0,
         })

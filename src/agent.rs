@@ -529,6 +529,21 @@ impl Agent {
         self.message_queue.pending_count()
     }
 
+    /// Get the current queue control state (modes and pending counts).
+    #[must_use]
+    pub fn queue_control(&self) -> crate::contracts::dto::QueueControl {
+        crate::contracts::dto::QueueControl {
+            steering_mode: crate::contracts::dto::QueueMode::from_agent(
+                self.message_queue.steering_mode,
+            ),
+            follow_up_mode: crate::contracts::dto::QueueMode::from_agent(
+                self.message_queue.follow_up_mode,
+            ),
+            pending_steering: self.message_queue.steering.len(),
+            pending_follow_up: self.message_queue.follow_up.len(),
+        }
+    }
+
     pub fn provider(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.provider)
     }
