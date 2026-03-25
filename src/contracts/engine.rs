@@ -4,8 +4,10 @@
 //! depend on while keeping engine-owned behavior behind typed boundaries.
 
 use crate::contracts::dto::{
-    ContextPack, InterruptReason, InterruptResult, ModelControl, PersistenceSnapshot, QueueControl,
-    QueueEnqueueResult, SessionIdentity, WorkerLaunchEnvelope, WorkerRuntimeKind,
+    ContextPack, InterruptReason, InterruptResult, LegacyImportRequest, LegacyStoreRole,
+    LegacyStoreValidation, ModelControl, PersistenceSnapshot, PersistenceStoreKind, QueueControl,
+    QueueEnqueueResult, SessionEvent, SessionEventPayload, SessionIdentity, SessionProjection,
+    WorkerLaunchEnvelope, WorkerRuntimeKind,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -200,12 +202,90 @@ pub trait WorkerRuntimeContract: Send + Sync {
 }
 
 /// Contract for session/workflow persistence.
+///
+/// This is the **single authoritative persistence boundary** for session
+/// state. After cutover, all session writes flow through this contract and
+/// all reads are served from rebuildable projections.
+///
+/// Legacy store access (JSONL, SQLite, V2 sidecar) is restricted to
+/// import/export/migration/inspection roles via explicit role-gated methods.
 #[async_trait]
 pub trait PersistenceContract: Send + Sync {
+    // -- Health and observability --
+
     async fn snapshot(&self) -> Result<PersistenceSnapshot>;
     async fn is_healthy(&self) -> bool;
     async fn rebuild_projections(&self) -> Result<()>;
     async fn last_persisted_offset(&self) -> u64;
     async fn pending_mutations(&self) -> usize;
     async fn flush(&self) -> Result<()>;
+
+    // -- Authoritative session event store operations --
+
+    /// Create a new session in the event store. Returns the session ID.
+    async fn create_session(&self, session_id: String) -> Result<String>;
+
+    /// Append an event to the authoritative session event store.
+    /// Returns the assigned sequence number.
+    async fn append_event(
+        &self,
+        session_id: &str,
+        payload: SessionEventPayload,
+        parent_event_id: Option<String>,
+    ) -> Result<u64>;
+
+    /// Get the current rebuildable session projection.
+    async fn session_projection(&self, session_id: &str) -> Result<SessionProjection>;
+
+    /// Read events from the session event store.
+    /// Returns events in sequence order from the given offset.
+    async fn read_events(
+        &self,
+        session_id: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<SessionEvent>>;
+
+    /// Read the active path (from root to current leaf) for a session.
+    async fn read_active_path(&self, session_id: &str) -> Result<Vec<SessionEvent>>;
+
+    /// Read the most recent N events (tail) for fast resume.
+    async fn read_tail(&self, session_id: &str, count: u64) -> Result<Vec<SessionEvent>>;
+
+    /// Compact a session by appending a compaction event.
+    /// The compaction summary and continuity metadata become a typed event.
+    async fn compact_session(
+        &self,
+        session_id: &str,
+        summary: String,
+        compacted_entry_count: u64,
+        original_message_count: u64,
+        continuity: Option<serde_json::Value>,
+    ) -> Result<u64>;
+
+    // -- Legacy store gating (import/export/migration/inspection only) --
+
+    /// Validate a legacy store for import/migration/inspection use.
+    /// Fails if the store would be used as a live authority.
+    async fn validate_legacy_store(
+        &self,
+        path: &str,
+        role: LegacyStoreRole,
+    ) -> Result<LegacyStoreValidation>;
+
+    /// Import a legacy session into the authoritative event store.
+    /// The legacy store is read-only during import; writes go only to the event store.
+    async fn import_legacy_session(&self, request: LegacyImportRequest) -> Result<String>;
+
+    /// Export a session from the event store to a legacy format.
+    /// The event store is read-only during export; writes go only to the legacy target.
+    async fn export_session(
+        &self,
+        session_id: &str,
+        target_kind: PersistenceStoreKind,
+        target_path: &str,
+    ) -> Result<()>;
+
+    /// List sessions available in the event store (projection-backed).
+    async fn list_sessions(&self) -> Result<Vec<SessionIdentity>>;
 }

@@ -359,6 +359,164 @@ pub enum PersistenceStoreKind {
     Jsonl,
     Sqlite,
     V2Sidecar,
+    /// The authoritative session event store (V2 segmented append log).
+    EventStore,
+}
+
+/// Role tag for legacy store access after cutover.
+///
+/// After the authoritative event store cutover, JSONL/SQLite paths must only
+/// be used under one of these explicitly-approved roles.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LegacyStoreRole {
+    /// Import data from a legacy format into the event store.
+    Import,
+    /// Export data from the event store into a legacy format.
+    Export,
+    /// One-time migration from a legacy format to the event store.
+    Migration,
+    /// Offline inspection (read-only) of a legacy format.
+    Inspection,
+}
+
+/// A persisted session event in the authoritative event store.
+///
+/// This wraps the existing `SessionEntry` types with event store metadata
+/// (sequence number, timestamps, checksums) that the store manages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvent {
+    /// Monotonically increasing sequence number within the session.
+    pub seq: u64,
+    /// Stable unique identifier for this event.
+    pub event_id: String,
+    /// Parent event ID for tree structure (null for root events).
+    pub parent_event_id: Option<String>,
+    /// The typed session entry payload.
+    pub payload: SessionEventPayload,
+    /// ISO 8601 timestamp when the event was appended.
+    pub timestamp: String,
+    /// SHA-256 checksum of the serialized payload for integrity.
+    pub payload_checksum: String,
+}
+
+/// Payload types for session events.
+///
+/// This mirrors the existing `SessionEntry` variants but as a flat-tagged
+/// union so the event store can persist them without coupling to the
+/// in-memory `Session` representation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEventPayload {
+    Message {
+        role: String,
+        content: serde_json::Value,
+    },
+    ModelChange {
+        provider: String,
+        model_id: String,
+    },
+    ThinkingLevelChange {
+        thinking_level: String,
+    },
+    Compaction {
+        summary: String,
+        #[serde(default)]
+        compacted_entry_count: u64,
+        #[serde(default)]
+        original_message_count: u64,
+        continuity: Option<serde_json::Value>,
+    },
+    BranchSummary {
+        summary: String,
+        from_leaf_id: Option<String>,
+    },
+    Label {
+        label: String,
+        target_entry_id: Option<String>,
+    },
+    SessionInfo {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Reliability/workflow entries stored as typed events.
+    ReliabilityStateDigest {
+        payload: serde_json::Value,
+    },
+    ReliabilityTaskCheckpoint {
+        payload: serde_json::Value,
+    },
+    ReliabilityTaskCreated {
+        payload: serde_json::Value,
+    },
+    ReliabilityTaskTransition {
+        payload: serde_json::Value,
+    },
+    ReliabilityVerificationEvidence {
+        payload: serde_json::Value,
+    },
+    ReliabilityCloseDecision {
+        payload: serde_json::Value,
+    },
+    ReliabilityHumanBlockerRaised {
+        payload: serde_json::Value,
+    },
+    ReliabilityHumanBlockerResolved {
+        payload: serde_json::Value,
+    },
+    /// Extension-defined structured payload.
+    Custom {
+        name: String,
+        payload: serde_json::Value,
+    },
+}
+
+/// Rebuildable projection of session state derived from the event store.
+///
+/// Projections are *never* co-equal truth. They are derived from the
+/// authoritative event store and can be fully rebuilt at any time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProjection {
+    /// The session identity this projection covers.
+    pub session_id: String,
+    /// Total number of events in the session.
+    pub event_count: u64,
+    /// The current leaf event ID (active position in the tree).
+    pub leaf_event_id: Option<String>,
+    /// Whether the tree is strictly linear (no branching).
+    pub is_linear: bool,
+    /// Total message count (user + assistant).
+    pub message_count: u64,
+    /// Most recent session name from SessionInfo entries.
+    pub session_name: Option<String>,
+    /// Current model and provider from the latest ModelChange event.
+    pub current_model: Option<ModelControl>,
+    /// Current thinking level from the latest ThinkingLevelChange event.
+    pub current_thinking_level: Option<String>,
+    /// The event store offset this projection was built from.
+    pub built_from_offset: u64,
+}
+
+/// Result of validating a legacy session store for migration/import.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyStoreValidation {
+    pub role: LegacyStoreRole,
+    pub source_kind: PersistenceStoreKind,
+    pub entry_count: u64,
+    pub is_valid: bool,
+    pub errors: Vec<String>,
+}
+
+/// Parameters for importing a legacy session into the event store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyImportRequest {
+    pub source_path: String,
+    pub source_kind: PersistenceStoreKind,
+    pub role: LegacyStoreRole,
 }
 
 /// Worker launch envelope handed from the workflow engine to a worker runtime.

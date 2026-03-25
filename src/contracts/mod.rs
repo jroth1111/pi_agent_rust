@@ -25,10 +25,11 @@ pub use dto::{
     AdmissionControl, AdmissionDecision, AdmissionGrant, ApprovalChoice, ApprovalControl,
     ApprovalDecision, ApprovalPrompt, ContextBudget, ContextFreshness, ContextPack,
     ContextProvenance, DurabilityMode, InferenceReceipt, InterruptControl, InterruptReason,
-    InterruptResult, ModelControl, ModelSelection, PersistenceSnapshot, PersistenceStoreKind,
-    QueueControl, QueueDrainResult, QueueEnqueueResult, QueueKind, QueueMode, ResourceRequest,
-    SessionControl, SessionIdentity, ThinkingLevel, WorkerLaunchEnvelope, WorkerRuntimeKind,
-    WorkloadClass, WorkspaceSnapshot,
+    InterruptResult, LegacyImportRequest, LegacyStoreRole, LegacyStoreValidation, ModelControl,
+    ModelSelection, PersistenceSnapshot, PersistenceStoreKind, QueueControl, QueueDrainResult,
+    QueueEnqueueResult, QueueKind, QueueMode, ResourceRequest, SessionControl, SessionEvent,
+    SessionEventPayload, SessionIdentity, SessionProjection, ThinkingLevel, WorkerLaunchEnvelope,
+    WorkerRuntimeKind, WorkloadClass, WorkspaceSnapshot,
 };
 pub use engine::{
     AppendEvidenceRequest, ConversationContract, DispatchOptions, LeaseGrant, PersistenceContract,

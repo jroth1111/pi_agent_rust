@@ -554,7 +554,6 @@ impl AutosaveQueue {
 // ============================================================================
 
 /// A session manages conversation state and persistence.
-#[derive(Debug)]
 pub struct Session {
     /// Session header
     pub header: SessionHeader,
@@ -604,6 +603,26 @@ pub struct Session {
     /// Offset to add to `cached_message_count` to account for messages not loaded in memory
     /// (e.g. when using V2 tail hydration).
     v2_message_count_offset: u64,
+    /// When set, all session writes route through this authoritative persistence
+    /// contract instead of the legacy JSONL/V2 direct paths. After cutover,
+    /// this is the single authoritative write path.
+    persistence: Option<std::sync::Arc<dyn crate::contracts::engine::PersistenceContract>>,
+    /// Tracks the event store sequence number for the last persisted entry.
+    /// Used when persistence is set to avoid re-appending already-persisted events.
+    event_store_seq: u64,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.header.id)
+            .field("entries", &self.entries.len())
+            .field("leaf_id", &self.leaf_id)
+            .field("path", &self.path)
+            .field("has_persistence", &self.persistence.is_some())
+            .field("event_store_seq", &self.event_store_seq)
+            .finish()
+    }
 }
 
 impl Clone for Session {
@@ -634,6 +653,8 @@ impl Clone for Session {
             v2_partial_hydration: self.v2_partial_hydration,
             v2_resume_mode: self.v2_resume_mode,
             v2_message_count_offset: self.v2_message_count_offset,
+            persistence: self.persistence.clone(),
+            event_store_seq: self.event_store_seq,
         }
     }
 }
@@ -1022,6 +1043,8 @@ impl Session {
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            persistence: None,
+            event_store_seq: 0,
         }
     }
 
@@ -1061,6 +1084,8 @@ impl Session {
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            persistence: None,
+            event_store_seq: 0,
         }
     }
 
@@ -1070,6 +1095,202 @@ impl Session {
         for warning in diagnostics.warning_lines() {
             eprintln!("{warning}");
         }
+        Ok(session)
+    }
+
+    /// Set the authoritative persistence contract for this session.
+    ///
+    /// When set, all `save()` calls route through the `PersistenceContract`
+    /// (the authoritative event store) instead of the legacy JSONL/V2 direct
+    /// paths. This is the session-authority cutover mechanism: once a session
+    /// has a persistence contract, legacy paths are no longer live authorities.
+    ///
+    /// The contract is also used for `open_from_event_store` to hydrate
+    /// session entries from the event store.
+    pub fn with_persistence(
+        mut self,
+        persistence: std::sync::Arc<dyn crate::contracts::engine::PersistenceContract>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Check whether this session routes writes through the authoritative
+    /// event store (PersistenceContract) rather than legacy paths.
+    pub fn has_authoritative_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Open a session from the authoritative event store.
+    ///
+    /// This creates a `Session` hydrated from the event store via the
+    /// `PersistenceContract`. All subsequent saves go through the same
+    /// contract, establishing it as the single authoritative write path.
+    ///
+    /// Returns an error if the session does not exist in the event store.
+    pub async fn open_from_event_store(
+        persistence: std::sync::Arc<dyn crate::contracts::engine::PersistenceContract>,
+        session_id: &str,
+    ) -> Result<Self> {
+        use crate::contracts::dto::SessionEventPayload;
+
+        // Read all events from the event store
+        let events = persistence.read_events(session_id, 1, u64::MAX).await?;
+
+        if events.is_empty() {
+            return Err(Error::session(format!(
+                "session {session_id} not found in event store"
+            )));
+        }
+
+        let mut session = Self::in_memory();
+        session.header.id = session_id.to_string();
+        session.persistence = Some(persistence);
+
+        // Reconstruct entries from events using append methods
+        // This ensures we go through the same code paths as normal operation
+        for event in &events {
+            match &event.payload {
+                SessionEventPayload::Message { role, content } => match role.as_str() {
+                    "user" => {
+                        let text = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        session.append_message(SessionMessage::User {
+                            content: UserContent::Text(text.to_string()),
+                            timestamp: None,
+                        });
+                    }
+                    "assistant" => {
+                        let text = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        session.append_message(SessionMessage::Assistant {
+                            message: AssistantMessage {
+                                content: vec![ContentBlock::Text(TextContent {
+                                    text: text.to_string(),
+                                    text_signature: None,
+                                })],
+                                api: content
+                                    .get("api")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                provider: content
+                                    .get("provider")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                model: content
+                                    .get("model")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                ..Default::default()
+                            },
+                        });
+                    }
+                    "tool_result" => {
+                        let tool_call_id = content
+                            .get("tool_call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let tool_name = content
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let tool_content = content
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        session.append_message(SessionMessage::ToolResult {
+                            tool_call_id: tool_call_id.to_string(),
+                            tool_name: tool_name.to_string(),
+                            content: vec![ContentBlock::Text(TextContent {
+                                text: tool_content.to_string(),
+                                text_signature: None,
+                            })],
+                            details: None,
+                            is_error: false,
+                            timestamp: None,
+                        });
+                    }
+                    other => {
+                        session.append_message(SessionMessage::Custom {
+                            custom_type: other.to_string(),
+                            content: serde_json::to_string(content).unwrap_or_default(),
+                            display: true,
+                            details: None,
+                            timestamp: None,
+                        });
+                    }
+                },
+                SessionEventPayload::ModelChange { provider, model_id } => {
+                    session.append_model_change(provider.clone(), model_id.clone());
+                }
+                SessionEventPayload::ThinkingLevelChange { thinking_level } => {
+                    session.append_thinking_level_change(thinking_level.clone());
+                }
+                SessionEventPayload::Compaction {
+                    summary,
+                    continuity,
+                    ..
+                } => {
+                    session.append_compaction(
+                        summary.clone(),
+                        String::new(), // first_kept_entry_id — not available in event
+                        0,             // tokens_before — not available in event
+                        continuity.clone(),
+                        None, // from_hook
+                    );
+                }
+                SessionEventPayload::BranchSummary {
+                    summary,
+                    from_leaf_id,
+                } => {
+                    session.append_branch_summary(
+                        from_leaf_id.as_deref().unwrap_or("").to_string(),
+                        summary.clone(),
+                        None, // details
+                        None, // from_hook
+                    );
+                }
+                SessionEventPayload::Label {
+                    label,
+                    target_entry_id,
+                } => {
+                    // Labels don't have a simple append method, use custom entry
+                    session.append_custom_entry(
+                        format!("label/{label}"),
+                        target_entry_id
+                            .as_ref()
+                            .map(|id| serde_json::json!({"label": label, "target_entry_id": id})),
+                    );
+                }
+                SessionEventPayload::SessionInfo { key, value } => {
+                    if key == "name" {
+                        let name = value.as_str().map(|s| s.to_string());
+                        session.append_session_info(name);
+                    } else {
+                        session.append_custom_entry(
+                            format!("session_info/{key}"),
+                            Some(value.clone()),
+                        );
+                    }
+                }
+                _ => {
+                    // Reliability and custom entries
+                    session.append_custom_entry(
+                        "event_store_entry".to_string(),
+                        Some(serde_json::to_value(&event.payload).unwrap_or(Value::Null)),
+                    );
+                }
+            }
+
+            session.event_store_seq = event.seq;
+        }
+
+        // Mark all entries as persisted since they came from the store
+        session
+            .persisted_entry_count
+            .store(session.entries.len(), Ordering::SeqCst);
+
         Ok(session)
     }
 
@@ -1206,6 +1427,8 @@ impl Session {
                 v2_partial_hydration: !matches!(mode, V2OpenMode::Full),
                 v2_resume_mode: Some(mode),
                 v2_message_count_offset,
+                persistence: None,
+                event_store_seq: 0,
             },
             diagnostics,
         ))
@@ -1271,6 +1494,8 @@ impl Session {
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            persistence: None,
+            event_store_seq: 0,
         })
     }
 
@@ -1529,6 +1754,19 @@ impl Session {
     async fn save_inner(&mut self) -> Result<()> {
         self.ensure_entry_ids();
 
+        // === Authoritative event store path ===
+        // When a PersistenceContract is set, ALL writes go through it.
+        // This is the single authoritative write path after cutover.
+        // Legacy JSONL/V2 paths below are only used when no contract is set
+        // (i.e., during migration/import scenarios).
+        if let Some(ref persistence) = self.persistence {
+            let contract = persistence.clone();
+            return self.save_to_event_store(contract.as_ref()).await;
+        }
+
+        // === Legacy persistence paths (migration/import only) ===
+        // These paths remain for backward compatibility during migration but
+        // are NOT live authorities when a PersistenceContract is set.
         let store_kind = match self
             .path
             .as_ref()
@@ -1796,6 +2034,95 @@ impl Session {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Save all new entries to the authoritative event store.
+    ///
+    /// This is the single authoritative write path when a PersistenceContract
+    /// is set. Only entries that haven't been persisted yet (i.e., entries
+    /// after `event_store_seq`) are appended.
+    async fn save_to_event_store(
+        &mut self,
+        persistence: &dyn crate::contracts::engine::PersistenceContract,
+    ) -> Result<()> {
+        use crate::contracts::dto::SessionEventPayload;
+
+        let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
+        if new_start >= self.entries.len() {
+            // No new entries to persist
+            return Ok(());
+        }
+
+        // Ensure the session exists in the event store
+        if self.event_store_seq == 0 && new_start == 0 {
+            persistence.create_session(self.header.id.clone()).await?;
+        }
+
+        // Append each new entry as an event
+        let new_entries = &self.entries[new_start..];
+        for entry in new_entries {
+            let base = entry.base();
+            let parent_event_id = base.parent_id.clone();
+
+            let payload = match entry {
+                SessionEntry::Message(msg) => {
+                    let role = match &msg.message {
+                        SessionMessage::User { .. } => "user",
+                        SessionMessage::Assistant { .. } => "assistant",
+                        SessionMessage::ToolResult { .. } => "tool_result",
+                        SessionMessage::BashExecution { .. } => "bash_execution",
+                        SessionMessage::Custom { custom_type, .. } => custom_type.as_str(),
+                        _ => "other",
+                    };
+                    SessionEventPayload::Message {
+                        role: role.to_string(),
+                        content: serde_json::to_value(&msg.message).unwrap_or(Value::Null),
+                    }
+                }
+                SessionEntry::ModelChange(mc) => SessionEventPayload::ModelChange {
+                    provider: mc.provider.clone(),
+                    model_id: mc.model_id.clone(),
+                },
+                SessionEntry::ThinkingLevelChange(tl) => SessionEventPayload::ThinkingLevelChange {
+                    thinking_level: tl.thinking_level.clone(),
+                },
+                SessionEntry::Compaction(c) => SessionEventPayload::Compaction {
+                    summary: c.summary.clone(),
+                    compacted_entry_count: 0,
+                    original_message_count: 0,
+                    continuity: c.details.clone(),
+                },
+                SessionEntry::BranchSummary(bs) => SessionEventPayload::BranchSummary {
+                    summary: bs.summary.clone(),
+                    from_leaf_id: Some(bs.from_id.clone()),
+                },
+                SessionEntry::Label(l) => SessionEventPayload::Label {
+                    label: l.label.clone().unwrap_or_default(),
+                    target_entry_id: Some(l.target_id.clone()),
+                },
+                SessionEntry::SessionInfo(si) => SessionEventPayload::SessionInfo {
+                    key: "name".to_string(),
+                    value: serde_json::to_value(si.name.as_deref().unwrap_or(""))
+                        .unwrap_or(Value::Null),
+                },
+                _ => SessionEventPayload::Custom {
+                    name: "session_entry".to_string(),
+                    payload: serde_json::to_value(entry).unwrap_or(Value::Null),
+                },
+            };
+
+            let seq = persistence
+                .append_event(&self.header.id, payload, parent_event_id)
+                .await?;
+            self.event_store_seq = seq;
+        }
+
+        self.persisted_entry_count
+            .store(self.entries.len(), Ordering::SeqCst);
+        self.header_dirty = false;
+        self.appends_since_checkpoint = 0;
+
         Ok(())
     }
 
@@ -4237,6 +4564,8 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            persistence: None,
+            event_store_seq: 0,
         },
         diagnostics,
     ))
