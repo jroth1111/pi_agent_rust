@@ -29,7 +29,7 @@
 )]
 
 use std::fmt::Write as _;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -66,8 +66,8 @@ use pi::surface::extension_runtime::{
     resolve_surface_extension_runtime_flavor, spawn_surface_extension_prewarm,
 };
 use pi::surface::startup::{
-    StartupResources, SurfaceSelectionOutcome, build_surface_agent_session,
-    load_model_registry_with_warning, load_surface_startup_resources, refresh_surface_startup_auth,
+    PreparedSurfaceInputs, StartupResources, SurfaceSelectionOutcome, build_surface_agent_session,
+    load_surface_startup_resources, prepare_surface_inputs, refresh_surface_startup_auth,
     resolve_surface_model_selection,
 };
 use pi::tui::PiConsole;
@@ -306,97 +306,6 @@ fn apply_cli_retry_override(config: &mut Config, cli: &cli::Cli) {
     config.retry = Some(retry);
 }
 
-struct PreparedSurfaceInputs {
-    global_dir: PathBuf,
-    models_path: PathBuf,
-    model_registry: ModelRegistry,
-    initial: Option<pi::app::InitialMessage>,
-    messages: Vec<String>,
-    surface_bootstrap: pi::surface::CliSurfaceBootstrap,
-    mode: String,
-    non_interactive_guard: Option<pi::surface::NonInteractiveGuard>,
-    scoped_patterns: Vec<String>,
-}
-
-async fn prepare_surface_inputs(
-    cli: &mut cli::Cli,
-    config: &Config,
-    auth: &AuthStorage,
-    cwd: &Path,
-) -> Result<Option<PreparedSurfaceInputs>> {
-    let global_dir = Config::global_dir();
-    let models_path = default_models_path(&global_dir);
-    let model_registry = load_model_registry_with_warning(auth, &models_path);
-    if let Some(pattern) = &cli.list_models {
-        list_models(&model_registry, pattern.as_deref());
-        return Ok(None);
-    }
-
-    if cli.mode.as_deref() != Some("rpc") {
-        let stdin_content = read_piped_stdin()?;
-        pi::app::apply_piped_stdin(cli, stdin_content);
-    }
-
-    // Auto-detect print mode: if the user passed positional message args (e.g. `pi "hello"`)
-    // or stdin was piped, run in non-interactive print mode automatically.
-    if !cli.print && cli.mode.is_none() && !cli.message_args().is_empty() {
-        cli.print = true;
-    }
-
-    pi::app::normalize_cli(cli);
-
-    if let Some(export_path) = cli.export.clone() {
-        let output = cli.message_args().first().map(ToString::to_string);
-        let output_path = pi::surface::export_session_html(&export_path, output.as_deref()).await?;
-        println!("Exported to: {}", output_path.display());
-        return Ok(None);
-    }
-
-    pi::app::validate_rpc_args(cli)?;
-
-    let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
-    let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
-    let initial = pi::app::prepare_initial_message(
-        cwd,
-        &file_args,
-        &mut messages,
-        config
-            .images
-            .as_ref()
-            .and_then(|i| i.auto_resize)
-            .unwrap_or(true),
-    )?;
-
-    let surface_bootstrap = pi::surface::CliSurfaceBootstrap::from_cli(
-        cli.mode.as_deref(),
-        cli.print,
-        cwd.to_path_buf(),
-        io::stdin().is_terminal(),
-        io::stdout().is_terminal(),
-        std::env::args().collect(),
-    )?;
-    let mode = surface_bootstrap.mode.clone();
-    let non_interactive_guard = surface_bootstrap.non_interactive_guard();
-
-    let scoped_patterns = if let Some(models_arg) = &cli.models {
-        pi::app::parse_models_arg(models_arg)
-    } else {
-        config.enabled_models.clone().unwrap_or_default()
-    };
-
-    Ok(Some(PreparedSurfaceInputs {
-        global_dir,
-        models_path,
-        model_registry,
-        initial,
-        messages,
-        surface_bootstrap,
-        mode,
-        non_interactive_guard,
-        scoped_patterns,
-    }))
-}
-
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -448,7 +357,7 @@ async fn run(
         mode,
         non_interactive_guard,
         scoped_patterns,
-    }) = prepare_surface_inputs(&mut cli, &config, &auth, &cwd).await?
+    }) = prepare_surface_inputs(&mut cli, &config, &auth, &cwd, list_models).await?
     else {
         return Ok(());
     };
@@ -2974,20 +2883,6 @@ async fn run_interactive_mode(
 }
 
 type InitialMessage = pi::app::InitialMessage;
-
-fn read_piped_stdin() -> Result<Option<String>> {
-    if io::stdin().is_terminal() {
-        return Ok(None);
-    }
-
-    let mut data = String::new();
-    io::stdin().read_to_string(&mut data)?;
-    if data.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(data))
-    }
-}
 
 fn format_token_count(count: u32) -> String {
     if count >= 1_000_000 {

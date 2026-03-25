@@ -5,6 +5,7 @@
 //! Lives in the surface layer because it is purely startup I/O coordination —
 //! no inference, session state, or business-rule ownership.
 
+use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -158,6 +159,18 @@ pub struct SurfaceSelectionResolution {
     pub resolved_key: Option<String>,
 }
 
+pub struct PreparedSurfaceInputs {
+    pub global_dir: PathBuf,
+    pub models_path: PathBuf,
+    pub model_registry: ModelRegistry,
+    pub initial: Option<crate::app::InitialMessage>,
+    pub messages: Vec<String>,
+    pub surface_bootstrap: crate::surface::CliSurfaceBootstrap,
+    pub mode: String,
+    pub non_interactive_guard: Option<crate::surface::NonInteractiveGuard>,
+    pub scoped_patterns: Vec<String>,
+}
+
 pub enum SurfaceSelectionOutcome {
     Selected(SurfaceSelectionResolution),
     ExitQuietly,
@@ -170,6 +183,102 @@ pub fn load_model_registry_with_warning(auth: &AuthStorage, models_path: &Path) 
         eprintln!("Warning: models.json error: {error}");
     }
     model_registry
+}
+
+fn read_piped_stdin() -> Result<Option<String>> {
+    if io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let mut data = String::new();
+    io::stdin().read_to_string(&mut data)?;
+    if data.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(data))
+    }
+}
+
+pub async fn prepare_surface_inputs<F>(
+    cli: &mut cli::Cli,
+    config: &Config,
+    auth: &AuthStorage,
+    cwd: &Path,
+    list_models: F,
+) -> Result<Option<PreparedSurfaceInputs>>
+where
+    F: FnOnce(&ModelRegistry, Option<&str>),
+{
+    let global_dir = Config::global_dir();
+    let models_path = crate::models::default_models_path(&global_dir);
+    let model_registry = load_model_registry_with_warning(auth, &models_path);
+    if let Some(pattern) = &cli.list_models {
+        list_models(&model_registry, pattern.as_deref());
+        return Ok(None);
+    }
+
+    if cli.mode.as_deref() != Some("rpc") {
+        let stdin_content = read_piped_stdin()?;
+        crate::app::apply_piped_stdin(cli, stdin_content);
+    }
+
+    if !cli.print && cli.mode.is_none() && !cli.message_args().is_empty() {
+        cli.print = true;
+    }
+
+    crate::app::normalize_cli(cli);
+
+    if let Some(export_path) = cli.export.clone() {
+        let output = cli.message_args().first().map(ToString::to_string);
+        let output_path =
+            crate::surface::export_session_html(&export_path, output.as_deref()).await?;
+        println!("Exported to: {}", output_path.display());
+        return Ok(None);
+    }
+
+    crate::app::validate_rpc_args(cli)?;
+
+    let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
+    let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
+    let initial = crate::app::prepare_initial_message(
+        cwd,
+        &file_args,
+        &mut messages,
+        config
+            .images
+            .as_ref()
+            .and_then(|i| i.auto_resize)
+            .unwrap_or(true),
+    )?;
+
+    let surface_bootstrap = crate::surface::CliSurfaceBootstrap::from_cli(
+        cli.mode.as_deref(),
+        cli.print,
+        cwd.to_path_buf(),
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        std::env::args().collect(),
+    )?;
+    let mode = surface_bootstrap.mode.clone();
+    let non_interactive_guard = surface_bootstrap.non_interactive_guard();
+
+    let scoped_patterns = if let Some(models_arg) = &cli.models {
+        crate::app::parse_models_arg(models_arg)
+    } else {
+        config.enabled_models.clone().unwrap_or_default()
+    };
+
+    Ok(Some(PreparedSurfaceInputs {
+        global_dir,
+        models_path,
+        model_registry,
+        initial,
+        messages,
+        surface_bootstrap,
+        mode,
+        non_interactive_guard,
+        scoped_patterns,
+    }))
 }
 
 /// Attempt to run interactive first-time setup to recover from a startup error.
