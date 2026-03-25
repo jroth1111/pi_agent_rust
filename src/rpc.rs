@@ -2014,14 +2014,26 @@ pub async fn run(
                         }
                     };
 
-                let evidence = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.append_evidence(req)
+                let session_identity = match current_session_identity(&cx, &session).await {
+                    Ok(identity) => identity,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "reliability.append_evidence",
+                            &err,
+                        ));
+                        continue;
+                    }
                 };
-                let evidence = match evidence {
+                let evidence = match append_evidence_record(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &session_identity,
+                    req,
+                )
+                .await
+                {
                     Ok(evidence) => evidence,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -2032,20 +2044,6 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_verification_evidence_entry(evidence.clone());
-                    }
-                    guard.persist_session().await?;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -2068,15 +2066,28 @@ pub async fn run(
                         }
                     };
 
-                let req_for_report = req.clone();
-                let result = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.submit_task(req)
+                let session_identity = match current_session_identity(&cx, &session).await {
+                    Ok(identity) => identity,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "reliability.submit_task",
+                            &err,
+                        ));
+                        continue;
+                    }
                 };
-                let result = match result {
+                let result = match submit_task_and_sync(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &session_identity,
+                    req,
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -2087,66 +2098,6 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_close_decision_entry(
-                            result.close_payload.clone(),
-                            result.close.clone(),
-                        );
-                        inner_session.append_task_transition_entry(
-                            result.task_id.clone(),
-                            None,
-                            result.state.clone(),
-                            None,
-                        );
-                    }
-                    guard.persist_session().await?;
-                }
-
-                let report = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    build_submit_task_report(&rel, &req_for_report, &result)
-                };
-                let report = match report {
-                    Ok(report) => report,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.submit_task",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                if let Err(err) = sync_task_runs(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &result.task_id,
-                    Some(report),
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "reliability.submit_task",
-                        &err,
-                    ));
-                    continue;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
