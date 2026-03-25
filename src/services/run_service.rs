@@ -1901,7 +1901,7 @@ struct TaskVerificationOutcome {
 }
 
 #[async_trait]
-trait OrchestrationInlineWorker: Send + Sync {
+pub(crate) trait OrchestrationInlineWorker: Send + Sync {
     async fn execute(&self, workspace_path: &Path, task: &TaskContract) -> Result<String>;
 }
 
@@ -2246,7 +2246,7 @@ struct CapturedDispatchExecution {
     verification: TaskVerificationOutcome,
 }
 
-fn dispatch_workspace_segment_id(grant: &DispatchGrant) -> usize {
+pub(crate) fn dispatch_workspace_segment_id(grant: &DispatchGrant) -> usize {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     grant.task_id.hash(&mut hasher);
     grant.lease_id.hash(&mut hasher);
@@ -2479,7 +2479,7 @@ async fn finalize_captured_dispatch_execution(
     current_run_status(cx, orchestration_state, run_store, run_id).await
 }
 
-async fn execute_inline_dispatch_grant_with_worker(
+pub(crate) async fn execute_inline_dispatch_grant_with_worker(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
@@ -2619,7 +2619,7 @@ async fn finalize_captured_dispatches(
     Ok(updated_run)
 }
 
-async fn execute_dispatch_grants_with_worker(
+pub(crate) async fn execute_dispatch_grants_with_worker(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,

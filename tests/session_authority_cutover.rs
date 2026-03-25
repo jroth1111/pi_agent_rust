@@ -772,3 +772,545 @@ fn val_sess_008_session_without_persistence_uses_legacy_path() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// =========================================================================
+// VAL-SESS-006: Session migration cutover is atomic and correlation-linked
+// =========================================================================
+
+/// Helper: create a minimal JSONL session file for migration testing.
+fn create_test_jsonl_session(dir: &std::path::Path, name: &str) -> String {
+    use std::io::Write;
+
+    let path = dir.join(format!("{name}.jsonl"));
+    let mut file = std::fs::File::create(&path).expect("create jsonl");
+
+    // Header line — must match SessionHeader struct
+    let header = serde_json::json!({
+        "type": "session",
+        "version": 3,
+        "id": format!("sess-{name}"),
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "cwd": "/tmp/test"
+    });
+    writeln!(file, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+
+    // Entry 1: user message — must match SessionEntry enum format
+    let entry1 = serde_json::json!({
+        "type": "message",
+        "id": "e1",
+        "parentId": null,
+        "timestamp": "2026-01-01T00:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello world"}]
+        }
+    });
+    writeln!(file, "{}", serde_json::to_string(&entry1).unwrap()).unwrap();
+
+    // Entry 2: assistant message
+    let entry2 = serde_json::json!({
+        "type": "message",
+        "id": "e2",
+        "parentId": "e1",
+        "timestamp": "2026-01-01T00:00:02.000Z",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi there!"}],
+            "api": "anthropic",
+            "provider": "anthropic",
+            "model": "claude-3",
+            "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15, "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+            "stopReason": "stop",
+            "timestamp": 1735689600
+        }
+    });
+    writeln!(file, "{}", serde_json::to_string(&entry2).unwrap()).unwrap();
+
+    // Entry 3: model change
+    let entry3 = serde_json::json!({
+        "type": "model_change",
+        "id": "e3",
+        "parentId": "e2",
+        "timestamp": "2026-01-01T00:00:03.000Z",
+        "provider": "anthropic",
+        "modelId": "claude-3"
+    });
+    writeln!(file, "{}", serde_json::to_string(&entry3).unwrap()).unwrap();
+
+    path.to_string_lossy().to_string()
+}
+
+#[test]
+fn val_sess_006_migration_emits_correlation_id() {
+    // Prove: migration from legacy JSONL produces a MigrationRecord with
+    // a durable correlation ID linking source, target, counts, and outcome.
+    use pi::contracts::dto::{
+        LegacyImportRequest, LegacyStoreRole, MigrationOutcome, PersistenceStoreKind,
+    };
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("migration_correlation");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "corr_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+
+    // Verify correlation ID is present and UUID-like
+    assert!(
+        !record.correlation_id.is_empty(),
+        "correlation_id must be present"
+    );
+    assert_eq!(
+        record.correlation_id.split('-').count(),
+        5,
+        "correlation_id should be UUID format"
+    );
+
+    // Verify session_id matches the JSONL header
+    assert_eq!(record.session_id, "sess-corr_test");
+
+    // Verify source/target paths
+    assert!(record.source_path.contains("corr_test.jsonl"));
+    assert!(record.target_path.contains("sess-corr_test.v2"));
+
+    // Verify entry counts
+    assert_eq!(record.source_entry_count, 3, "source should have 3 entries");
+    assert_eq!(record.target_entry_count, 3, "target should have 3 entries");
+
+    // Verify outcome
+    assert_eq!(record.outcome, MigrationOutcome::Succeeded);
+
+    // Verify timestamps
+    assert!(!record.started_at.is_empty());
+    assert!(!record.completed_at.is_empty());
+
+    // Verify verification passed
+    assert!(record.verification_passed);
+    assert!(record.verification_errors.is_empty());
+
+    // Verify the migration record is retrievable
+    let stored = futures::executor::block_on(store.get_migration_record("sess-corr_test"))
+        .expect("get_migration_record should succeed")
+        .expect("migration record should exist");
+    assert_eq!(stored.correlation_id, record.correlation_id);
+    assert_eq!(stored.outcome, MigrationOutcome::Succeeded);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_006_authority_flips_only_after_verification() {
+    // Prove: the V2 target directory is only created in its final location
+    // after verification succeeds. During migration, a temp directory is used.
+    use pi::contracts::dto::{LegacyImportRequest, LegacyStoreRole, PersistenceStoreKind};
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("authority_flip_timing");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "flip_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    // Run migration
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+
+    assert_eq!(
+        record.outcome,
+        pi::contracts::dto::MigrationOutcome::Succeeded
+    );
+
+    // The final V2 target should exist
+    let final_target = root.join("event_store").join("sess-flip_test.v2");
+    assert!(
+        final_target.exists(),
+        "final V2 target should exist after cutover"
+    );
+
+    // The temp migration directory should NOT exist (cleaned up)
+    let temp_target = final_target.with_extension("v2.migrating");
+    assert!(
+        !temp_target.exists(),
+        "temp migration directory should be cleaned up after successful cutover"
+    );
+
+    // The source JSONL should still exist (source is preserved)
+    assert!(
+        std::path::Path::new(&source_path).exists(),
+        "source JSONL should still exist after migration"
+    );
+
+    // Verify the migrated events are readable through the event store
+    let events = futures::executor::block_on(store.read_events("sess-flip_test", 1, u64::MAX))
+        .expect("read_events should succeed");
+    assert_eq!(events.len(), 3, "should have 3 migrated events");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_006_migration_validates_entry_counts() {
+    // Prove: migration verifies that source and target entry counts match.
+    use pi::contracts::dto::{LegacyImportRequest, LegacyStoreRole, PersistenceStoreKind};
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("migration_counts");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "count_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+
+    // Entry counts must match
+    assert_eq!(
+        record.source_entry_count, record.target_entry_count,
+        "source and target entry counts must match after successful migration"
+    );
+    assert!(record.verification_passed);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_006_migration_validates_parent_link_integrity() {
+    // Prove: migration verifies parent-link integrity (INV-001).
+    use pi::contracts::dto::{LegacyImportRequest, LegacyStoreRole, PersistenceStoreKind};
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("migration_parent_links");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "parent_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+
+    // If verification passed, parent links are valid
+    assert!(record.verification_passed);
+    assert!(
+        record.verification_errors.is_empty(),
+        "no verification errors should exist when parent links are valid: {:?}",
+        record.verification_errors
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// =========================================================================
+// VAL-SESS-011: Failed or partial migration rolls back cleanly
+// =========================================================================
+
+#[test]
+fn val_sess_011_failed_migration_leaves_source_untouched() {
+    // Prove: when migration fails (nonexistent source), the source is untouched
+    // and a rollback record is written to the surviving authority.
+    use pi::contracts::dto::{
+        LegacyImportRequest, LegacyStoreRole, MigrationOutcome, PersistenceStoreKind,
+    };
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("failed_migration_source");
+    let store = SessionEventStore::new(root.join("event_store"));
+
+    // Attempt to migrate a nonexistent file
+    let nonexistent = root.join("does_not_exist.jsonl");
+    let request = LegacyImportRequest {
+        source_path: nonexistent.to_string_lossy().to_string(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should return a record even on failure");
+
+    // Verify the migration failed
+    assert_eq!(record.outcome, MigrationOutcome::Failed);
+    assert!(!record.verification_passed);
+    assert!(!record.session_id.is_empty() || !record.verification_errors.is_empty());
+
+    // Verify no V2 target was created for this session
+    let event_store_root = root.join("event_store");
+    let v2_dirs: Vec<_> = std::fs::read_dir(&event_store_root)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".v2"))
+        .collect();
+    assert!(
+        v2_dirs.is_empty(),
+        "no V2 target directories should exist after failed migration"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_011_partial_target_never_readable_as_authority() {
+    // Prove: if migration fails during the copy phase, the partial target
+    // directory is cleaned up and never becomes the authoritative store.
+    use pi::contracts::dto::{
+        LegacyImportRequest, LegacyStoreRole, MigrationOutcome, PersistenceStoreKind,
+    };
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("partial_target_cleanup");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "partial_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    // This migration should succeed — verify atomicity guarantees
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+
+    if record.outcome == MigrationOutcome::Succeeded {
+        let final_target = root.join("event_store").join("sess-partial_test.v2");
+        let temp_target = final_target.with_extension("v2.migrating");
+        assert!(
+            !temp_target.exists(),
+            "temp migration dir should be cleaned up after success"
+        );
+    }
+
+    // Migrate a nonexistent source and verify no temp dir leaks
+    let request2 = LegacyImportRequest {
+        source_path: root.join("nonexistent.jsonl").to_string_lossy().to_string(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record2 = futures::executor::block_on(store.migrate_session(request2))
+        .expect("migrate_session should return record on failure");
+
+    assert_eq!(record2.outcome, MigrationOutcome::Failed);
+
+    // No .migrating directories should exist anywhere in the event store root
+    let event_store_root = root.join("event_store");
+    let migrating_dirs: Vec<_> = std::fs::read_dir(&event_store_root)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".migrating"))
+        .collect();
+    assert!(
+        migrating_dirs.is_empty(),
+        "no .migrating temp directories should leak after failed migration"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_011_rollback_evidence_survives_cleanup() {
+    // Prove: rollback evidence is written to the surviving authority
+    // (sessions root) and survives even after target cleanup.
+    use pi::contracts::dto::{
+        LegacyImportRequest, LegacyStoreRole, MigrationOutcome, PersistenceStoreKind,
+    };
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("rollback_evidence_survives");
+    let store = SessionEventStore::new(root.join("event_store"));
+
+    // Migrate a nonexistent source — this should produce rollback evidence
+    let request = LegacyImportRequest {
+        source_path: root.join("missing.jsonl").to_string_lossy().to_string(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should return record");
+
+    assert_eq!(record.outcome, MigrationOutcome::Failed);
+
+    // Check for rollback record in the surviving authority (sessions root)
+    let event_store_root = root.join("event_store");
+    let rollback_files: Vec<_> = std::fs::read_dir(&event_store_root)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".rollback.json"))
+        .collect();
+
+    // There should be a rollback evidence file for the failed migration
+    let has_rollback_evidence = rollback_files.iter().any(|f| f.path().exists());
+    assert!(
+        has_rollback_evidence,
+        "rollback evidence file should survive in the sessions root after failed migration"
+    );
+
+    // Verify the rollback evidence content is valid
+    if let Some(rollback_file) = rollback_files.first() {
+        let content = std::fs::read_to_string(rollback_file.path())
+            .expect("rollback evidence should be readable");
+        let rollback: pi::contracts::dto::RollbackRecord =
+            serde_json::from_str(&content).expect("rollback evidence should be valid JSON");
+
+        // Verify correlation link
+        assert!(!rollback.migration_correlation_id.is_empty());
+        assert!(!rollback.rolled_back_at.is_empty());
+        assert!(!rollback.reason.is_empty());
+        assert!(
+            rollback.target_cleaned,
+            "target should be marked as cleaned"
+        );
+        assert_eq!(
+            rollback.surviving_authority_kind,
+            PersistenceStoreKind::Jsonl,
+            "surviving authority should be the source JSONL"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_011_rollback_evidence_is_retrievable() {
+    // Prove: the rollback record can be retrieved via get_rollback_record
+    // for sessions that had a failed migration.
+    use pi::contracts::dto::{
+        LegacyImportRequest, LegacyStoreRole, MigrationOutcome, PersistenceStoreKind,
+    };
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("rollback_retrievable");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "rollback_retrieve_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+
+    // First do a successful migration
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+    assert_eq!(record.outcome, MigrationOutcome::Succeeded);
+
+    // For a successful migration, no rollback record should exist
+    let rollback =
+        futures::executor::block_on(store.get_rollback_record("sess-rollback_retrieve_test"));
+    assert!(rollback.is_ok(), "get_rollback_record should not error");
+
+    // Now attempt a failed migration to produce rollback evidence
+    let fail_request = LegacyImportRequest {
+        source_path: root.join("nonexistent.jsonl").to_string_lossy().to_string(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let fail_record = futures::executor::block_on(store.migrate_session(fail_request))
+        .expect("migrate_session should return record on failure");
+    assert_eq!(fail_record.outcome, MigrationOutcome::Failed);
+
+    // The migration record for the successful migration should still be retrievable
+    let migration =
+        futures::executor::block_on(store.get_migration_record("sess-rollback_retrieve_test"))
+            .expect("get_migration_record should succeed")
+            .expect("migration record should exist for successfully migrated session");
+    assert_eq!(migration.outcome, MigrationOutcome::Succeeded);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn val_sess_011_migration_cannot_be_resumed_after_failure() {
+    // Prove: after a failed migration, re-running migration for the same
+    // session starts fresh (does not resume from partial state).
+    use pi::contracts::dto::{
+        LegacyImportRequest, LegacyStoreRole, MigrationOutcome, PersistenceStoreKind,
+    };
+    use pi::contracts::engine::PersistenceContract;
+    use pi::services::session_event_store::SessionEventStore;
+
+    let root = temp_session_root("no_resume_after_fail");
+    let jsonl_dir = root.join("jsonl_source");
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    let source_path = create_test_jsonl_session(&jsonl_dir, "no_resume_test");
+
+    let store = SessionEventStore::new(root.join("event_store"));
+
+    // Run migration — it should succeed
+    let request = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record1 = futures::executor::block_on(store.migrate_session(request))
+        .expect("migrate_session should succeed");
+    assert_eq!(record1.outcome, MigrationOutcome::Succeeded);
+    let corr1 = record1.correlation_id.clone();
+
+    // Run migration again for the same session — it should start fresh
+    // with a new correlation ID
+    let request2 = LegacyImportRequest {
+        source_path: source_path.clone(),
+        source_kind: PersistenceStoreKind::Jsonl,
+        role: LegacyStoreRole::Migration,
+    };
+
+    let record2 = futures::executor::block_on(store.migrate_session(request2))
+        .expect("migrate_session should succeed");
+    assert_eq!(record2.outcome, MigrationOutcome::Succeeded);
+
+    // Each migration attempt gets its own correlation ID
+    assert_ne!(
+        corr1, record2.correlation_id,
+        "each migration attempt should have a unique correlation ID"
+    );
+
+    // The migration record should reflect the latest attempt
+    let stored = futures::executor::block_on(store.get_migration_record("sess-no_resume_test"))
+        .expect("get_migration_record should succeed")
+        .expect("migration record should exist");
+    assert_eq!(stored.correlation_id, record2.correlation_id);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

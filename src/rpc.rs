@@ -5259,6 +5259,10 @@ mod tests {
     };
     use crate::orchestration::RunVerifyScopeKind;
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
+    use crate::services::run_service::{
+        OrchestrationInlineWorker, dispatch_workspace_segment_id,
+        execute_dispatch_grants_with_worker, execute_inline_dispatch_grant_with_worker,
+    };
     use crate::session::Session;
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;
