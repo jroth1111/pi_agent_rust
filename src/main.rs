@@ -66,7 +66,8 @@ use pi::surface::extension_runtime::{
     resolve_surface_extension_runtime_flavor, spawn_surface_extension_prewarm,
 };
 use pi::surface::startup::{
-    SurfaceSelectionOutcome, build_surface_agent_session, load_model_registry_with_warning,
+    StartupResources, SurfaceSelectionOutcome, build_surface_agent_session,
+    load_model_registry_with_warning, load_surface_startup_resources, refresh_surface_startup_auth,
     resolve_surface_model_selection,
 };
 use pi::tui::PiConsole;
@@ -305,13 +306,6 @@ fn apply_cli_retry_override(config: &mut Config, cli: &cli::Cli) {
     config.retry = Some(retry);
 }
 
-struct StartupResources {
-    config: Config,
-    resources: ResourceLoader,
-    auth: AuthStorage,
-    resource_cli: ResourceCliOptions,
-}
-
 struct PreparedSurfaceInputs {
     global_dir: PathBuf,
     models_path: PathBuf,
@@ -322,84 +316,6 @@ struct PreparedSurfaceInputs {
     mode: String,
     non_interactive_guard: Option<pi::surface::NonInteractiveGuard>,
     scoped_patterns: Vec<String>,
-}
-
-async fn load_startup_resources(
-    cli: &cli::Cli,
-    extension_flags: &[cli::ExtensionCliFlag],
-    cwd: &Path,
-) -> Result<StartupResources> {
-    let mut config = Config::load()?;
-    if let Some(theme_spec) = cli.theme.as_deref() {
-        // Theme already validated above.
-        config.theme = Some(theme_spec.to_string());
-    }
-    apply_cli_retry_override(&mut config, cli);
-    spawn_session_index_maintenance();
-
-    let package_manager = PackageManager::new(cwd.to_path_buf());
-    let resource_cli = ResourceCliOptions {
-        no_skills: cli.no_skills,
-        no_prompt_templates: cli.no_prompt_templates,
-        no_extensions: cli.no_extensions,
-        no_themes: cli.no_themes,
-        skill_paths: cli.skill.clone(),
-        prompt_paths: cli.prompt_template.clone(),
-        extension_paths: cli.extension.clone(),
-        theme_paths: cli.theme_path.clone(),
-    };
-
-    let auth_path = Config::auth_path();
-    let (resources_result, auth_result) = futures::future::join(
-        ResourceLoader::load(&package_manager, cwd, &config, &resource_cli),
-        AuthStorage::load_async(auth_path),
-    )
-    .await;
-
-    let resources = match resources_result {
-        Ok(resources) => resources,
-        Err(err) => {
-            eprintln!("Warning: Failed to load skills/prompts: {err}");
-            ResourceLoader::empty(config.enable_skill_commands())
-        }
-    };
-
-    if !extension_flags.is_empty() && resources.extensions().is_empty() {
-        let rendered = extension_flags
-            .iter()
-            .map(cli::ExtensionCliFlag::display_name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(pi::error::Error::validation(format!(
-            "Extension flags were provided ({rendered}), but no extensions are loaded. \
-             Add extensions via --extension or remove the flags."
-        ))
-        .into());
-    }
-
-    Ok(StartupResources {
-        config,
-        resources,
-        auth: auth_result?,
-        resource_cli,
-    })
-}
-
-async fn refresh_startup_auth(auth: &mut AuthStorage) -> Result<()> {
-    auth.refresh_expired_oauth_tokens().await?;
-
-    // Prune stale credentials that are well past expiry and lack refresh metadata.
-    // 7-day cutoff (in milliseconds).
-    let pruned = auth.prune_stale_credentials(7 * 24 * 60 * 60 * 1000);
-    if !pruned.is_empty() {
-        tracing::info!(
-            pruned_providers = ?pruned,
-            "Pruned stale credentials during startup"
-        );
-        auth.save()?;
-    }
-
-    Ok(())
 }
 
 async fn prepare_surface_inputs(
@@ -501,12 +417,13 @@ async fn run(
         }
     }
 
+    spawn_session_index_maintenance();
     let StartupResources {
         config,
         resources,
         mut auth,
         resource_cli,
-    } = load_startup_resources(&cli, &extension_flags, &cwd).await?;
+    } = load_surface_startup_resources(&cli, &extension_flags, &cwd).await?;
     let extension_runtime_flavor = resolve_surface_extension_runtime_flavor(&resources)?;
 
     // Pre-warm extension runtime in a background task so startup work can overlap
@@ -519,7 +436,7 @@ async fn run(
         extension_runtime_flavor,
     );
 
-    refresh_startup_auth(&mut auth).await?;
+    refresh_surface_startup_auth(&mut auth).await?;
     let package_dir = Config::package_dir();
     let Some(PreparedSurfaceInputs {
         global_dir,
