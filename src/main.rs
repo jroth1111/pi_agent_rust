@@ -42,7 +42,6 @@ use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
-use pi::app::StartupError;
 use pi::auth::AuthStorage;
 use pi::cli;
 use pi::compaction::ResolvedCompactionSettings;
@@ -72,8 +71,7 @@ use pi::surface::extension_policy::{
 };
 use pi::surface::extension_runtime::activate_extensions_for_session;
 use pi::surface::startup::{
-    NonInteractiveStartupRequirement, SurfaceStartupLoopAction, load_model_registry_with_warning,
-    recover_surface_startup_error_for_selection,
+    SurfaceSelectionOutcome, load_model_registry_with_warning, resolve_surface_model_selection,
 };
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
@@ -665,107 +663,26 @@ async fn run(
     else {
         return Ok(());
     };
-    let mut scoped_models = if scoped_patterns.is_empty() {
-        Vec::new()
-    } else {
-        pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
-    };
-
-    if cli.api_key.is_some()
-        && cli.provider.is_none()
-        && cli.model.is_none()
-        && scoped_models.is_empty()
-    {
-        bail!("--api-key requires a model to be specified via --provider/--model or --models");
-    }
-
     let mut session = Box::pin(Session::new(&cli, &config)).await?;
 
-    let (selection, resolved_key) = loop {
-        scoped_models = if scoped_patterns.is_empty() {
-            Vec::new()
-        } else {
-            pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
-        };
-
-        let selection = match pi::app::select_model_and_thinking(
-            &cli,
-            &config,
-            &session,
-            &model_registry,
-            &scoped_models,
-            &global_dir,
-        ) {
-            Ok(selection) => selection,
-            Err(err) => {
-                if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    match recover_surface_startup_error_for_selection(
-                        &surface_bootstrap,
-                        non_interactive_guard.as_ref(),
-                        startup,
-                        &mut auth,
-                        &mut cli,
-                        &models_path,
-                        &mut model_registry,
-                        NonInteractiveStartupRequirement::Tty("first-time setup"),
-                    )
-                    .await?
-                    {
-                        SurfaceStartupLoopAction::ContinueSelection => continue,
-                        SurfaceStartupLoopAction::ExitQuietly => return Ok(()),
-                        SurfaceStartupLoopAction::Propagate => {}
-                    }
-                }
-                return Err(err);
-            }
-        };
-
-        match pi::app::resolve_api_key(&auth, &cli, &selection.model_entry) {
-            Ok(key) => {
-                break (selection, key);
-            }
-            Err(err) => {
-                if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    if let StartupError::MissingApiKey { provider } = startup {
-                        let canonical_provider =
-                            pi::provider_metadata::canonical_provider_id(provider)
-                                .unwrap_or(provider.as_str());
-                        if canonical_provider == "sap-ai-core" {
-                            if let Some(token) = pi::auth::exchange_sap_access_token(&auth).await? {
-                                break (selection, Some(token));
-                            }
-                        }
-                    }
-
-                    let non_interactive_requirement = match startup {
-                        StartupError::MissingApiKey { provider } => {
-                            NonInteractiveStartupRequirement::OAuth(provider)
-                        }
-                        StartupError::NoModelsAvailable { .. } => {
-                            NonInteractiveStartupRequirement::None
-                        }
-                    };
-
-                    match recover_surface_startup_error_for_selection(
-                        &surface_bootstrap,
-                        non_interactive_guard.as_ref(),
-                        startup,
-                        &mut auth,
-                        &mut cli,
-                        &models_path,
-                        &mut model_registry,
-                        non_interactive_requirement,
-                    )
-                    .await?
-                    {
-                        SurfaceStartupLoopAction::ContinueSelection => continue,
-                        SurfaceStartupLoopAction::ExitQuietly => return Ok(()),
-                        SurfaceStartupLoopAction::Propagate => {}
-                    }
-                }
-                return Err(err);
-            }
+    let (selection, resolved_key) = match resolve_surface_model_selection(
+        &surface_bootstrap,
+        non_interactive_guard.as_ref(),
+        &mut auth,
+        &mut cli,
+        &models_path,
+        &mut model_registry,
+        &scoped_patterns,
+        &global_dir,
+        &config,
+        &session,
+    )
+    .await?
+    {
+        SurfaceSelectionOutcome::Selected(resolution) => {
+            (resolution.selection, resolution.resolved_key)
         }
+        SurfaceSelectionOutcome::ExitQuietly => return Ok(()),
     };
 
     pi::app::update_session_for_selection(&mut session, &selection);
@@ -3468,7 +3385,8 @@ mod tests {
             name: "dry-run".to_string(),
             value: None,
         };
-        let value = coerce_extension_flag_value(&flag, "bool").expect("coerce bool");
+        let value = pi::surface::extension_runtime::coerce_extension_flag_value(&flag, "bool")
+            .expect("coerce bool");
         assert_eq!(value, Value::Bool(true));
     }
 
@@ -3478,7 +3396,8 @@ mod tests {
             name: "dry-run".to_string(),
             value: Some("maybe".to_string()),
         };
-        let err = coerce_extension_flag_value(&flag, "bool").expect_err("invalid bool should fail");
+        let err = pi::surface::extension_runtime::coerce_extension_flag_value(&flag, "bool")
+            .expect_err("invalid bool should fail");
         assert!(err.to_string().contains("Invalid boolean value"));
     }
 
