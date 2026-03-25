@@ -1,22 +1,29 @@
+use crate::agent::AgentSession;
+use crate::agent_cx::AgentCx;
 use crate::config::ReliabilityEnforcementMode;
 use crate::error::{Error, Result};
+use crate::orchestration::RunStore;
 use crate::reliability;
 use crate::reliability::ArtifactStore;
 use crate::rpc::{
-    AppendEvidenceRequest, ClosePayload, DispatchGrant, EvidenceRecord, RpcReliabilityState,
-    StateDigest, SubmitTaskRequest, SubmitTaskResponse, TaskContract,
+    AppendEvidenceRequest, ArtifactQuery, BlockerReport, ClosePayload, DispatchGrant,
+    EvidenceRecord, RpcOrchestrationState, RpcReliabilityState, StateDigest, SubmitTaskRequest,
+    SubmitTaskResponse, TaskContract,
 };
+use crate::services::run_service;
+use asupersync::sync::Mutex as AsyncMutex;
 use chrono::SecondsFormat;
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 
 pub(crate) struct ReliabilityService {
-    state: Arc<Mutex<RpcReliabilityState>>,
+    state: Arc<StdMutex<RpcReliabilityState>>,
 }
 
 impl ReliabilityService {
     #[must_use]
-    pub(crate) const fn new(state: Arc<Mutex<RpcReliabilityState>>) -> Self {
+    pub(crate) const fn new(state: Arc<StdMutex<RpcReliabilityState>>) -> Self {
         Self { state }
     }
 
@@ -66,6 +73,183 @@ impl ReliabilityService {
             .lock()
             .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
         Ok(state.first_task_id())
+    }
+
+    pub(crate) async fn request_dispatch_and_sync(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<AsyncMutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        contract: &TaskContract,
+        agent_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<DispatchGrant> {
+        let grant = {
+            let mut state = reliability_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+            Self::request_dispatch(&mut state, contract, agent_id, ttl_seconds)?
+        };
+
+        run_service::append_dispatch_grants_session_entries(
+            cx,
+            session,
+            reliability_state,
+            &[grant.clone()],
+        )
+        .await?;
+        run_service::sync_task_runs(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            &grant.task_id,
+            None,
+        )
+        .await?;
+
+        Ok(grant)
+    }
+
+    pub(crate) async fn resolve_blocker_and_sync(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<AsyncMutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        report: BlockerReport,
+    ) -> Result<String> {
+        let task_id_for_note = report.task_id.clone();
+        let raised = !report.resolved;
+        let state = {
+            let mut reliability = reliability_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+            Self::resolve_blocker(&mut reliability, report)?
+        };
+
+        {
+            let mut guard = session
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+            {
+                let mut inner_session =
+                    guard.session.lock(cx).await.map_err(|err| {
+                        Error::session(format!("inner session lock failed: {err}"))
+                    })?;
+                if raised {
+                    inner_session.append_human_blocker_raised_entry(
+                        task_id_for_note.clone(),
+                        "raised via rpc.resolve_blocker".to_string(),
+                        format!("state={state}"),
+                    );
+                } else {
+                    inner_session.append_human_blocker_resolved_entry(
+                        task_id_for_note.clone(),
+                        format!("state={state}"),
+                    );
+                }
+            }
+            guard.persist_session().await?;
+        }
+
+        let summary = if raised {
+            format!("Human blocker raised: state={state}")
+        } else {
+            format!("Blocker resolved: state={state}")
+        };
+        let task_report = {
+            let reliability = reliability_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+            run_service::build_runtime_task_report(&reliability, &task_id_for_note, summary)
+        };
+        run_service::sync_task_runs(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            &task_id_for_note,
+            task_report,
+        )
+        .await?;
+
+        Ok(state)
+    }
+
+    pub(crate) async fn query_artifact_text(
+        cx: &AgentCx,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        artifact_id: &str,
+    ) -> Result<String> {
+        let state = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        Self::load_artifact_text(&state, artifact_id)
+    }
+
+    pub(crate) async fn query_artifact_ids(
+        cx: &AgentCx,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        query: ArtifactQuery,
+    ) -> Result<Vec<String>> {
+        let state = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        Self::query_artifact(&state, query)
+    }
+
+    pub(crate) async fn get_state_digest_and_record(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        requested_task_id: Option<String>,
+    ) -> Result<StateDigest> {
+        let digest = {
+            let mut state = reliability_state
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+            let task_id = if let Some(task_id) = requested_task_id {
+                task_id
+            } else if let Some(task_id) = state.first_task_id() {
+                task_id
+            } else {
+                return Err(Error::validation("No reliability tasks available"));
+            };
+            Self::get_state_digest_state(&mut state, &task_id)?
+        };
+
+        let mut guard = session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        {
+            let mut inner_session = guard
+                .session
+                .lock(cx)
+                .await
+                .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+            inner_session.append_state_digest_entry(digest.clone());
+            inner_session.append_custom_entry(
+                "workflow_mutation_identity".to_string(),
+                Some(json!({
+                    "mutation": "reliability.get_state_digest",
+                    "objective": digest.objective.clone(),
+                })),
+            );
+        }
+        guard.persist_session().await?;
+        Ok(digest)
     }
 
     pub(crate) async fn validate_fence(&self, lease_id: &str, fence_token: u64) -> Result<bool> {

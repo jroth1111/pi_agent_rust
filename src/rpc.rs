@@ -1928,14 +1928,18 @@ pub async fn run(
                     .and_then(Value::as_i64)
                     .unwrap_or(3600);
 
-                let grant = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.request_dispatch(&contract, agent_id, lease_ttl_sec)
-                };
-                let grant = match grant {
+                let grant = match ReliabilityService::request_dispatch_and_sync(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &contract,
+                    agent_id,
+                    lease_ttl_sec,
+                )
+                .await
+                {
                     Ok(grant) => grant,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -1946,52 +1950,6 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_task_created_entry(
-                            contract.task_id.clone(),
-                            contract.objective,
-                            Some(agent_id.to_string()),
-                        );
-                        inner_session.append_task_transition_entry(
-                            contract.task_id,
-                            None,
-                            grant.state.clone(),
-                            Some(json!({
-                                "leaseId": grant.lease_id,
-                                "fenceToken": grant.fence_token,
-                            })),
-                        );
-                    }
-                    guard.persist_session().await?;
-                }
-
-                if let Err(err) = sync_task_runs(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &grant.task_id,
-                    None,
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "reliability.request_dispatch",
-                        &err,
-                    ));
-                    continue;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -2119,16 +2077,16 @@ pub async fn run(
                             continue;
                         }
                     };
-                let task_id_for_note = report.task_id.clone();
-                let raised = !report.resolved;
-                let state = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.resolve_blocker(report)
-                };
-                let state = match state {
+                let state = match ReliabilityService::resolve_blocker_and_sync(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    report,
+                )
+                .await
+                {
                     Ok(state) => state,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -2140,62 +2098,6 @@ pub async fn run(
                     }
                 };
 
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        if raised {
-                            inner_session.append_human_blocker_raised_entry(
-                                task_id_for_note.clone(),
-                                "raised via rpc.resolve_blocker".to_string(),
-                                format!("state={state}"),
-                            );
-                        } else {
-                            inner_session.append_human_blocker_resolved_entry(
-                                task_id_for_note.clone(),
-                                format!("state={state}"),
-                            );
-                        }
-                    }
-                    guard.persist_session().await?;
-                }
-
-                let report = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    let summary = if raised {
-                        format!("Human blocker raised: state={state}")
-                    } else {
-                        format!("Blocker resolved: state={state}")
-                    };
-                    build_runtime_task_report(&rel, &task_id_for_note, summary)
-                };
-                if let Err(err) = sync_task_runs(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &task_id_for_note,
-                    report,
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "reliability.resolve_blocker",
-                        &err,
-                    ));
-                    continue;
-                }
-
                 let _ = out_tx.send(response_ok(
                     id,
                     "reliability.resolve_blocker",
@@ -2206,12 +2108,12 @@ pub async fn run(
             "reliability.query_artifact" => {
                 let payload = command_payload(&parsed);
                 if let Some(artifact_id) = payload.get("artifactId").and_then(Value::as_str) {
-                    let content = {
-                        let rel = reliability_state.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("reliability lock failed: {err}"))
-                        })?;
-                        rel.load_artifact_text(artifact_id)
-                    };
+                    let content = ReliabilityService::query_artifact_text(
+                        &cx,
+                        &reliability_state,
+                        artifact_id,
+                    )
+                    .await;
                     match content {
                         Ok(content) => {
                             let _ = out_tx.send(response_ok(
@@ -2246,13 +2148,8 @@ pub async fn run(
                             continue;
                         }
                     };
-                let ids = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    rel.query_artifact(query)
-                };
+                let ids =
+                    ReliabilityService::query_artifact_ids(&cx, &reliability_state, query).await;
                 match ids {
                     Ok(ids) => {
                         let _ = out_tx.send(response_ok(
@@ -2285,26 +2182,14 @@ pub async fn run(
                         }
                     };
 
-                let digest = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    let task_id = if let Some(task_id) = req.task_id.clone() {
-                        task_id
-                    } else if let Some(task_id) = rel.first_task_id() {
-                        task_id
-                    } else {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "reliability.get_state_digest",
-                            "No reliability tasks available".to_string(),
-                        ));
-                        continue;
-                    };
-                    rel.get_state_digest(&task_id)
-                };
-                let digest = match digest {
+                let digest = match ReliabilityService::get_state_digest_and_record(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    req.task_id,
+                )
+                .await
+                {
                     Ok(digest) => digest,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -2315,20 +2200,6 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_state_digest_entry(digest.clone());
-                    }
-                    guard.persist_session().await?;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
