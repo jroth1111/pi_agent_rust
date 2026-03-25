@@ -1256,7 +1256,7 @@ pub(crate) async fn start_run(
         for contract in &req.tasks {
             ReliabilityService::reconcile_prerequisites(&mut rel, contract)?;
         }
-        rel.refresh_dependency_states();
+        ReliabilityService::refresh_dependency_states(&mut rel);
         refresh_run_from_reliability(&rel, &mut status);
     }
 
@@ -1607,13 +1607,18 @@ pub(crate) fn dispatch_run_wave(
     let mut grants = Vec::with_capacity(dispatchable_task_ids.len());
     for task_id in dispatchable_task_ids {
         let agent_id = format!("{agent_id_prefix}:{task_id}");
-        match reliability.request_dispatch_existing(&task_id, &agent_id, lease_ttl_sec) {
+        match ReliabilityService::request_dispatch_existing_state(
+            reliability,
+            &task_id,
+            &agent_id,
+            lease_ttl_sec,
+        ) {
             Ok(grant) => grants.push(grant),
             Err(err) => {
                 for grant in &grants {
-                    let _ = reliability.expire_dispatch_grant(grant);
+                    let _ = ReliabilityService::expire_dispatch_grant(reliability, grant);
                 }
-                reliability.refresh_dependency_states();
+                ReliabilityService::refresh_dependency_states(reliability);
                 refresh_run_from_reliability(reliability, run);
                 return Err(err);
             }
@@ -1653,10 +1658,10 @@ pub(crate) fn cancel_live_run_tasks(
         .collect::<Vec<_>>();
 
     for grant in &leased_grants {
-        let _ = reliability.expire_dispatch_grant(grant);
+        let _ = ReliabilityService::expire_dispatch_grant(reliability, grant);
     }
 
-    reliability.refresh_dependency_states();
+    ReliabilityService::refresh_dependency_states(reliability);
     refresh_run_from_reliability(reliability, run);
     run.lifecycle = RunLifecycle::Canceled;
     run.active_wave = None;
@@ -1671,7 +1676,7 @@ pub(crate) fn build_cancel_run_task_report(
     task_id: &str,
 ) -> Option<TaskReport> {
     let task = reliability.tasks.get(task_id)?;
-    let state = RpcReliabilityState::state_label(&task.runtime.state);
+    let state = ReliabilityService::state_label(&task.runtime.state);
     build_runtime_task_report(
         reliability,
         task_id,
@@ -1722,7 +1727,7 @@ pub(crate) fn apply_dispatch_rollback_recovery(
     grant: &crate::rpc::DispatchGrant,
     failure_summary: Option<&str>,
 ) -> String {
-    let _ = reliability.expire_dispatch_grant(grant);
+    let _ = ReliabilityService::expire_dispatch_grant(reliability, grant);
 
     let fallback_state = "ready".to_string();
     let rollback_state = {
@@ -1754,14 +1759,14 @@ pub(crate) fn apply_dispatch_rollback_recovery(
             }
         }
 
-        RpcReliabilityState::state_label(&task.runtime.state).to_string()
+        ReliabilityService::state_label(&task.runtime.state).to_string()
     };
 
-    reliability.refresh_dependency_states();
+    ReliabilityService::refresh_dependency_states(reliability);
     reliability
         .tasks
         .get(&grant.task_id)
-        .map(|task| RpcReliabilityState::state_label(&task.runtime.state).to_string())
+        .map(|task| ReliabilityService::state_label(&task.runtime.state).to_string())
         .unwrap_or(rollback_state)
 }
 
@@ -1848,7 +1853,7 @@ pub(crate) async fn append_canceled_dispatch_grants_session_entries(
                     (
                         grant.task_id.clone(),
                         grant.state.clone(),
-                        RpcReliabilityState::state_label(&task.runtime.state).to_string(),
+                        ReliabilityService::state_label(&task.runtime.state).to_string(),
                         grant.lease_id.clone(),
                         grant.fence_token,
                     )

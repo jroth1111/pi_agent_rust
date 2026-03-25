@@ -72,7 +72,7 @@ impl ReliabilityService {
             .state
             .lock()
             .map_err(|e| Error::session(format!("reliability lock failed: {e}")))?;
-        Ok(state.first_task_id())
+        Ok(state.tasks.keys().next().cloned())
     }
 
     pub(crate) async fn request_dispatch_and_sync(
@@ -326,7 +326,7 @@ impl ReliabilityService {
                 .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
             let task_id = if let Some(task_id) = requested_task_id {
                 task_id
-            } else if let Some(task_id) = state.first_task_id() {
+            } else if let Some(task_id) = state.tasks.keys().next().cloned() {
                 task_id
             } else {
                 return Err(Error::validation("No reliability tasks available"));
@@ -384,6 +384,14 @@ impl ReliabilityService {
 
     pub(crate) const fn mode_blocks(state: &RpcReliabilityState) -> bool {
         matches!(state.enforcement_mode, ReliabilityEnforcementMode::Hard)
+    }
+
+    pub(crate) fn ensure_enabled_state(state: &RpcReliabilityState) -> Result<()> {
+        if state.enabled {
+            Ok(())
+        } else {
+            Err(Error::validation("Reliability is disabled in config"))
+        }
     }
 
     pub(crate) fn is_synthetic_trace_parent(trace_parent: &str) -> bool {
@@ -726,11 +734,11 @@ impl ReliabilityService {
         agent_id: &str,
         ttl_seconds: i64,
     ) -> Result<DispatchGrant> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
         let task_id = contract.task_id.clone();
         Self::get_or_create_task(state, contract)?;
-        state.reconcile_prerequisites(contract)?;
-        state.refresh_dependency_states();
+        Self::reconcile_prerequisites(state, contract)?;
+        Self::refresh_dependency_states(state);
         Self::request_dispatch_existing_state(state, &task_id, agent_id, ttl_seconds)
     }
 
@@ -740,8 +748,8 @@ impl ReliabilityService {
         agent_id: &str,
         ttl_seconds: i64,
     ) -> Result<DispatchGrant> {
-        state.ensure_enabled()?;
-        let waiting_on = state.project_waiting_on_for_task(task_id);
+        Self::ensure_enabled_state(state)?;
+        let waiting_on = Self::project_waiting_on_for_task(state, task_id);
         if !waiting_on.is_empty() {
             return Err(Error::validation(format!(
                 "task {task_id} is blocked by prerequisites: {}",
@@ -814,7 +822,7 @@ impl ReliabilityService {
         state: &mut RpcReliabilityState,
         grant: &DispatchGrant,
     ) -> Result<()> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
         let _ = state.leases.expire_lease(&grant.lease_id);
         let Some(task) = state.tasks.get_mut(&grant.task_id) else {
             return Ok(());
@@ -835,7 +843,7 @@ impl ReliabilityService {
         state: &mut RpcReliabilityState,
         req: AppendEvidenceRequest,
     ) -> Result<EvidenceRecord> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
 
         let mut artifact_ids = req.artifact_ids;
         if !req.stdout.is_empty() {
@@ -874,7 +882,7 @@ impl ReliabilityService {
         state: &mut RpcReliabilityState,
         req: SubmitTaskRequest,
     ) -> Result<SubmitTaskResponse> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
         let SubmitTaskRequest {
             task_id,
             lease_id,
@@ -1009,7 +1017,7 @@ impl ReliabilityService {
             Self::state_label(&task.runtime.state).to_string()
         };
         let _ = state.leases.expire_lease(&lease_id_for_release);
-        state.refresh_dependency_states();
+        Self::refresh_dependency_states(state);
         if let Some(task) = state.tasks.get(&task_id) {
             state_label = Self::state_label(&task.runtime.state).to_string();
         }
@@ -1094,7 +1102,7 @@ impl ReliabilityService {
         state: &mut RpcReliabilityState,
         report: crate::rpc::BlockerReport,
     ) -> Result<String> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
         let is_defer = report.reason.trim().eq_ignore_ascii_case("defer");
         let report_reason = report.reason.clone();
         let report_context = report.context.clone();
@@ -1171,7 +1179,7 @@ impl ReliabilityService {
         state: &RpcReliabilityState,
         query: crate::rpc::ArtifactQuery,
     ) -> Result<Vec<String>> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
         state
             .artifacts
             .list(&query)
@@ -1182,7 +1190,7 @@ impl ReliabilityService {
         state: &RpcReliabilityState,
         artifact_id: &str,
     ) -> Result<String> {
-        state.ensure_enabled()?;
+        Self::ensure_enabled_state(state)?;
         let bytes = state
             .artifacts
             .load(artifact_id)
@@ -1194,8 +1202,8 @@ impl ReliabilityService {
         state: &mut RpcReliabilityState,
         task_id: &str,
     ) -> Result<StateDigest> {
-        state.ensure_enabled()?;
-        state.refresh_dependency_states();
+        Self::ensure_enabled_state(state)?;
+        Self::refresh_dependency_states(state);
         let Some(task) = state.tasks.get(task_id) else {
             return Err(Error::validation(format!(
                 "Unknown reliability task: {task_id}"

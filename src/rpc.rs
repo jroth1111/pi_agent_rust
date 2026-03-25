@@ -25,13 +25,13 @@ use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
-use crate::orchestration::{RunStatus, RunStore, RunVerifyStatus, WaveStatus};
+use crate::orchestration::{RunStatus, RunStore};
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
 use crate::resources::ResourceLoader;
 use crate::services::reliability_service::ReliabilityService;
-use crate::services::run_service::{self, CompletedRunVerifyScope};
+use crate::services::run_service;
 use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
@@ -42,7 +42,7 @@ use memchr::memchr_iter;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,7 +54,11 @@ use crate::contracts::dto::SessionIdentity;
 #[cfg(test)]
 use crate::orchestration::ExecutionTier;
 #[cfg(test)]
-use crate::orchestration::{RunLifecycle, SubrunPlan, TaskReport};
+use crate::orchestration::{RunLifecycle, RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus};
+#[cfg(test)]
+use crate::services::run_service::CompletedRunVerifyScope;
+#[cfg(test)]
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::Path;
 
@@ -386,14 +390,17 @@ impl RpcReliabilityState {
         self.leases.set_external_provider(provider);
     }
 
+    #[cfg(test)]
     const fn mode_blocks(&self) -> bool {
         ReliabilityService::mode_blocks(self)
     }
 
+    #[cfg(test)]
     fn is_synthetic_trace_parent(trace_parent: &str) -> bool {
         ReliabilityService::is_synthetic_trace_parent(trace_parent)
     }
 
+    #[cfg(test)]
     fn validate_close_trace_chain(
         &self,
         task_id: &str,
@@ -402,6 +409,7 @@ impl RpcReliabilityState {
         ReliabilityService::validate_close_trace_chain(self, task_id, close_payload)
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure_enabled(&self) -> Result<()> {
         if self.enabled {
             Ok(())
@@ -410,10 +418,12 @@ impl RpcReliabilityState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn state_label(state: &reliability::RuntimeState) -> &'static str {
         ReliabilityService::state_label(state)
     }
 
+    #[cfg(test)]
     fn get_or_create_task(
         &mut self,
         contract: &TaskContract,
@@ -421,10 +431,12 @@ impl RpcReliabilityState {
         ReliabilityService::get_or_create_task(self, contract)
     }
 
+    #[cfg(test)]
     fn task_counts_for(&self, task_ids: &[String]) -> BTreeMap<String, usize> {
         ReliabilityService::task_counts_for(self, task_ids)
     }
 
+    #[cfg(test)]
     fn trigger_satisfied(
         trigger: &reliability::EdgeTrigger,
         terminal: &reliability::TerminalState,
@@ -432,34 +444,42 @@ impl RpcReliabilityState {
         ReliabilityService::trigger_satisfied(trigger, terminal)
     }
 
+    #[cfg(test)]
     fn trigger_key(trigger: &reliability::EdgeTrigger) -> String {
         ReliabilityService::trigger_key(trigger)
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_prerequisites(&mut self, contract: &TaskContract) -> Result<()> {
         ReliabilityService::reconcile_prerequisites(self, contract)
     }
 
+    #[cfg(test)]
     fn waiting_on_for_task(&self, task_id: &str) -> Vec<String> {
         ReliabilityService::waiting_on_for_task(self, task_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn project_waiting_on_for_task(&mut self, task_id: &str) -> Vec<String> {
         ReliabilityService::project_waiting_on_for_task(self, task_id)
     }
 
+    #[cfg(test)]
     fn evaluate_dag_unblock(&mut self) -> reliability::DagEvaluation {
         ReliabilityService::evaluate_dag_unblock(self)
     }
 
+    #[cfg(test)]
     fn promote_recoverable_due(&mut self) -> Vec<reliability::RecoveryAction> {
         ReliabilityService::promote_recoverable_due(self)
     }
 
+    #[cfg(test)]
     pub(crate) fn refresh_dependency_states(&mut self) {
         ReliabilityService::refresh_dependency_states(self);
     }
 
+    #[cfg(test)]
     fn request_dispatch(
         &mut self,
         contract: &TaskContract,
@@ -469,6 +489,7 @@ impl RpcReliabilityState {
         ReliabilityService::request_dispatch(self, contract, agent_id, ttl_seconds)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_dispatch_existing(
         &mut self,
         task_id: &str,
@@ -478,34 +499,42 @@ impl RpcReliabilityState {
         ReliabilityService::request_dispatch_existing_state(self, task_id, agent_id, ttl_seconds)
     }
 
+    #[cfg(test)]
     pub(crate) fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
         ReliabilityService::expire_dispatch_grant(self, grant)
     }
 
+    #[cfg(test)]
     fn append_evidence(&mut self, req: AppendEvidenceRequest) -> Result<EvidenceRecord> {
         ReliabilityService::append_evidence_state(self, req)
     }
 
+    #[cfg(test)]
     fn submit_task(&mut self, req: SubmitTaskRequest) -> Result<SubmitTaskResponse> {
         ReliabilityService::submit_task_state(self, req)
     }
 
+    #[cfg(test)]
     fn resolve_blocker(&mut self, report: BlockerReport) -> Result<String> {
         ReliabilityService::resolve_blocker(self, report)
     }
 
+    #[cfg(test)]
     fn query_artifact(&self, query: ArtifactQuery) -> Result<Vec<String>> {
         ReliabilityService::query_artifact(self, query)
     }
 
+    #[cfg(test)]
     fn load_artifact_text(&self, artifact_id: &str) -> Result<String> {
         ReliabilityService::load_artifact_text(self, artifact_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn first_task_id(&self) -> Option<String> {
         self.tasks.keys().next().cloned()
     }
 
+    #[cfg(test)]
     fn get_state_digest(&mut self, task_id: &str) -> Result<StateDigest> {
         ReliabilityService::get_state_digest_state(self, task_id)
     }
@@ -609,6 +638,7 @@ where
         .map_err(|err| Error::validation(format!("Invalid payload for {command_type}: {err}")))
 }
 
+#[cfg(test)]
 async fn persist_run_status(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -618,6 +648,7 @@ async fn persist_run_status(
     run_service::persist_run_status(cx, session, run_store, status).await
 }
 
+#[cfg(test)]
 async fn append_dispatch_grants_session_entries(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -628,6 +659,7 @@ async fn append_dispatch_grants_session_entries(
         .await
 }
 
+#[cfg(test)]
 async fn append_canceled_dispatch_grants_session_entries(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -643,6 +675,7 @@ async fn append_canceled_dispatch_grants_session_entries(
     .await
 }
 
+#[cfg(test)]
 async fn append_dispatch_rollback_session_entry(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -723,14 +756,17 @@ fn select_execution_tier(tasks: &[TaskContract]) -> ExecutionTier {
     }
 }
 
+#[cfg(test)]
 fn task_terminal_success(reliability: &RpcReliabilityState, task_id: &str) -> bool {
     run_service::task_terminal_success(reliability, task_id)
 }
 
+#[cfg(test)]
 fn run_terminal_success(reliability: &RpcReliabilityState, run: &RunStatus) -> bool {
     run_service::run_terminal_success(reliability, run)
 }
 
+#[cfg(test)]
 fn completed_run_verify_scope(
     reliability: &RpcReliabilityState,
     run: &RunStatus,
@@ -738,18 +774,22 @@ fn completed_run_verify_scope(
     run_service::completed_run_verify_scope(reliability, run)
 }
 
+#[cfg(test)]
 fn should_skip_run_verify(run: &RunStatus, scope: &CompletedRunVerifyScope) -> bool {
     run_service::should_skip_run_verify(run, scope)
 }
 
+#[cfg(test)]
 fn completed_scope_from_run_verify(status: &RunVerifyStatus) -> CompletedRunVerifyScope {
     run_service::completed_scope_from_run_verify(status)
 }
 
+#[cfg(test)]
 fn apply_run_verify_lifecycle(run: &mut RunStatus) {
     run_service::apply_run_verify_lifecycle(run);
 }
 
+#[cfg(test)]
 fn next_active_wave(
     existing: Option<WaveStatus>,
     active_task_ids: Vec<String>,
