@@ -1716,7 +1716,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                let status = match run_service::start_run(
+                let data = match run_service::rpc_start_run(
                     &cx,
                     &session,
                     &reliability_state,
@@ -1727,7 +1727,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(status) => status,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -1737,12 +1737,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "orchestration.start_run",
-                    Some(json!({ "run": status })),
-                ));
+                let _ = out_tx.send(response_ok(id, "orchestration.start_run", Some(data)));
             }
 
             "orchestration.get_run" => {
@@ -1759,7 +1754,7 @@ pub async fn run(
                         }
                     };
 
-                let run = match run_service::get_run(
+                let data = match run_service::rpc_get_run(
                     &cx,
                     &session,
                     &reliability_state,
@@ -1769,7 +1764,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(run) => run,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -1779,11 +1774,7 @@ pub async fn run(
                         continue;
                     }
                 };
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "orchestration.get_run",
-                    Some(json!({ "run": run })),
-                ));
+                let _ = out_tx.send(response_ok(id, "orchestration.get_run", Some(data)));
             }
 
             "orchestration.dispatch_run" => {
@@ -1799,7 +1790,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                let (run, grants) = match run_service::dispatch_run(
+                let data = match run_service::rpc_dispatch_run(
                     &cx,
                     &session,
                     &reliability_state,
@@ -1810,7 +1801,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -1820,12 +1811,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "orchestration.dispatch_run",
-                    Some(json!({ "run": run, "grants": grants })),
-                ));
+                let _ = out_tx.send(response_ok(id, "orchestration.dispatch_run", Some(data)));
             }
 
             "orchestration.cancel_run" => {
@@ -1842,7 +1828,7 @@ pub async fn run(
                         }
                     };
 
-                let run = match run_service::cancel_run(
+                let data = match run_service::rpc_cancel_run(
                     &cx,
                     &session,
                     &reliability_state,
@@ -1852,7 +1838,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(run) => run,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -1862,12 +1848,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "orchestration.cancel_run",
-                    Some(json!({ "run": run })),
-                ));
+                let _ = out_tx.send(response_ok(id, "orchestration.cancel_run", Some(data)));
             }
 
             "orchestration.resume_run" => {
@@ -1884,7 +1865,7 @@ pub async fn run(
                         }
                     };
 
-                let run = match run_service::resume_run(
+                let data = match run_service::rpc_resume_run(
                     &cx,
                     &session,
                     &reliability_state,
@@ -1895,7 +1876,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(run) => run,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -1905,12 +1886,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "orchestration.resume_run",
-                    Some(json!({ "run": run })),
-                ));
+                let _ = out_tx.send(response_ok(id, "orchestration.resume_run", Some(data)));
             }
 
             "reliability.request_dispatch" => {
@@ -1940,7 +1916,7 @@ pub async fn run(
                     .and_then(Value::as_i64)
                     .unwrap_or(3600);
 
-                let grant = match ReliabilityService::request_dispatch_and_sync(
+                let data = match ReliabilityService::rpc_request_dispatch(
                     &cx,
                     &session,
                     &reliability_state,
@@ -1952,7 +1928,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(grant) => grant,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -1962,12 +1938,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.request_dispatch",
-                    Some(json!({ "grant": grant })),
-                ));
+                let _ = out_tx.send(response_ok(id, "reliability.request_dispatch", Some(data)));
             }
 
             "reliability.append_evidence" => {
@@ -1984,28 +1955,15 @@ pub async fn run(
                         }
                     };
 
-                let session_identity =
-                    match run_service::current_session_identity(&cx, &session).await {
-                        Ok(identity) => identity,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.append_evidence",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let evidence = match run_service::append_evidence_record(
+                let data = match ReliabilityService::rpc_append_evidence(
                     &cx,
                     &session,
                     &reliability_state,
-                    &session_identity,
                     req,
                 )
                 .await
                 {
-                    Ok(evidence) => evidence,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -2015,12 +1973,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.append_evidence",
-                    Some(json!({ "evidence": evidence })),
-                ));
+                let _ = out_tx.send(response_ok(id, "reliability.append_evidence", Some(data)));
             }
 
             "reliability.submit_task" => {
@@ -2037,30 +1990,17 @@ pub async fn run(
                         }
                     };
 
-                let session_identity =
-                    match run_service::current_session_identity(&cx, &session).await {
-                        Ok(identity) => identity,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.submit_task",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let result = match run_service::submit_task_and_sync(
+                let data = match ReliabilityService::rpc_submit_task(
                     &cx,
                     &session,
                     &reliability_state,
                     &orchestration_state,
                     &run_store,
-                    &session_identity,
                     req,
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -2070,12 +2010,7 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.submit_task",
-                    Some(json!({ "result": result })),
-                ));
+                let _ = out_tx.send(response_ok(id, "reliability.submit_task", Some(data)));
             }
 
             "reliability.resolve_blocker" => {
@@ -2091,7 +2026,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                let state = match ReliabilityService::resolve_blocker_and_sync(
+                let data = match ReliabilityService::rpc_resolve_blocker(
                     &cx,
                     &session,
                     &reliability_state,
@@ -2101,7 +2036,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(state) => state,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -2111,32 +2046,24 @@ pub async fn run(
                         continue;
                     }
                 };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.resolve_blocker",
-                    Some(json!({ "state": state })),
-                ));
+                let _ = out_tx.send(response_ok(id, "reliability.resolve_blocker", Some(data)));
             }
 
             "reliability.query_artifact" => {
                 let payload = command_payload(&parsed);
                 if let Some(artifact_id) = payload.get("artifactId").and_then(Value::as_str) {
-                    let content = ReliabilityService::query_artifact_text(
+                    match ReliabilityService::rpc_query_artifact_text(
                         &cx,
                         &reliability_state,
                         artifact_id,
                     )
-                    .await;
-                    match content {
-                        Ok(content) => {
+                    .await
+                    {
+                        Ok(data) => {
                             let _ = out_tx.send(response_ok(
                                 id,
                                 "reliability.query_artifact",
-                                Some(json!({
-                                    "artifactId": artifact_id,
-                                    "content": content,
-                                })),
+                                Some(data),
                             ));
                         }
                         Err(err) => {
@@ -2162,15 +2089,12 @@ pub async fn run(
                             continue;
                         }
                     };
-                let ids =
-                    ReliabilityService::query_artifact_ids(&cx, &reliability_state, query).await;
-                match ids {
-                    Ok(ids) => {
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "reliability.query_artifact",
-                            Some(json!({ "artifactIds": ids })),
-                        ));
+                match ReliabilityService::rpc_query_artifact_ids(&cx, &reliability_state, query)
+                    .await
+                {
+                    Ok(data) => {
+                        let _ =
+                            out_tx.send(response_ok(id, "reliability.query_artifact", Some(data)));
                     }
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
@@ -2196,7 +2120,7 @@ pub async fn run(
                         }
                     };
 
-                let digest = match ReliabilityService::get_state_digest_and_record(
+                let data = match ReliabilityService::rpc_get_state_digest(
                     &cx,
                     &session,
                     &reliability_state,
@@ -2204,7 +2128,7 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(digest) => digest,
+                    Ok(data) => data,
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
@@ -2215,11 +2139,7 @@ pub async fn run(
                     }
                 };
 
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "reliability.get_state_digest",
-                    Some(json!({ "digest": digest })),
-                ));
+                let _ = out_tx.send(response_ok(id, "reliability.get_state_digest", Some(data)));
             }
 
             "get_session_stats" => {

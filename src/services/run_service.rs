@@ -21,7 +21,7 @@ use crate::session::Session;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -1272,6 +1272,28 @@ pub(crate) async fn start_run(
     Ok(status)
 }
 
+pub(crate) async fn rpc_start_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    req: StartRunRequest,
+) -> Result<Value> {
+    let status = start_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        config,
+        req,
+    )
+    .await?;
+    Ok(json!({ "run": status }))
+}
+
 pub(crate) async fn get_run(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -1289,6 +1311,26 @@ pub(crate) async fn get_run(
         &req.run_id,
     )
     .await
+}
+
+pub(crate) async fn rpc_get_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    req: RunLookupRequest,
+) -> Result<Value> {
+    let run = get_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        req,
+    )
+    .await?;
+    Ok(json!({ "run": run }))
 }
 
 pub(crate) async fn dispatch_run(
@@ -1330,6 +1372,28 @@ pub(crate) async fn dispatch_run(
     .await?;
     persist_run_status(cx, session, run_store, &run).await?;
     Ok((run, grants))
+}
+
+pub(crate) async fn rpc_dispatch_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    req: DispatchRunRequest,
+) -> Result<Value> {
+    let (run, grants) = dispatch_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        config,
+        req,
+    )
+    .await?;
+    Ok(json!({ "run": run, "grants": grants }))
 }
 
 pub(crate) async fn cancel_run(
@@ -1382,6 +1446,26 @@ pub(crate) async fn cancel_run(
     }
     persist_run_status(cx, session, run_store, &run).await?;
     Ok(run)
+}
+
+pub(crate) async fn rpc_cancel_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    req: CancelRunRequest,
+) -> Result<Value> {
+    let run = cancel_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        req,
+    )
+    .await?;
+    Ok(json!({ "run": run }))
 }
 
 pub(crate) async fn resume_run(
@@ -1454,6 +1538,28 @@ pub(crate) async fn resume_run(
     }
     persist_run_status(cx, session, run_store, &run).await?;
     Ok(run)
+}
+
+pub(crate) async fn rpc_resume_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    req: RunLookupRequest,
+) -> Result<Value> {
+    let run = resume_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        config,
+        req,
+    )
+    .await?;
+    Ok(json!({ "run": run }))
 }
 
 pub(crate) const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);

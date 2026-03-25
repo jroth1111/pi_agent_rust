@@ -13,7 +13,7 @@ use crate::rpc::{
 use crate::services::run_service;
 use asupersync::sync::Mutex as AsyncMutex;
 use chrono::SecondsFormat;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -114,6 +114,30 @@ impl ReliabilityService {
         Ok(grant)
     }
 
+    pub(crate) async fn rpc_request_dispatch(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<AsyncMutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        contract: &TaskContract,
+        agent_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<Value> {
+        let grant = Self::request_dispatch_and_sync(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            contract,
+            agent_id,
+            ttl_seconds,
+        )
+        .await?;
+        Ok(json!({ "grant": grant }))
+    }
+
     pub(crate) async fn resolve_blocker_and_sync(
         cx: &AgentCx,
         session: &Arc<AsyncMutex<AgentSession>>,
@@ -184,6 +208,66 @@ impl ReliabilityService {
         Ok(state)
     }
 
+    pub(crate) async fn rpc_append_evidence(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        req: AppendEvidenceRequest,
+    ) -> Result<Value> {
+        let session_identity = run_service::current_session_identity(cx, session).await?;
+        let evidence = run_service::append_evidence_record(
+            cx,
+            session,
+            reliability_state,
+            &session_identity,
+            req,
+        )
+        .await?;
+        Ok(json!({ "evidence": evidence }))
+    }
+
+    pub(crate) async fn rpc_submit_task(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<AsyncMutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        req: SubmitTaskRequest,
+    ) -> Result<Value> {
+        let session_identity = run_service::current_session_identity(cx, session).await?;
+        let result = run_service::submit_task_and_sync(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            &session_identity,
+            req,
+        )
+        .await?;
+        Ok(json!({ "result": result }))
+    }
+
+    pub(crate) async fn rpc_resolve_blocker(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        orchestration_state: &Arc<AsyncMutex<RpcOrchestrationState>>,
+        run_store: &RunStore,
+        report: BlockerReport,
+    ) -> Result<Value> {
+        let state = Self::resolve_blocker_and_sync(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            report,
+        )
+        .await?;
+        Ok(json!({ "state": state }))
+    }
+
     pub(crate) async fn query_artifact_text(
         cx: &AgentCx,
         reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
@@ -196,6 +280,18 @@ impl ReliabilityService {
         Self::load_artifact_text(&state, artifact_id)
     }
 
+    pub(crate) async fn rpc_query_artifact_text(
+        cx: &AgentCx,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        artifact_id: &str,
+    ) -> Result<Value> {
+        let content = Self::query_artifact_text(cx, reliability_state, artifact_id).await?;
+        Ok(json!({
+            "artifactId": artifact_id,
+            "content": content,
+        }))
+    }
+
     pub(crate) async fn query_artifact_ids(
         cx: &AgentCx,
         reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
@@ -206,6 +302,15 @@ impl ReliabilityService {
             .await
             .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
         Self::query_artifact(&state, query)
+    }
+
+    pub(crate) async fn rpc_query_artifact_ids(
+        cx: &AgentCx,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        query: ArtifactQuery,
+    ) -> Result<Value> {
+        let ids = Self::query_artifact_ids(cx, reliability_state, query).await?;
+        Ok(json!({ "artifactIds": ids }))
     }
 
     pub(crate) async fn get_state_digest_and_record(
@@ -250,6 +355,18 @@ impl ReliabilityService {
         }
         guard.persist_session().await?;
         Ok(digest)
+    }
+
+    pub(crate) async fn rpc_get_state_digest(
+        cx: &AgentCx,
+        session: &Arc<AsyncMutex<AgentSession>>,
+        reliability_state: &Arc<AsyncMutex<RpcReliabilityState>>,
+        requested_task_id: Option<String>,
+    ) -> Result<Value> {
+        let digest =
+            Self::get_state_digest_and_record(cx, session, reliability_state, requested_task_id)
+                .await?;
+        Ok(json!({ "digest": digest }))
     }
 
     pub(crate) async fn validate_fence(&self, lease_id: &str, fence_token: u64) -> Result<bool> {
