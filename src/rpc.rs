@@ -28,8 +28,8 @@ use crate::model::{
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyScopeKind,
-    RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus,
+    ExecutionTier, FlockWorkspace, RunLifecycle, RunStatus, RunStore, RunVerifyStatus, SubrunPlan,
+    TaskReport, WaveStatus,
 };
 use crate::provider::Provider;
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
@@ -282,7 +282,7 @@ pub(crate) struct RpcOrchestrationState {
 }
 
 impl RpcOrchestrationState {
-    fn register_run(&mut self, run: RunStatus) {
+    pub(crate) fn register_run(&mut self, run: RunStatus) {
         self.update_task_run_index(&run.run_id, &run.task_ids);
         self.runs.insert(run.run_id.clone(), run);
     }
@@ -300,7 +300,7 @@ impl RpcOrchestrationState {
         self.task_runs.retain(|_, run_ids| !run_ids.is_empty());
     }
 
-    fn get_run(&self, run_id: &str) -> Option<RunStatus> {
+    pub(crate) fn get_run(&self, run_id: &str) -> Option<RunStatus> {
         self.runs.get(run_id).cloned()
     }
 
@@ -308,12 +308,12 @@ impl RpcOrchestrationState {
         self.runs.get_mut(run_id)
     }
 
-    fn update_run(&mut self, run: RunStatus) {
+    pub(crate) fn update_run(&mut self, run: RunStatus) {
         self.update_task_run_index(&run.run_id, &run.task_ids);
         self.runs.insert(run.run_id.clone(), run);
     }
 
-    fn run_ids_for_task(&self, task_id: &str) -> Vec<String> {
+    pub(crate) fn run_ids_for_task(&self, task_id: &str) -> Vec<String> {
         self.task_runs
             .get(task_id)
             .map(|ids| ids.iter().cloned().collect())
@@ -446,7 +446,7 @@ impl RpcReliabilityState {
     }
 
     pub(crate) fn refresh_dependency_states(&mut self) {
-        ReliabilityService::refresh_dependency_states(self)
+        ReliabilityService::refresh_dependency_states(self);
     }
 
     fn request_dispatch(
@@ -612,25 +612,7 @@ async fn persist_run_status(
     run_store: &RunStore,
     status: &RunStatus,
 ) -> Result<()> {
-    run_store.save(status)?;
-
-    let mut guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    {
-        let mut inner_session = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        inner_session.append_custom_entry(
-            "orchestration_run_status".to_string(),
-            Some(json!(status.clone())),
-        );
-    }
-    guard.persist_session().await?;
-    Ok(())
+    run_service::persist_run_status(cx, session, run_store, status).await
 }
 
 async fn append_dispatch_grants_session_entries(
@@ -937,7 +919,7 @@ fn completed_scope_from_run_verify(status: &RunVerifyStatus) -> CompletedRunVeri
 }
 
 fn apply_run_verify_lifecycle(run: &mut RunStatus) {
-    run_service::apply_run_verify_lifecycle(run)
+    run_service::apply_run_verify_lifecycle(run);
 }
 
 fn next_active_wave(
@@ -971,7 +953,7 @@ fn refresh_live_run_from_reliability(
 }
 
 fn refresh_run_from_reliability(reliability: &RpcReliabilityState, run: &mut RunStatus) {
-    run_service::refresh_run_from_reliability(reliability, run)
+    run_service::refresh_run_from_reliability(reliability, run);
 }
 
 fn dispatch_run_wave(
@@ -2302,21 +2284,7 @@ async fn session_workspace_root(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
 ) -> Result<PathBuf> {
-    let guard = session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    let inner = guard
-        .session
-        .lock(cx)
-        .await
-        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-    let cwd = inner.header.cwd.trim();
-    Ok(if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    } else {
-        PathBuf::from(cwd)
-    })
+    run_service::session_workspace_root(cx, session).await
 }
 
 async fn current_session_identity(
@@ -2453,66 +2421,7 @@ fn build_submit_task_report(
     req: &SubmitTaskRequest,
     result: &SubmitTaskResponse,
 ) -> Result<TaskReport> {
-    let task = reliability.tasks.get(&result.task_id).ok_or_else(|| {
-        Error::validation(format!("Unknown reliability task: {}", result.task_id))
-    })?;
-
-    let evidence = reliability
-        .evidence_by_task
-        .get(&result.task_id)
-        .cloned()
-        .unwrap_or_default();
-    let verify_exit_code = evidence
-        .last()
-        .map(|record| record.exit_code)
-        .unwrap_or_else(|| {
-            if req.verify_timed_out {
-                124
-            } else {
-                i32::from(!req.verify_passed.unwrap_or(result.close.approved))
-            }
-        });
-
-    let attempt = match &task.runtime.state {
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Succeeded { .. }) => {
-            task.runtime.attempt.saturating_add(1).max(1)
-        }
-        _ => task.runtime.attempt.max(1),
-    };
-    let summary = if result.close.approved {
-        result.close_payload.outcome.clone()
-    } else if result.close.violations.is_empty() {
-        format!("task {} closed without approval", result.task_id)
-    } else {
-        result.close.violations.join("; ")
-    };
-
-    let verify_command = match &task.spec.verify {
-        reliability::VerifyPlan::Standard { command, .. } => command.clone(),
-    };
-
-    Ok(TaskReport {
-        task_id: result.task_id.clone(),
-        attempt,
-        summary,
-        changed_files: req.changed_files.clone(),
-        patch_digest: req.patch_digest.clone(),
-        evidence_ids: result.close_payload.evidence_ids.clone(),
-        acceptance_ids: if result.close_payload.acceptance_ids.is_empty() {
-            task.spec.acceptance_ids.clone()
-        } else {
-            result.close_payload.acceptance_ids.clone()
-        },
-        verify_command,
-        verify_exit_code,
-        failure_class: runtime_failure_class_label(&task.runtime.state).or_else(|| {
-            req.failure_class
-                .map(|class| failure_class_label(class).to_string())
-        }),
-        blockers: task_report_blockers(&task.runtime.state),
-        workspace_snapshot: task.spec.input_snapshot.clone(),
-        generated_at: chrono::Utc::now(),
-    })
+    run_service::build_submit_task_report(reliability, req, result)
 }
 
 fn build_runtime_task_report(
@@ -2520,33 +2429,7 @@ fn build_runtime_task_report(
     task_id: &str,
     summary: String,
 ) -> Option<TaskReport> {
-    let task = reliability.tasks.get(task_id)?;
-    let evidence = reliability
-        .evidence_by_task
-        .get(task_id)
-        .cloned()
-        .unwrap_or_default();
-    let verify_command = match &task.spec.verify {
-        reliability::VerifyPlan::Standard { command, .. } => command.clone(),
-    };
-    Some(TaskReport {
-        task_id: task_id.to_string(),
-        attempt: task.runtime.attempt.max(1),
-        summary,
-        changed_files: Vec::new(),
-        patch_digest: String::new(),
-        evidence_ids: evidence
-            .iter()
-            .map(|record| record.evidence_id.clone())
-            .collect(),
-        acceptance_ids: task.spec.acceptance_ids.clone(),
-        verify_command,
-        verify_exit_code: evidence.last().map(|record| record.exit_code).unwrap_or(0),
-        failure_class: runtime_failure_class_label(&task.runtime.state),
-        blockers: task_report_blockers(&task.runtime.state),
-        workspace_snapshot: task.spec.input_snapshot.clone(),
-        generated_at: chrono::Utc::now(),
-    })
+    run_service::build_runtime_task_report(reliability, task_id, summary)
 }
 
 fn refresh_task_runs_with_verify_scopes(
@@ -2555,24 +2438,7 @@ fn refresh_task_runs_with_verify_scopes(
     task_id: &str,
     report: Option<&TaskReport>,
 ) -> Vec<(RunStatus, Option<CompletedRunVerifyScope>)> {
-    let run_ids = orchestration.run_ids_for_task(task_id);
-    let mut updated_runs = Vec::new();
-
-    for run_id in run_ids {
-        let Some(mut run) = orchestration.get_run(&run_id) else {
-            continue;
-        };
-        if let Some(report) = report.filter(|report| run.task_ids.contains(&report.task_id)) {
-            run.upsert_task_report(report.clone());
-        }
-        let verify_scope = completed_run_verify_scope(reliability, &run)
-            .filter(|scope| !should_skip_run_verify(&run, scope));
-        refresh_run_from_reliability(reliability, &mut run);
-        orchestration.update_run(run.clone());
-        updated_runs.push((run, verify_scope));
-    }
-
-    updated_runs
+    run_service::refresh_task_runs_with_verify_scopes(reliability, orchestration, task_id, report)
 }
 
 fn refresh_task_runs(
@@ -2581,10 +2447,7 @@ fn refresh_task_runs(
     task_id: &str,
     report: Option<TaskReport>,
 ) -> Vec<RunStatus> {
-    refresh_task_runs_with_verify_scopes(reliability, orchestration, task_id, report.as_ref())
-        .into_iter()
-        .map(|(run, _)| run)
-        .collect()
+    run_service::refresh_task_runs(reliability, orchestration, task_id, report)
 }
 
 fn run_verify_scope_summary(
@@ -2592,21 +2455,7 @@ fn run_verify_scope_summary(
     ok: bool,
     details: impl AsRef<str>,
 ) -> String {
-    let scope_label = match scope.scope_kind {
-        RunVerifyScopeKind::Run => "run",
-        RunVerifyScopeKind::Wave => "wave",
-        RunVerifyScopeKind::Subrun => "subrun",
-    };
-    let prefix = if ok {
-        "run verification passed"
-    } else {
-        "run verification failed"
-    };
-    format!(
-        "{prefix} for {scope_label} {}: {}",
-        scope.scope_id,
-        details.as_ref().trim()
-    )
+    run_service::run_verify_scope_summary(scope, ok, details)
 }
 
 async fn execute_run_verification(
@@ -2614,49 +2463,7 @@ async fn execute_run_verification(
     run: &mut RunStatus,
     scope: &CompletedRunVerifyScope,
 ) {
-    let timeout_sec = run.run_verify_timeout_sec.unwrap_or(60);
-    let verify_status =
-        match Verifier::execute_verify_command(cwd, &run.run_verify_command, timeout_sec).await {
-            Ok(execution) => {
-                let outcome = Verifier::classify_execution(&execution);
-                let details = if outcome.ok {
-                    format!(
-                        "exit_code={}, duration_ms={}",
-                        execution.exit_code, execution.duration_ms
-                    )
-                } else {
-                    outcome.violations.join("; ")
-                };
-                RunVerifyStatus {
-                    scope_id: scope.scope_id.clone(),
-                    scope_kind: scope.scope_kind,
-                    subrun_id: scope.subrun_id.clone(),
-                    command: execution.command,
-                    timeout_sec: execution.timeout_sec,
-                    exit_code: execution.exit_code,
-                    ok: outcome.ok,
-                    summary: run_verify_scope_summary(scope, outcome.ok, details),
-                    duration_ms: execution.duration_ms,
-                    generated_at: chrono::Utc::now(),
-                }
-            }
-            Err(err) => RunVerifyStatus {
-                scope_id: scope.scope_id.clone(),
-                scope_kind: scope.scope_kind,
-                subrun_id: scope.subrun_id.clone(),
-                command: run.run_verify_command.clone(),
-                timeout_sec,
-                exit_code: -1,
-                ok: false,
-                summary: run_verify_scope_summary(scope, false, err.to_string()),
-                duration_ms: 0,
-                generated_at: chrono::Utc::now(),
-            },
-        };
-
-    run.latest_run_verify = Some(verify_status);
-    apply_run_verify_lifecycle(run);
-    run.touch();
+    run_service::execute_run_verification(cwd, run, scope).await
 }
 
 async fn sync_task_runs(
@@ -2668,38 +2475,16 @@ async fn sync_task_runs(
     task_id: &str,
     report: Option<TaskReport>,
 ) -> Result<Vec<RunStatus>> {
-    let refreshed_runs = {
-        let reliability = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        let mut orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        refresh_task_runs_with_verify_scopes(
-            &reliability,
-            &mut orchestration,
-            task_id,
-            report.as_ref(),
-        )
-    };
-
-    let cwd = session_workspace_root(cx, session).await?;
-    let mut updated_runs = Vec::with_capacity(refreshed_runs.len());
-    for (mut run, verify_scope) in refreshed_runs {
-        if let Some(scope) = verify_scope {
-            execute_run_verification(&cwd, &mut run, &scope).await;
-            let mut orchestration = orchestration_state
-                .lock(cx)
-                .await
-                .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-            orchestration.update_run(run.clone());
-        }
-        persist_run_status(cx, session, run_store, &run).await?;
-        updated_runs.push(run);
-    }
-    Ok(updated_runs)
+    run_service::sync_task_runs(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        task_id,
+        report,
+    )
+    .await
 }
 
 async fn refresh_run_if_live(
@@ -2708,30 +2493,17 @@ async fn refresh_run_if_live(
     reliability_state: &Arc<Mutex<RpcReliabilityState>>,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
     run_store: &RunStore,
-    mut run: RunStatus,
+    run: RunStatus,
 ) -> Result<RunStatus> {
-    let original = run.clone();
-    let has_live_tasks = {
-        let mut reliability = reliability_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-        refresh_live_run_from_reliability(&mut reliability, &mut run)
-    };
-
-    {
-        let mut orchestration = orchestration_state
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
-        orchestration.update_run(run.clone());
-    }
-
-    if has_live_tasks && run != original {
-        persist_run_status(cx, session, run_store, &run).await?;
-    }
-
-    Ok(run)
+    run_service::refresh_run_if_live(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        run,
+    )
+    .await
 }
 
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
