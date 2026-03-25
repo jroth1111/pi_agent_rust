@@ -35,7 +35,6 @@ use crate::provider::Provider;
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
-use crate::reliability::ArtifactStore;
 use crate::reliability::verifier::Verifier;
 use crate::resources::ResourceLoader;
 use crate::services::reliability_service::ReliabilityService;
@@ -411,197 +410,42 @@ impl RpcReliabilityState {
     }
 
     fn task_counts_for(&self, task_ids: &[String]) -> BTreeMap<String, usize> {
-        let mut counts = BTreeMap::new();
-        for task_id in task_ids {
-            if let Some(task) = self.tasks.get(task_id) {
-                let label = Self::state_label(&task.runtime.state).to_string();
-                *counts.entry(label).or_insert(0) += 1;
-            }
-        }
-        counts
+        ReliabilityService::task_counts_for(self, task_ids)
     }
 
     fn trigger_satisfied(
         trigger: &reliability::EdgeTrigger,
         terminal: &reliability::TerminalState,
     ) -> bool {
-        match trigger {
-            reliability::EdgeTrigger::Always => true,
-            reliability::EdgeTrigger::OnSuccess => {
-                matches!(terminal, reliability::TerminalState::Succeeded { .. })
-            }
-            reliability::EdgeTrigger::OnFailure(mask) => match terminal {
-                reliability::TerminalState::Failed { class, .. } => mask.matches(*class),
-                _ => false,
-            },
-        }
+        ReliabilityService::trigger_satisfied(trigger, terminal)
     }
 
     fn trigger_key(trigger: &reliability::EdgeTrigger) -> String {
-        match trigger {
-            reliability::EdgeTrigger::OnSuccess => "on_success".to_string(),
-            reliability::EdgeTrigger::Always => "always".to_string(),
-            reliability::EdgeTrigger::OnFailure(mask) => {
-                let mut classes: Vec<String> = mask
-                    .classes
-                    .iter()
-                    .map(|class| format!("{class:?}"))
-                    .collect();
-                classes.sort();
-                format!("on_failure:{}", classes.join("|"))
-            }
-        }
+        ReliabilityService::trigger_key(trigger)
     }
 
     pub(crate) fn reconcile_prerequisites(&mut self, contract: &TaskContract) -> Result<()> {
-        let previous_edges = self.edges.clone();
-        self.edges.retain(|edge| {
-            !(edge.to == contract.task_id
-                && matches!(edge.kind, reliability::EdgeKind::Prerequisite { .. }))
-        });
-
-        let mut dedupe = HashSet::new();
-        for prerequisite in &contract.prerequisites {
-            let from = prerequisite.task_id.trim();
-            if from.is_empty() {
-                continue;
-            }
-            let key = format!(
-                "{}->{}:{}",
-                from,
-                contract.task_id,
-                Self::trigger_key(&prerequisite.trigger)
-            );
-            if !dedupe.insert(key.clone()) {
-                continue;
-            }
-            self.edges.push(reliability::ReliabilityEdge {
-                id: format!("rpc_edge:{key}"),
-                from: from.to_string(),
-                to: contract.task_id.clone(),
-                kind: reliability::EdgeKind::Prerequisite {
-                    trigger: prerequisite.trigger.clone(),
-                },
-            });
-        }
-        self.edges.sort_by(|left, right| left.id.cmp(&right.id));
-
-        if reliability::DagEvaluator::detect_cycle(&self.edges) {
-            self.edges = previous_edges;
-            return Err(Error::validation(format!(
-                "reliability DAG cycle detected while integrating prerequisites for {}",
-                contract.task_id
-            )));
-        }
-
-        Ok(())
+        ReliabilityService::reconcile_prerequisites(self, contract)
     }
 
     fn waiting_on_for_task(&self, task_id: &str) -> Vec<String> {
-        let terminal_states: HashMap<String, reliability::TerminalState> = self
-            .tasks
-            .iter()
-            .filter_map(|(id, task)| match &task.runtime.state {
-                reliability::RuntimeState::Terminal(terminal) => {
-                    Some((id.clone(), terminal.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let mut waiting_on = Vec::new();
-        for edge in &self.edges {
-            if edge.to != task_id {
-                continue;
-            }
-            let reliability::EdgeKind::Prerequisite { trigger } = &edge.kind else {
-                continue;
-            };
-            match terminal_states.get(&edge.from) {
-                Some(terminal) if Self::trigger_satisfied(trigger, terminal) => {}
-                _ => waiting_on.push(edge.from.clone()),
-            }
-        }
-        waiting_on.sort();
-        waiting_on.dedup();
-        waiting_on
+        ReliabilityService::waiting_on_for_task(self, task_id)
     }
 
     pub(crate) fn project_waiting_on_for_task(&mut self, task_id: &str) -> Vec<String> {
-        let waiting_on = self.waiting_on_for_task(task_id);
-        let Some(task) = self.tasks.get_mut(task_id) else {
-            return waiting_on;
-        };
-
-        match (&task.runtime.state, waiting_on.is_empty()) {
-            (
-                reliability::RuntimeState::Ready | reliability::RuntimeState::Blocked { .. },
-                false,
-            ) => {
-                task.runtime.state = reliability::RuntimeState::Blocked {
-                    waiting_on: waiting_on.clone(),
-                };
-            }
-            (reliability::RuntimeState::Blocked { .. }, true) => {
-                if reliability::apply_transition(
-                    &mut task.runtime,
-                    &reliability::TransitionEvent::DependenciesMet,
-                    task.spec.max_attempts,
-                )
-                .is_err()
-                {
-                    task.runtime.state = reliability::RuntimeState::Ready;
-                }
-            }
-            _ => {}
-        }
-
-        waiting_on
+        ReliabilityService::project_waiting_on_for_task(self, task_id)
     }
 
     fn evaluate_dag_unblock(&mut self) -> reliability::DagEvaluation {
-        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
-        ordered_ids.sort();
-        let mut task_snapshot = ordered_ids
-            .iter()
-            .filter_map(|task_id| self.tasks.get(task_id).cloned())
-            .collect::<Vec<_>>();
-
-        let evaluation =
-            reliability::DagEvaluator::evaluate_and_unblock(&mut task_snapshot, &self.edges);
-        for node in task_snapshot {
-            if let Some(task) = self.tasks.get_mut(&node.id) {
-                task.runtime = node.runtime;
-            }
-        }
-        evaluation
+        ReliabilityService::evaluate_dag_unblock(self)
     }
 
     fn promote_recoverable_due(&mut self) -> Vec<reliability::RecoveryAction> {
-        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
-        ordered_ids.sort();
-        let mut task_snapshot = ordered_ids
-            .iter()
-            .filter_map(|task_id| self.tasks.get(task_id).cloned())
-            .collect::<Vec<_>>();
-
-        let promoted = reliability::RecoveryManager::promote_recoverable(&mut task_snapshot);
-        for node in task_snapshot {
-            if let Some(task) = self.tasks.get_mut(&node.id) {
-                task.runtime = node.runtime;
-            }
-        }
-        promoted
+        ReliabilityService::promote_recoverable_due(self)
     }
 
     pub(crate) fn refresh_dependency_states(&mut self) {
-        self.promote_recoverable_due();
-        self.evaluate_dag_unblock();
-
-        let mut ordered_ids = self.tasks.keys().cloned().collect::<Vec<_>>();
-        ordered_ids.sort();
-        for task_id in ordered_ids {
-            self.project_waiting_on_for_task(&task_id);
-        }
+        ReliabilityService::refresh_dependency_states(self)
     }
 
     fn request_dispatch(
@@ -623,21 +467,7 @@ impl RpcReliabilityState {
     }
 
     fn expire_dispatch_grant(&mut self, grant: &DispatchGrant) -> Result<()> {
-        self.ensure_enabled()?;
-        let _ = self.leases.expire_lease(&grant.lease_id);
-        let Some(task) = self.tasks.get_mut(&grant.task_id) else {
-            return Ok(());
-        };
-
-        if matches!(task.runtime.state, reliability::RuntimeState::Leased { .. }) {
-            reliability::apply_transition(
-                &mut task.runtime,
-                &reliability::TransitionEvent::ExpireLease,
-                task.spec.max_attempts,
-            )
-            .map_err(|err| Error::validation(format!("dispatch rollback failed: {err}")))?;
-        }
-        Ok(())
+        ReliabilityService::expire_dispatch_grant(self, grant)
     }
 
     fn append_evidence(&mut self, req: AppendEvidenceRequest) -> Result<EvidenceRecord> {
@@ -649,93 +479,15 @@ impl RpcReliabilityState {
     }
 
     fn resolve_blocker(&mut self, report: BlockerReport) -> Result<String> {
-        self.ensure_enabled()?;
-        let is_defer = report.reason.trim().eq_ignore_ascii_case("defer");
-        let report_reason = report.reason.clone();
-        let report_context = report.context.clone();
-        let lease_id_for_release = report.lease_id.clone();
-        if !report.resolved
-            && is_defer
-            && !self.allow_open_ended_defer
-            && report.defer_trigger.is_none()
-        {
-            return Err(Error::validation(
-                "Open-ended defer blocker is disabled by reliability policy; provide defer_trigger Until or DependsOn",
-            ));
-        }
-
-        {
-            let Some(task) = self.tasks.get_mut(&report.task_id) else {
-                return Err(Error::validation(format!(
-                    "Unknown reliability task: {}",
-                    report.task_id
-                )));
-            };
-
-            let event = if report.resolved {
-                reliability::TransitionEvent::HumanResolve
-            } else {
-                reliability::TransitionEvent::ReportBlocker {
-                    lease_id: report.lease_id,
-                    fence_token: report.fence_token,
-                    reason: report_reason,
-                    context: report_context.clone(),
-                }
-            };
-            reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
-                .map_err(|err| {
-                    Error::validation(format!("resolve blocker transition rejected: {err}"))
-                })?;
-
-            if !report.resolved && is_defer {
-                if let Some(trigger) = &report.defer_trigger {
-                    match trigger {
-                        reliability::DeferTrigger::Until { until } => {
-                            task.runtime.state = reliability::RuntimeState::Recoverable {
-                                reason: reliability::FailureClass::HumanBlocker,
-                                failure_artifact: None,
-                                handoff_summary: report_context,
-                                retry_after: Some(*until),
-                            };
-                        }
-                        reliability::DeferTrigger::DependsOn { task_id } => {
-                            task.runtime.state = reliability::RuntimeState::Blocked {
-                                waiting_on: vec![task_id.clone()],
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
-        if !report.resolved {
-            let _ = self.leases.expire_lease(&lease_id_for_release);
-        }
-
-        self.refresh_dependency_states();
-        let Some(task) = self.tasks.get(&report.task_id) else {
-            return Err(Error::validation(format!(
-                "Unknown reliability task: {}",
-                report.task_id
-            )));
-        };
-        Ok(Self::state_label(&task.runtime.state).to_string())
+        ReliabilityService::resolve_blocker(self, report)
     }
 
     fn query_artifact(&self, query: ArtifactQuery) -> Result<Vec<String>> {
-        self.ensure_enabled()?;
-        self.artifacts
-            .list(&query)
-            .map_err(|err| Error::session(format!("artifact query failed: {err}")))
+        ReliabilityService::query_artifact(self, query)
     }
 
     fn load_artifact_text(&self, artifact_id: &str) -> Result<String> {
-        self.ensure_enabled()?;
-        let bytes = self
-            .artifacts
-            .load(artifact_id)
-            .map_err(|err| Error::session(format!("artifact load failed: {err}")))?;
-        Ok(String::from_utf8_lossy(&bytes).to_string())
+        ReliabilityService::load_artifact_text(self, artifact_id)
     }
 
     pub(crate) fn first_task_id(&self) -> Option<String> {

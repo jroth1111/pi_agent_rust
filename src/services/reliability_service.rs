@@ -7,6 +7,7 @@ use crate::rpc::{
     StateDigest, SubmitTaskRequest, SubmitTaskResponse, TaskContract,
 };
 use chrono::SecondsFormat;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct ReliabilityService {
@@ -152,6 +153,20 @@ impl ReliabilityService {
         }
     }
 
+    pub(crate) fn task_counts_for(
+        state: &RpcReliabilityState,
+        task_ids: &[String],
+    ) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for task_id in task_ids {
+            if let Some(task) = state.tasks.get(task_id) {
+                let label = Self::state_label(&task.runtime.state).to_string();
+                *counts.entry(label).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     pub(crate) fn get_or_create_task<'a>(
         state: &'a mut RpcReliabilityState,
         contract: &TaskContract,
@@ -209,6 +224,199 @@ impl ReliabilityService {
             state.parent_goal_trace_by_task.remove(&contract.task_id);
         }
         Ok(entry)
+    }
+
+    pub(crate) fn trigger_satisfied(
+        trigger: &reliability::EdgeTrigger,
+        terminal: &reliability::TerminalState,
+    ) -> bool {
+        match trigger {
+            reliability::EdgeTrigger::Always => true,
+            reliability::EdgeTrigger::OnSuccess => {
+                matches!(terminal, reliability::TerminalState::Succeeded { .. })
+            }
+            reliability::EdgeTrigger::OnFailure(mask) => match terminal {
+                reliability::TerminalState::Failed { class, .. } => mask.matches(*class),
+                _ => false,
+            },
+        }
+    }
+
+    pub(crate) fn trigger_key(trigger: &reliability::EdgeTrigger) -> String {
+        match trigger {
+            reliability::EdgeTrigger::OnSuccess => "on_success".to_string(),
+            reliability::EdgeTrigger::Always => "always".to_string(),
+            reliability::EdgeTrigger::OnFailure(mask) => {
+                let mut classes: Vec<String> = mask
+                    .classes
+                    .iter()
+                    .map(|class| format!("{class:?}"))
+                    .collect();
+                classes.sort();
+                format!("on_failure:{}", classes.join("|"))
+            }
+        }
+    }
+
+    pub(crate) fn reconcile_prerequisites(
+        state: &mut RpcReliabilityState,
+        contract: &TaskContract,
+    ) -> Result<()> {
+        let previous_edges = state.edges.clone();
+        state.edges.retain(|edge| {
+            !(edge.to == contract.task_id
+                && matches!(edge.kind, reliability::EdgeKind::Prerequisite { .. }))
+        });
+
+        let mut dedupe = HashSet::new();
+        for prerequisite in &contract.prerequisites {
+            let from = prerequisite.task_id.trim();
+            if from.is_empty() {
+                continue;
+            }
+            let key = format!(
+                "{}->{}:{}",
+                from,
+                contract.task_id,
+                Self::trigger_key(&prerequisite.trigger)
+            );
+            if !dedupe.insert(key.clone()) {
+                continue;
+            }
+            state.edges.push(reliability::ReliabilityEdge {
+                id: format!("rpc_edge:{key}"),
+                from: from.to_string(),
+                to: contract.task_id.clone(),
+                kind: reliability::EdgeKind::Prerequisite {
+                    trigger: prerequisite.trigger.clone(),
+                },
+            });
+        }
+        state.edges.sort_by(|left, right| left.id.cmp(&right.id));
+
+        if reliability::DagEvaluator::detect_cycle(&state.edges) {
+            state.edges = previous_edges;
+            return Err(Error::validation(format!(
+                "reliability DAG cycle detected while integrating prerequisites for {}",
+                contract.task_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn waiting_on_for_task(state: &RpcReliabilityState, task_id: &str) -> Vec<String> {
+        let terminal_states: HashMap<String, reliability::TerminalState> = state
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| match &task.runtime.state {
+                reliability::RuntimeState::Terminal(terminal) => {
+                    Some((id.clone(), terminal.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut waiting_on = Vec::new();
+        for edge in &state.edges {
+            if edge.to != task_id {
+                continue;
+            }
+            let reliability::EdgeKind::Prerequisite { trigger } = &edge.kind else {
+                continue;
+            };
+            match terminal_states.get(&edge.from) {
+                Some(terminal) if Self::trigger_satisfied(trigger, terminal) => {}
+                _ => waiting_on.push(edge.from.clone()),
+            }
+        }
+        waiting_on.sort();
+        waiting_on.dedup();
+        waiting_on
+    }
+
+    pub(crate) fn project_waiting_on_for_task(
+        state: &mut RpcReliabilityState,
+        task_id: &str,
+    ) -> Vec<String> {
+        let waiting_on = Self::waiting_on_for_task(state, task_id);
+        let Some(task) = state.tasks.get_mut(task_id) else {
+            return waiting_on;
+        };
+
+        match (&task.runtime.state, waiting_on.is_empty()) {
+            (
+                reliability::RuntimeState::Ready | reliability::RuntimeState::Blocked { .. },
+                false,
+            ) => {
+                task.runtime.state = reliability::RuntimeState::Blocked {
+                    waiting_on: waiting_on.clone(),
+                };
+            }
+            (reliability::RuntimeState::Blocked { .. }, true) => {
+                if reliability::apply_transition(
+                    &mut task.runtime,
+                    &reliability::TransitionEvent::DependenciesMet,
+                    task.spec.max_attempts,
+                )
+                .is_err()
+                {
+                    task.runtime.state = reliability::RuntimeState::Ready;
+                }
+            }
+            _ => {}
+        }
+
+        waiting_on
+    }
+
+    pub(crate) fn evaluate_dag_unblock(
+        state: &mut RpcReliabilityState,
+    ) -> reliability::DagEvaluation {
+        let mut ordered_ids = state.tasks.keys().cloned().collect::<Vec<_>>();
+        ordered_ids.sort();
+        let mut task_snapshot = ordered_ids
+            .iter()
+            .filter_map(|task_id| state.tasks.get(task_id).cloned())
+            .collect::<Vec<_>>();
+
+        let evaluation =
+            reliability::DagEvaluator::evaluate_and_unblock(&mut task_snapshot, &state.edges);
+        for node in task_snapshot {
+            if let Some(task) = state.tasks.get_mut(&node.id) {
+                task.runtime = node.runtime;
+            }
+        }
+        evaluation
+    }
+
+    pub(crate) fn promote_recoverable_due(
+        state: &mut RpcReliabilityState,
+    ) -> Vec<reliability::RecoveryAction> {
+        let mut ordered_ids = state.tasks.keys().cloned().collect::<Vec<_>>();
+        ordered_ids.sort();
+        let mut task_snapshot = ordered_ids
+            .iter()
+            .filter_map(|task_id| state.tasks.get(task_id).cloned())
+            .collect::<Vec<_>>();
+
+        let promoted = reliability::RecoveryManager::promote_recoverable(&mut task_snapshot);
+        for node in task_snapshot {
+            if let Some(task) = state.tasks.get_mut(&node.id) {
+                task.runtime = node.runtime;
+            }
+        }
+        promoted
+    }
+
+    pub(crate) fn refresh_dependency_states(state: &mut RpcReliabilityState) {
+        Self::promote_recoverable_due(state);
+        Self::evaluate_dag_unblock(state);
+
+        let mut ordered_ids = state.tasks.keys().cloned().collect::<Vec<_>>();
+        ordered_ids.sort();
+        for task_id in ordered_ids {
+            Self::project_waiting_on_for_task(state, &task_id);
+        }
     }
 
     pub(crate) fn request_dispatch(
@@ -299,6 +507,27 @@ impl ReliabilityService {
             expires_at: grant.expires_at,
             state: state_label,
         })
+    }
+
+    pub(crate) fn expire_dispatch_grant(
+        state: &mut RpcReliabilityState,
+        grant: &DispatchGrant,
+    ) -> Result<()> {
+        state.ensure_enabled()?;
+        let _ = state.leases.expire_lease(&grant.lease_id);
+        let Some(task) = state.tasks.get_mut(&grant.task_id) else {
+            return Ok(());
+        };
+
+        if matches!(task.runtime.state, reliability::RuntimeState::Leased { .. }) {
+            reliability::apply_transition(
+                &mut task.runtime,
+                &reliability::TransitionEvent::ExpireLease,
+                task.spec.max_attempts,
+            )
+            .map_err(|err| Error::validation(format!("dispatch rollback failed: {err}")))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn append_evidence_state(
@@ -558,6 +787,106 @@ impl ReliabilityService {
             close_payload,
             close,
         })
+    }
+
+    pub(crate) fn resolve_blocker(
+        state: &mut RpcReliabilityState,
+        report: crate::rpc::BlockerReport,
+    ) -> Result<String> {
+        state.ensure_enabled()?;
+        let is_defer = report.reason.trim().eq_ignore_ascii_case("defer");
+        let report_reason = report.reason.clone();
+        let report_context = report.context.clone();
+        let lease_id_for_release = report.lease_id.clone();
+        if !report.resolved
+            && is_defer
+            && !state.allow_open_ended_defer
+            && report.defer_trigger.is_none()
+        {
+            return Err(Error::validation(
+                "Open-ended defer blocker is disabled by reliability policy; provide defer_trigger Until or DependsOn",
+            ));
+        }
+
+        {
+            let Some(task) = state.tasks.get_mut(&report.task_id) else {
+                return Err(Error::validation(format!(
+                    "Unknown reliability task: {}",
+                    report.task_id
+                )));
+            };
+
+            let event = if report.resolved {
+                reliability::TransitionEvent::HumanResolve
+            } else {
+                reliability::TransitionEvent::ReportBlocker {
+                    lease_id: report.lease_id,
+                    fence_token: report.fence_token,
+                    reason: report_reason,
+                    context: report_context.clone(),
+                }
+            };
+            reliability::apply_transition(&mut task.runtime, &event, task.spec.max_attempts)
+                .map_err(|err| {
+                    Error::validation(format!("resolve blocker transition rejected: {err}"))
+                })?;
+
+            if !report.resolved && is_defer {
+                if let Some(trigger) = &report.defer_trigger {
+                    match trigger {
+                        reliability::DeferTrigger::Until { until } => {
+                            task.runtime.state = reliability::RuntimeState::Recoverable {
+                                reason: reliability::FailureClass::HumanBlocker,
+                                failure_artifact: None,
+                                handoff_summary: report_context,
+                                retry_after: Some(*until),
+                            };
+                        }
+                        reliability::DeferTrigger::DependsOn { task_id } => {
+                            task.runtime.state = reliability::RuntimeState::Blocked {
+                                waiting_on: vec![task_id.clone()],
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        if !report.resolved {
+            let _ = state.leases.expire_lease(&lease_id_for_release);
+        }
+
+        Self::refresh_dependency_states(state);
+        let Some(task) = state.tasks.get(&report.task_id) else {
+            return Err(Error::validation(format!(
+                "Unknown reliability task: {}",
+                report.task_id
+            )));
+        };
+        Ok(Self::state_label(&task.runtime.state).to_string())
+    }
+
+    pub(crate) fn query_artifact(
+        state: &RpcReliabilityState,
+        query: crate::rpc::ArtifactQuery,
+    ) -> Result<Vec<String>> {
+        state.ensure_enabled()?;
+        state
+            .artifacts
+            .list(&query)
+            .map_err(|err| Error::session(format!("artifact query failed: {err}")))
+    }
+
+    pub(crate) fn load_artifact_text(
+        state: &RpcReliabilityState,
+        artifact_id: &str,
+    ) -> Result<String> {
+        state.ensure_enabled()?;
+        let bytes = state
+            .artifacts
+            .load(artifact_id)
+            .map_err(|err| Error::session(format!("artifact load failed: {err}")))?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
     pub(crate) fn get_state_digest_state(
