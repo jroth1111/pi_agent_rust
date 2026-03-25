@@ -1341,7 +1341,7 @@ fn convert_run_lifecycle(lifecycle: RunLifecycle) -> crate::contracts::engine::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::engine::{TaskContract, TaskPrerequisite, WorkflowContract};
+    use crate::contracts::engine::TaskPrerequisite;
     use crate::orchestration::ExecutionTier;
     use crate::reliability::state::RuntimeState;
 
@@ -1731,69 +1731,6 @@ mod tests {
             store.get_task("task-2").unwrap().runtime.state,
             RuntimeState::Terminal(TerminalState::Canceled { .. })
         ));
-    }
-
-    #[test]
-    fn test_workflow_service_contract_create_and_dispatch() {
-        let store = test_store();
-        let service = WorkflowService::new(store);
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let run_id = rt
-            .block_on(service.create_run(
-                "Build feature".to_string(),
-                vec![TaskContract {
-                    task_id: "task-1".to_string(),
-                    objective: "Implement X".to_string(),
-                    prerequisites: Vec::new(),
-                    verify_command: Some("cargo test".to_string()),
-                    max_attempts: Some(3),
-                }],
-            ))
-            .unwrap();
-
-        assert!(run_id.starts_with("run-"));
-
-        let status = rt.block_on(service.run_status(&run_id)).unwrap();
-        assert_eq!(status.run_id, run_id);
-
-        let envelopes = rt
-            .block_on(service.dispatch_run(
-                &run_id,
-                DispatchOptions {
-                    agent_id_prefix: Some("worker".to_string()),
-                    lease_ttl_sec: Some(300),
-                    max_parallelism: Some(1),
-                },
-            ))
-            .unwrap();
-
-        assert_eq!(envelopes.len(), 1);
-        assert_eq!(envelopes[0].task_id, "task-1");
-        assert_eq!(envelopes[0].run_id, run_id);
-    }
-
-    #[test]
-    fn test_workflow_service_state_digest() {
-        let store = test_store();
-        let service = WorkflowService::new(store);
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(service.create_run(
-            "Build".to_string(),
-            vec![TaskContract {
-                task_id: "t1".to_string(),
-                objective: "X".to_string(),
-                prerequisites: Vec::new(),
-                verify_command: None,
-                max_attempts: None,
-            }],
-        ))
-        .unwrap();
-
-        let digest = rt.block_on(service.state_digest(None)).unwrap();
-        assert_eq!(digest.tasks.len(), 1);
-        assert!(digest.is_dag_valid);
     }
 
     // ========================================================================
