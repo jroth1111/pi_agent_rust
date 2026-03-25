@@ -27,8 +27,7 @@ use crate::model::{
 };
 use crate::models::ModelEntry;
 use crate::orchestration::{
-    ExecutionTier, RunLifecycle, RunStatus, RunStore, RunVerifyStatus, SubrunPlan, TaskReport,
-    WaveStatus,
+    RunLifecycle, RunStatus, RunStore, RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus,
 };
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
@@ -52,6 +51,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use crate::orchestration::ExecutionTier;
 
 fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
@@ -213,40 +215,40 @@ struct StateDigestRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StartRunRequest {
+pub(crate) struct StartRunRequest {
     #[serde(default)]
-    run_id: Option<String>,
-    objective: String,
-    tasks: Vec<TaskContract>,
-    run_verify_command: String,
+    pub(crate) run_id: Option<String>,
+    pub(crate) objective: String,
+    pub(crate) tasks: Vec<TaskContract>,
+    pub(crate) run_verify_command: String,
     #[serde(default)]
-    run_verify_timeout_sec: Option<u32>,
+    pub(crate) run_verify_timeout_sec: Option<u32>,
     #[serde(default)]
-    max_parallelism: Option<usize>,
+    pub(crate) max_parallelism: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RunLookupRequest {
-    run_id: String,
+pub(crate) struct RunLookupRequest {
+    pub(crate) run_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CancelRunRequest {
-    run_id: String,
+pub(crate) struct CancelRunRequest {
+    pub(crate) run_id: String,
     #[serde(default)]
-    reason: Option<String>,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DispatchRunRequest {
-    run_id: String,
+pub(crate) struct DispatchRunRequest {
+    pub(crate) run_id: String,
     #[serde(default)]
-    agent_id_prefix: Option<String>,
+    pub(crate) agent_id_prefix: Option<String>,
     #[serde(default)]
-    lease_ttl_sec: Option<i64>,
+    pub(crate) lease_ttl_sec: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -591,14 +593,6 @@ where
         .map_err(|err| Error::validation(format!("Invalid payload for {command_type}: {err}")))
 }
 
-fn next_run_id(candidate: Option<&str>) -> String {
-    candidate
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4().simple()))
-}
-
 async fn persist_run_status(
     cx: &AgentCx,
     session: &Arc<Mutex<AgentSession>>,
@@ -643,6 +637,7 @@ async fn append_dispatch_rollback_session_entry(
     run_service::append_dispatch_rollback_session_entry(cx, session, grant, to_state, summary).await
 }
 
+#[cfg(test)]
 fn ensure_run_id_available(
     orchestration: &RpcOrchestrationState,
     run_store: &RunStore,
@@ -656,6 +651,7 @@ fn ensure_run_id_available(
     Ok(())
 }
 
+#[cfg(test)]
 fn orchestration_dag_depth(tasks: &[TaskContract]) -> usize {
     fn visit(
         task_id: &str,
@@ -702,68 +698,12 @@ fn orchestration_dag_depth(tasks: &[TaskContract]) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn select_execution_tier(tasks: &[TaskContract]) -> ExecutionTier {
     match tasks.len() {
         0 | 1 => ExecutionTier::Inline,
         2..=24 if orchestration_dag_depth(tasks) <= 4 => ExecutionTier::Wave,
         _ => ExecutionTier::Hierarchical,
-    }
-}
-
-const fn failure_class_label(class: reliability::FailureClass) -> &'static str {
-    match class {
-        reliability::FailureClass::VerificationFailed => "verification_failed",
-        reliability::FailureClass::ScopeCreepDetected => "scope_creep_detected",
-        reliability::FailureClass::MergeConflict => "merge_conflict",
-        reliability::FailureClass::InfraTransient => "infra_transient",
-        reliability::FailureClass::InfraPermanent => "infra_permanent",
-        reliability::FailureClass::HumanBlocker => "human_blocker",
-        reliability::FailureClass::MaxAttemptsExceeded => "max_attempts_exceeded",
-    }
-}
-
-fn runtime_failure_class_label(state: &reliability::RuntimeState) -> Option<String> {
-    match state {
-        reliability::RuntimeState::Recoverable { reason, .. } => {
-            Some(failure_class_label(*reason).to_string())
-        }
-        reliability::RuntimeState::AwaitingHuman { .. } => {
-            Some(failure_class_label(reliability::FailureClass::HumanBlocker).to_string())
-        }
-        reliability::RuntimeState::Terminal(reliability::TerminalState::Failed {
-            class, ..
-        }) => Some(failure_class_label(*class).to_string()),
-        _ => None,
-    }
-}
-
-fn task_report_blockers(state: &reliability::RuntimeState) -> Vec<String> {
-    match state {
-        reliability::RuntimeState::Blocked { waiting_on } => waiting_on.clone(),
-        reliability::RuntimeState::AwaitingHuman {
-            question, context, ..
-        } => {
-            let mut blockers = vec![question.clone()];
-            if !context.trim().is_empty() {
-                blockers.push(context.clone());
-            }
-            blockers
-        }
-        reliability::RuntimeState::Recoverable {
-            handoff_summary,
-            retry_after,
-            ..
-        } => {
-            let mut blockers = Vec::new();
-            if !handoff_summary.trim().is_empty() {
-                blockers.push(handoff_summary.clone());
-            }
-            if let Some(retry_after) = retry_after {
-                blockers.push(format!("retry_after={}", retry_after.to_rfc3339()));
-            }
-            blockers
-        }
-        _ => Vec::new(),
     }
 }
 
@@ -1764,53 +1704,19 @@ pub async fn run(
                             continue;
                         }
                     };
-                if req.tasks.is_empty() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "Run must include at least one task".to_string(),
-                    ));
-                    continue;
-                }
-                if req.objective.trim().is_empty() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "Run objective cannot be empty".to_string(),
-                    ));
-                    continue;
-                }
-                if req.run_verify_command.trim().is_empty() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "runVerifyCommand cannot be empty".to_string(),
-                    ));
-                    continue;
-                }
-                if matches!(req.run_verify_timeout_sec, Some(0)) {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "runVerifyTimeoutSec must be at least 1 when provided".to_string(),
-                    ));
-                    continue;
-                }
-                if matches!(req.max_parallelism, Some(0)) {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "orchestration.start_run",
-                        "maxParallelism must be at least 1 when provided".to_string(),
-                    ));
-                    continue;
-                }
-
-                let run_id = next_run_id(req.run_id.as_deref());
+                let status = match run_service::start_run(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &options.config,
+                    req,
+                )
+                .await
                 {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    if let Err(err) = ensure_run_id_available(&orchestration, &run_store, &run_id) {
+                    Ok(status) => status,
+                    Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.start_run",
@@ -1818,64 +1724,7 @@ pub async fn run(
                         ));
                         continue;
                     }
-                }
-                let selected_tier = select_execution_tier(&req.tasks);
-                let task_ids = req
-                    .tasks
-                    .iter()
-                    .map(|task| task.task_id.clone())
-                    .collect::<Vec<_>>();
-                let mut status =
-                    RunStatus::new(run_id.clone(), req.objective.clone(), selected_tier);
-                status.lifecycle = RunLifecycle::Pending;
-                status.run_verify_command = req.run_verify_command.clone();
-                status.run_verify_timeout_sec = Some(
-                    req.run_verify_timeout_sec
-                        .unwrap_or(options.config.reliability_verify_timeout_sec_default()),
-                );
-                status.max_parallelism = req
-                    .max_parallelism
-                    .unwrap_or(RunStatus::DEFAULT_MAX_PARALLELISM);
-                status.task_ids = task_ids.clone();
-
-                let result = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    for contract in &req.tasks {
-                        rel.get_or_create_task(contract)?;
-                    }
-                    for contract in &req.tasks {
-                        rel.reconcile_prerequisites(contract)?;
-                    }
-                    rel.refresh_dependency_states();
-                    refresh_run_from_reliability(&rel, &mut status);
-                    Ok::<(), Error>(())
                 };
-                if let Err(err) = result {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.start_run",
-                        &err,
-                    ));
-                    continue;
-                }
-
-                {
-                    let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.register_run(status.clone());
-                }
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &status).await {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.start_run",
-                        &err,
-                    ));
-                    continue;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -1898,45 +1747,31 @@ pub async fn run(
                         }
                     };
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
+                let run = match run_service::get_run(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    req,
+                )
+                .await
+                {
+                    Ok(run) => run,
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "orchestration.get_run",
+                            &err,
+                        ));
+                        continue;
+                    }
                 };
-
-                if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                    let run = match refresh_run_if_live(
-                        &cx,
-                        &session,
-                        &reliability_state,
-                        &orchestration_state,
-                        &run_store,
-                        run,
-                    )
-                    .await
-                    {
-                        Ok(run) => run,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.get_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "orchestration.get_run",
-                        Some(json!({ "run": run })),
-                    ));
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ =
-                        out_tx.send(response_error_with_hints(id, "orchestration.get_run", &err));
-                }
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "orchestration.get_run",
+                    Some(json!({ "run": run })),
+                ));
             }
 
             "orchestration.dispatch_run" => {
@@ -1952,43 +1787,14 @@ pub async fn run(
                             continue;
                         }
                     };
-                let agent_id_prefix = req
-                    .agent_id_prefix
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("run");
-                let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
-
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-                let run = if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok())
-                {
-                    run
-                } else {
-                    let err =
-                        Error::session(format!("orchestration run not found: {}", req.run_id));
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                };
-
-                let (run, grants) = match dispatch_run_until_quiescent(
+                let (run, grants) = match run_service::dispatch_run(
                     &cx,
                     &session,
                     &reliability_state,
                     &orchestration_state,
                     &run_store,
                     &options.config,
-                    run,
-                    agent_id_prefix,
-                    lease_ttl_sec,
+                    req,
                 )
                 .await
                 {
@@ -2002,14 +1808,6 @@ pub async fn run(
                         continue;
                     }
                 };
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.dispatch_run",
-                        &err,
-                    ));
-                    continue;
-                }
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -2032,43 +1830,18 @@ pub async fn run(
                         }
                     };
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-                let mut run =
-                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.cancel_run",
-                            &err,
-                        ));
-                        continue;
-                    };
-                let has_live_tasks = {
-                    let rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    run_has_live_tasks(&rel, &run)
-                };
-                if has_live_tasks {
-                    if let Err(err) = cancel_live_run_tasks_and_sync(
-                        &cx,
-                        &session,
-                        &reliability_state,
-                        &orchestration_state,
-                        &run_store,
-                        &mut run,
-                    )
-                    .await
-                    {
+                let run = match run_service::cancel_run(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    req,
+                )
+                .await
+                {
+                    Ok(run) => run,
+                    Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.cancel_run",
@@ -2076,26 +1849,7 @@ pub async fn run(
                         ));
                         continue;
                     }
-                } else {
-                    run.lifecycle = RunLifecycle::Canceled;
-                    run.active_wave = None;
-                    run.active_subrun_id = None;
-                    run.touch();
-                }
-                {
-                    let mut orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.update_run(run.clone());
-                }
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.cancel_run",
-                        &err,
-                    ));
-                    continue;
-                }
+                };
 
                 let _ = out_tx.send(response_ok(
                     id,
@@ -2118,95 +1872,27 @@ pub async fn run(
                         }
                     };
 
-                let cached_run = {
-                    let orchestration = orchestration_state.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("orchestration lock failed: {err}"))
-                    })?;
-                    orchestration.get_run(&req.run_id)
-                };
-                let mut run =
-                    if let Some(run) = cached_run.or_else(|| run_store.load(&req.run_id).ok()) {
-                        run
-                    } else {
-                        let err =
-                            Error::session(format!("orchestration run not found: {}", req.run_id));
+                let run = match run_service::resume_run(
+                    &cx,
+                    &session,
+                    &reliability_state,
+                    &orchestration_state,
+                    &run_store,
+                    &options.config,
+                    req,
+                )
+                .await
+                {
+                    Ok(run) => run,
+                    Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(
                             id,
                             "orchestration.resume_run",
                             &err,
                         ));
                         continue;
-                    };
-                if matches!(
-                    run.lifecycle,
-                    RunLifecycle::Canceled | RunLifecycle::Blocked | RunLifecycle::Failed
-                ) {
-                    run.lifecycle = RunLifecycle::Pending;
-                }
-                if let Some(status) = run.latest_run_verify.as_ref().filter(|status| !status.ok) {
-                    let scope = completed_scope_from_run_verify(status);
-                    let cwd = session_workspace_root(&cx, &session).await?;
-                    execute_run_verification(&cwd, &mut run, &scope).await;
-                }
-                let has_live_tasks = {
-                    let mut rel = reliability_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
-                    refresh_live_run_from_reliability(&mut rel, &mut run)
-                };
-                if has_live_tasks
-                    && !matches!(
-                        run.lifecycle,
-                        RunLifecycle::Canceled
-                            | RunLifecycle::Failed
-                            | RunLifecycle::Succeeded
-                            | RunLifecycle::Blocked
-                            | RunLifecycle::AwaitingHuman
-                    )
-                {
-                    let (updated_run, _) = match dispatch_run_until_quiescent(
-                        &cx,
-                        &session,
-                        &reliability_state,
-                        &orchestration_state,
-                        &run_store,
-                        &options.config,
-                        run,
-                        "resume",
-                        3600,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.resume_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                    run = updated_run;
-                } else {
-                    run.touch();
-                    {
-                        let mut orchestration =
-                            orchestration_state.lock(&cx).await.map_err(|err| {
-                                Error::session(format!("orchestration lock failed: {err}"))
-                            })?;
-                        orchestration.update_run(run.clone());
                     }
-                }
-                if let Err(err) = persist_run_status(&cx, &session, &run_store, &run).await {
-                    let _ = out_tx.send(response_error_with_hints(
-                        id,
-                        "orchestration.resume_run",
-                        &err,
-                    ));
-                    continue;
-                }
+                };
 
                 let _ = out_tx.send(response_ok(
                     id,

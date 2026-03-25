@@ -12,8 +12,9 @@ use crate::orchestration::{
 use crate::provider::Provider;
 use crate::reliability::verifier::Verifier;
 use crate::rpc::{
-    AppendEvidenceRequest, DispatchGrant, EvidenceRecord, RpcOrchestrationState,
-    RpcReliabilityState, SubmitTaskRequest, SubmitTaskResponse, TaskContract,
+    AppendEvidenceRequest, CancelRunRequest, DispatchGrant, DispatchRunRequest, EvidenceRecord,
+    RpcOrchestrationState, RpcReliabilityState, RunLookupRequest, StartRunRequest,
+    SubmitTaskRequest, SubmitTaskResponse, TaskContract,
 };
 use crate::services::reliability_service::ReliabilityService;
 use crate::session::Session;
@@ -1066,6 +1067,81 @@ pub(crate) async fn submit_task_and_sync(
     Ok(result)
 }
 
+fn next_run_id(candidate: Option<&str>) -> String {
+    candidate
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4().simple()))
+}
+
+fn ensure_run_id_available(
+    orchestration: &RpcOrchestrationState,
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<()> {
+    if orchestration.get_run(run_id).is_some() || run_store.exists(run_id) {
+        return Err(Error::validation(format!(
+            "orchestration run already exists: {run_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn orchestration_dag_depth(tasks: &[TaskContract]) -> usize {
+    fn visit(
+        task_id: &str,
+        prereqs: &HashMap<String, Vec<String>>,
+        memo: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(depth) = memo.get(task_id) {
+            return *depth;
+        }
+        if !visiting.insert(task_id.to_string()) {
+            return 1;
+        }
+        let depth = prereqs
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|dep| 1 + visit(dep, prereqs, memo, visiting))
+            .max()
+            .unwrap_or(1);
+        visiting.remove(task_id);
+        memo.insert(task_id.to_string(), depth);
+        depth
+    }
+
+    let prereqs = tasks
+        .iter()
+        .map(|task| {
+            (
+                task.task_id.clone(),
+                task.prerequisites
+                    .iter()
+                    .map(|dep| dep.task_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    tasks
+        .iter()
+        .map(|task| visit(&task.task_id, &prereqs, &mut memo, &mut visiting))
+        .max()
+        .unwrap_or(0)
+}
+
+fn select_execution_tier(tasks: &[TaskContract]) -> ExecutionTier {
+    match tasks.len() {
+        0 | 1 => ExecutionTier::Inline,
+        2..=24 if orchestration_dag_depth(tasks) <= 4 => ExecutionTier::Wave,
+        _ => ExecutionTier::Hierarchical,
+    }
+}
+
 pub(crate) async fn current_run_status(
     cx: &AgentCx,
     orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
@@ -1082,6 +1158,302 @@ pub(crate) async fn current_run_status(
         return Ok(run);
     }
     run_store.load(run_id)
+}
+
+async fn load_existing_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<RunStatus> {
+    let run = {
+        let orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.get_run(run_id)
+    }
+    .or_else(|| run_store.load(run_id).ok())
+    .ok_or_else(|| Error::session(format!("orchestration run not found: {run_id}")))?;
+
+    refresh_run_if_live(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        run,
+    )
+    .await
+}
+
+pub(crate) async fn start_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    req: StartRunRequest,
+) -> Result<RunStatus> {
+    if req.tasks.is_empty() {
+        return Err(Error::validation("Run must include at least one task"));
+    }
+    if req.objective.trim().is_empty() {
+        return Err(Error::validation("Run objective cannot be empty"));
+    }
+    if req.run_verify_command.trim().is_empty() {
+        return Err(Error::validation("runVerifyCommand cannot be empty"));
+    }
+    if matches!(req.run_verify_timeout_sec, Some(0)) {
+        return Err(Error::validation(
+            "runVerifyTimeoutSec must be at least 1 when provided",
+        ));
+    }
+    if matches!(req.max_parallelism, Some(0)) {
+        return Err(Error::validation(
+            "maxParallelism must be at least 1 when provided",
+        ));
+    }
+
+    let run_id = next_run_id(req.run_id.as_deref());
+    {
+        let orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        ensure_run_id_available(&orchestration, run_store, &run_id)?;
+    }
+
+    let selected_tier = select_execution_tier(&req.tasks);
+    let task_ids = req
+        .tasks
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    let mut status = RunStatus::new(run_id, req.objective, selected_tier);
+    status.lifecycle = RunLifecycle::Pending;
+    status.run_verify_command = req.run_verify_command;
+    status.run_verify_timeout_sec = Some(
+        req.run_verify_timeout_sec
+            .unwrap_or(config.reliability_verify_timeout_sec_default()),
+    );
+    status.max_parallelism = req
+        .max_parallelism
+        .unwrap_or(RunStatus::DEFAULT_MAX_PARALLELISM);
+    status.task_ids = task_ids;
+
+    {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        for contract in &req.tasks {
+            ReliabilityService::get_or_create_task(&mut rel, contract)?;
+        }
+        for contract in &req.tasks {
+            ReliabilityService::reconcile_prerequisites(&mut rel, contract)?;
+        }
+        rel.refresh_dependency_states();
+        refresh_run_from_reliability(&rel, &mut status);
+    }
+
+    {
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.register_run(status.clone());
+    }
+    persist_run_status(cx, session, run_store, &status).await?;
+
+    Ok(status)
+}
+
+pub(crate) async fn get_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    req: RunLookupRequest,
+) -> Result<RunStatus> {
+    load_existing_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        &req.run_id,
+    )
+    .await
+}
+
+pub(crate) async fn dispatch_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    req: DispatchRunRequest,
+) -> Result<(RunStatus, Vec<DispatchGrant>)> {
+    let agent_id_prefix = req
+        .agent_id_prefix
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("run");
+    let lease_ttl_sec = req.lease_ttl_sec.unwrap_or(3600);
+    let run = load_existing_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        &req.run_id,
+    )
+    .await?;
+
+    let (run, grants) = dispatch_run_until_quiescent(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        config,
+        run,
+        agent_id_prefix,
+        lease_ttl_sec,
+    )
+    .await?;
+    persist_run_status(cx, session, run_store, &run).await?;
+    Ok((run, grants))
+}
+
+pub(crate) async fn cancel_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    req: CancelRunRequest,
+) -> Result<RunStatus> {
+    let _reason = req.reason;
+    let mut run = load_existing_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        &req.run_id,
+    )
+    .await?;
+    let has_live_tasks = {
+        let rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        run_has_live_tasks(&rel, &run)
+    };
+    if has_live_tasks {
+        cancel_live_run_tasks_and_sync(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            &mut run,
+        )
+        .await?;
+    } else {
+        run.lifecycle = RunLifecycle::Canceled;
+        run.active_wave = None;
+        run.active_subrun_id = None;
+        run.touch();
+    }
+    {
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.update_run(run.clone());
+    }
+    persist_run_status(cx, session, run_store, &run).await?;
+    Ok(run)
+}
+
+pub(crate) async fn resume_run(
+    cx: &AgentCx,
+    session: &Arc<Mutex<AgentSession>>,
+    reliability_state: &Arc<Mutex<RpcReliabilityState>>,
+    orchestration_state: &Arc<Mutex<RpcOrchestrationState>>,
+    run_store: &RunStore,
+    config: &Config,
+    req: RunLookupRequest,
+) -> Result<RunStatus> {
+    let mut run = load_existing_run(
+        cx,
+        session,
+        reliability_state,
+        orchestration_state,
+        run_store,
+        &req.run_id,
+    )
+    .await?;
+
+    if matches!(
+        run.lifecycle,
+        RunLifecycle::Canceled | RunLifecycle::Blocked | RunLifecycle::Failed
+    ) {
+        run.lifecycle = RunLifecycle::Pending;
+    }
+    if let Some(status) = run.latest_run_verify.as_ref().filter(|status| !status.ok) {
+        let scope = completed_scope_from_run_verify(status);
+        let cwd = session_workspace_root(cx, session).await?;
+        execute_run_verification(&cwd, &mut run, &scope).await;
+    }
+    let has_live_tasks = {
+        let mut rel = reliability_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("reliability lock failed: {err}")))?;
+        refresh_live_run_from_reliability(&mut rel, &mut run)
+    };
+    if has_live_tasks
+        && !matches!(
+            run.lifecycle,
+            RunLifecycle::Canceled
+                | RunLifecycle::Failed
+                | RunLifecycle::Succeeded
+                | RunLifecycle::Blocked
+                | RunLifecycle::AwaitingHuman
+        )
+    {
+        run = dispatch_run_until_quiescent(
+            cx,
+            session,
+            reliability_state,
+            orchestration_state,
+            run_store,
+            config,
+            run,
+            "resume",
+            3600,
+        )
+        .await?
+        .0;
+    } else {
+        run.touch();
+        let mut orchestration = orchestration_state
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("orchestration lock failed: {err}")))?;
+        orchestration.update_run(run.clone());
+    }
+    persist_run_status(cx, session, run_store, &run).await?;
+    Ok(run)
 }
 
 pub(crate) const ORCHESTRATION_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
