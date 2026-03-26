@@ -154,7 +154,8 @@ pub mod provider_metadata;
 pub mod providers;
 pub mod reliability;
 pub mod resources;
-pub mod rpc;
+#[cfg(test)]
+mod rpc;
 pub mod sandbox;
 pub mod scheduler;
 pub mod sdk;

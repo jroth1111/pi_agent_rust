@@ -21,8 +21,9 @@ use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, 
 use pi::provider::Provider;
 use pi::providers::openai::OpenAIProvider;
 use pi::resources::ResourceLoader;
-use pi::rpc::{RpcOptions, run};
 use pi::session::{Session, SessionMessage};
+use pi::surface::rpc_server::run;
+use pi::surface::rpc_types::RpcOptions;
 use pi::tools::ToolRegistry;
 use pi::vcr::{VcrMode, VcrRecorder};
 use serde_json::Value;

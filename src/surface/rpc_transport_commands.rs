@@ -1156,7 +1156,6 @@ pub(crate) async fn run_bash_rpc(
 
     let exit_code = loop {
         while let Ok(chunk) = rx.try_recv() {
-            let _stream_kind = chunk.kind;
             ingest_bash_rpc_chunk(
                 chunk.bytes,
                 &mut chunks,
@@ -1198,7 +1197,6 @@ pub(crate) async fn run_bash_rpc(
     loop {
         match rx.try_recv() {
             Ok(chunk) => {
-                let _stream_kind = chunk.kind;
                 ingest_bash_rpc_chunk(
                     chunk.bytes,
                     &mut chunks,

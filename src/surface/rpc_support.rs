@@ -175,7 +175,7 @@ pub(crate) fn rpc_session_message_value(message: SessionMessage) -> Value {
     value
 }
 
-fn rpc_flatten_content_blocks(value: &mut Value) {
+pub(crate) fn rpc_flatten_content_blocks(value: &mut Value) {
     let Value::Object(message_obj) = value else {
         return;
     };
@@ -626,7 +626,7 @@ pub(crate) fn fork_messages_from_entries(entries: &[crate::session::SessionEntry
     result
 }
 
-fn extract_user_text(content: &crate::model::UserContent) -> Option<String> {
+pub(crate) fn extract_user_text(content: &crate::model::UserContent) -> Option<String> {
     match content {
         crate::model::UserContent::Text(text) => Some(text.clone()),
         crate::model::UserContent::Blocks(blocks) => blocks.iter().find_map(|b| {

@@ -1,10 +1,18 @@
+use super::test_support::run_service_test_helpers::{
+    append_dispatch_grants_session_entries, build_runtime_task_report, build_submit_task_report,
+    cancel_live_run_tasks, cancel_live_run_tasks_and_sync, completed_run_verify_scope,
+    current_run_status, dispatch_run_wave, execute_run_verification, persist_run_status,
+    refresh_run_from_reliability, refresh_task_runs,
+};
+use super::test_support::{ensure_run_id_available, select_execution_tier};
 use super::*;
-use crate::agent::{Agent, AgentConfig, AgentSession};
+use crate::agent::{Agent, AgentConfig, AgentSession, QueueMode};
 use crate::auth::AuthCredential;
 use crate::compaction::ResolvedCompactionSettings;
 use crate::config::{ReliabilityConfig, parse_queue_mode};
+use crate::extensions::ExtensionUiRequest;
 use crate::model::{
-    AssistantMessage, ContentBlock, ImageContent, StopReason, StreamEvent, TextContent,
+    AssistantMessage, ContentBlock, ImageContent, Message, StopReason, StreamEvent, TextContent,
     ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::orchestration::RunVerifyScopeKind;
@@ -14,7 +22,11 @@ use crate::services::run_service::{
     execute_inline_dispatch_grant_with_worker,
 };
 use crate::session::Session;
+use crate::surface::rpc_server::try_send_line_with_backpressure;
+use crate::surface::rpc_support::session_state;
+use crate::surface::rpc_support::{extract_user_text, rpc_flatten_content_blocks};
 use crate::tools::ToolRegistry;
+use asupersync::channel::mpsc;
 use async_trait::async_trait;
 use futures::stream;
 use serde_json::json;
@@ -26,6 +38,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 
 // -----------------------------------------------------------------------
 // Helper builders
@@ -2263,7 +2276,7 @@ fn orchestration_blocker_rollup_marks_awaiting_human() {
         task_report
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("Need approval"))
+            .any(|blocker: &String| blocker.contains("Need approval"))
     );
 }
 
