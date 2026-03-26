@@ -29,13 +29,11 @@ use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::reliability;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
-use crate::surface::rpc_protocol::{
-    error_hints_value, normalize_command_type, response_error, response_error_with_hints,
-    response_ok,
-};
+use crate::surface::rpc_protocol::{error_hints_value, normalize_command_type, response_error};
 use crate::surface::rpc_runtime_commands::{self, RpcRuntimeCommandContext};
 use crate::surface::rpc_service_commands::{self, RpcServiceCommandContext};
 use crate::surface::rpc_session_commands::{self, RpcSessionCommandContext};
+use crate::surface::rpc_transport_commands::{self, RpcTransportCommandContext};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -547,7 +545,7 @@ impl RpcReliabilityState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamingBehavior {
+pub(crate) enum StreamingBehavior {
     Steer,
     FollowUp,
 }
@@ -581,7 +579,7 @@ impl RpcStateSnapshot {
     }
 }
 
-fn parse_streaming_behavior(value: Option<&Value>) -> Result<Option<StreamingBehavior>> {
+pub(crate) fn parse_streaming_behavior(value: Option<&Value>) -> Result<Option<StreamingBehavior>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -1062,7 +1060,7 @@ mod run_service_test_helpers {
 #[cfg(test)]
 use run_service_test_helpers::*;
 
-fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
+pub(crate) fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
     if images.is_empty() {
         return Message::User(UserMessage {
@@ -1080,7 +1078,7 @@ fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     })
 }
 
-fn is_extension_command(message: &str, expanded: &str) -> bool {
+pub(crate) fn is_extension_command(message: &str, expanded: &str) -> bool {
     // Extension commands start with `/` but are not expanded by the resource loader
     // (skills and prompt templates are expanded before queueing/sending).
     message.trim_start().starts_with('/') && message == expanded
@@ -1129,7 +1127,7 @@ impl RpcSharedState {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn push_steering(&mut self, message: Message) -> Result<()> {
+    pub(crate) fn push_steering(&mut self, message: Message) -> Result<()> {
         if self.steering.len() >= MAX_RPC_PENDING_MESSAGES {
             return Err(Error::session(
                 "Steering queue is full (Do you have too many pending commands?)",
@@ -1139,7 +1137,7 @@ impl RpcSharedState {
         Ok(())
     }
 
-    fn push_follow_up(&mut self, message: Message) -> Result<()> {
+    pub(crate) fn push_follow_up(&mut self, message: Message) -> Result<()> {
         if self.follow_up.len() >= MAX_RPC_PENDING_MESSAGES {
             return Err(Error::session("Follow-up queue is full"));
         }
@@ -1205,15 +1203,15 @@ pub(crate) async fn sync_agent_queue_modes(
 }
 
 /// Tracks a running bash command so it can be aborted.
-struct RunningBash {
-    id: String,
-    abort_tx: oneshot::Sender<()>,
+pub(crate) struct RunningBash {
+    pub(crate) id: String,
+    pub(crate) abort_tx: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Default)]
-struct RpcUiBridgeState {
-    active: Option<ExtensionUiRequest>,
-    queue: VecDeque<ExtensionUiRequest>,
+pub(crate) struct RpcUiBridgeState {
+    pub(crate) active: Option<ExtensionUiRequest>,
+    pub(crate) queue: VecDeque<ExtensionUiRequest>,
 }
 
 pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
@@ -1454,267 +1452,36 @@ pub async fn run(
         }
 
         match command_type {
-            "prompt" => {
-                let Some(message) = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                else {
-                    let resp = response_error(id, "prompt", "Missing message".to_string());
-                    let _ = out_tx.send(resp);
-                    continue;
-                };
-
-                let images = match parse_prompt_images(parsed.get("images")) {
-                    Ok(images) => images,
-                    Err(err) => {
-                        let resp = response_error_with_hints(id, "prompt", &err);
-                        let _ = out_tx.send(resp);
-                        continue;
-                    }
-                };
-
-                let streaming_behavior =
-                    match parse_streaming_behavior(parsed.get("streamingBehavior")) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            let resp = response_error_with_hints(id, "prompt", &err);
-                            let _ = out_tx.send(resp);
-                            continue;
-                        }
-                    };
-
-                let expanded = options.resources.expand_input(&message);
-
-                if is_streaming.load(Ordering::SeqCst) {
-                    if streaming_behavior.is_none() {
-                        let resp = response_error(
-                            id,
-                            "prompt",
-                            "Agent is currently streaming; specify streamingBehavior".to_string(),
-                        );
-                        let _ = out_tx.send(resp);
-                        continue;
-                    }
-
-                    let queued_result = {
-                        let mut state = shared_state
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        match streaming_behavior {
-                            Some(StreamingBehavior::Steer) => {
-                                state.push_steering(build_user_message(&expanded, &images))
-                            }
-                            Some(StreamingBehavior::FollowUp) => {
-                                state.push_follow_up(build_user_message(&expanded, &images))
-                            }
-                            None => Ok(()), // Unreachable due to check above
-                        }
-                    };
-
-                    match queued_result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response_ok(id, "prompt", None));
-                        }
-                        Err(err) => {
-                            let resp = response_error_with_hints(id, "prompt", &err);
-                            let _ = out_tx.send(resp);
-                        }
-                    }
-                    continue;
+            "prompt"
+            | "steer"
+            | "follow_up"
+            | "abort"
+            | "bash"
+            | "abort_bash"
+            | "extension_ui_response" => {
+                if let Some(response) = rpc_transport_commands::handle_transport_command(
+                    &parsed,
+                    command_type,
+                    id,
+                    RpcTransportCommandContext {
+                        cx: &cx,
+                        session: &session,
+                        shared_state: &shared_state,
+                        options: &options,
+                        out_tx: &out_tx,
+                        is_streaming: &is_streaming,
+                        is_compacting: &is_compacting,
+                        abort_handle: &abort_handle,
+                        bash_state: &bash_state,
+                        retry_abort: &retry_abort,
+                        rpc_extension_manager: rpc_extension_manager.as_ref(),
+                        rpc_ui_state: rpc_ui_state.as_ref(),
+                    },
+                )
+                .await?
+                {
+                    let _ = out_tx.send(response);
                 }
-
-                // Ack immediately.
-                let _ = out_tx.send(response_ok(id, "prompt", None));
-
-                is_streaming.store(true, Ordering::SeqCst);
-
-                let out_tx = out_tx.clone();
-                let session = Arc::clone(&session);
-                let shared_state = Arc::clone(&shared_state);
-                let is_streaming = Arc::clone(&is_streaming);
-                let is_compacting = Arc::clone(&is_compacting);
-                let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort = retry_abort.clone();
-                let options = options.clone();
-                let expanded = expanded.clone();
-                let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        images,
-                        cx,
-                    )
-                    .await;
-                });
-            }
-
-            "steer" => {
-                let Some(message) = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                else {
-                    let resp = response_error(id, "steer", "Missing message".to_string());
-                    let _ = out_tx.send(resp);
-                    continue;
-                };
-
-                let expanded = options.resources.expand_input(&message);
-                if is_extension_command(&message, &expanded) {
-                    let resp = response_error(
-                        id,
-                        "steer",
-                        "Extension commands are not allowed with steer".to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
-
-                if is_streaming.load(Ordering::SeqCst) {
-                    let result = shared_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_steering(build_user_message(&expanded, &[]));
-
-                    match result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response_ok(id, "steer", None));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(id, "steer", &err));
-                        }
-                    }
-                    continue;
-                }
-
-                let _ = out_tx.send(response_ok(id, "steer", None));
-
-                is_streaming.store(true, Ordering::SeqCst);
-
-                let out_tx = out_tx.clone();
-                let session = Arc::clone(&session);
-                let shared_state = Arc::clone(&shared_state);
-                let is_streaming = Arc::clone(&is_streaming);
-                let is_compacting = Arc::clone(&is_compacting);
-                let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort = retry_abort.clone();
-                let options = options.clone();
-                let expanded = expanded.clone();
-                let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        Vec::new(),
-                        cx,
-                    )
-                    .await;
-                });
-            }
-
-            "follow_up" => {
-                let Some(message) = parsed
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                else {
-                    let resp = response_error(id, "follow_up", "Missing message".to_string());
-                    let _ = out_tx.send(resp);
-                    continue;
-                };
-
-                let expanded = options.resources.expand_input(&message);
-                if is_extension_command(&message, &expanded) {
-                    let resp = response_error(
-                        id,
-                        "follow_up",
-                        "Extension commands are not allowed with follow_up".to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
-
-                if is_streaming.load(Ordering::SeqCst) {
-                    let result = shared_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_follow_up(build_user_message(&expanded, &[]));
-
-                    match result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response_ok(id, "follow_up", None));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(id, "follow_up", &err));
-                        }
-                    }
-                    continue;
-                }
-
-                let _ = out_tx.send(response_ok(id, "follow_up", None));
-
-                is_streaming.store(true, Ordering::SeqCst);
-
-                let out_tx = out_tx.clone();
-                let session = Arc::clone(&session);
-                let shared_state = Arc::clone(&shared_state);
-                let is_streaming = Arc::clone(&is_streaming);
-                let is_compacting = Arc::clone(&is_compacting);
-                let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort = retry_abort.clone();
-                let options = options.clone();
-                let expanded = expanded.clone();
-                let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        Vec::new(),
-                        cx,
-                    )
-                    .await;
-                });
-            }
-
-            "abort" => {
-                let handle = abort_handle
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("abort lock failed: {err}")))?
-                    .clone();
-                if let Some(handle) = handle {
-                    handle.abort();
-                }
-                let _ = out_tx.send(response_ok(id, "abort", None));
             }
 
             "get_state"
@@ -1755,97 +1522,6 @@ pub async fn run(
                 }
             }
 
-            "bash" => {
-                let Some(command) = parsed.get("command").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(id, "bash", "Missing command".to_string()));
-                    continue;
-                };
-
-                let mut running = bash_state
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?;
-                if running.is_some() {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "bash",
-                        "Bash command already running".to_string(),
-                    ));
-                    continue;
-                }
-
-                let run_id = uuid::Uuid::new_v4().to_string();
-                let (abort_tx, abort_rx) = oneshot::channel();
-                *running = Some(RunningBash {
-                    id: run_id.clone(),
-                    abort_tx,
-                });
-
-                let out_tx = out_tx.clone();
-                let session = Arc::clone(&session);
-                let bash_state = Arc::clone(&bash_state);
-                let command = command.to_string();
-                let id_clone = id.clone();
-                let runtime_handle = options.runtime_handle.clone();
-
-                runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    let result = run_bash_rpc(&cwd, &command, abort_rx).await;
-
-                    let response = match result {
-                        Ok(result) => {
-                            if let Ok(mut guard) = session.lock(&cx).await {
-                                if let Ok(mut inner_session) = guard.session.lock(&cx).await {
-                                    inner_session.append_message(SessionMessage::BashExecution {
-                                        command: command.clone(),
-                                        output: result.output.clone(),
-                                        exit_code: result.exit_code,
-                                        cancelled: Some(result.cancelled),
-                                        truncated: Some(result.truncated),
-                                        full_output_path: result.full_output_path.clone(),
-                                        timestamp: Some(chrono::Utc::now().timestamp_millis()),
-                                        extra: std::collections::HashMap::default(),
-                                    });
-                                }
-                                let _ = guard.persist_session().await;
-                            }
-
-                            response_ok(
-                                id_clone,
-                                "bash",
-                                Some(json!({
-                                    "output": result.output,
-                                    "exitCode": result.exit_code,
-                                    "cancelled": result.cancelled,
-                                    "truncated": result.truncated,
-                                    "fullOutputPath": result.full_output_path,
-                                })),
-                            )
-                        }
-                        Err(err) => response_error_with_hints(id_clone, "bash", &err),
-                    };
-
-                    let _ = out_tx.send(response);
-                    if let Ok(mut running) = bash_state.lock(&cx).await {
-                        if running.as_ref().is_some_and(|r| r.id == run_id) {
-                            *running = None;
-                        }
-                    }
-                });
-            }
-
-            "abort_bash" => {
-                let mut running = bash_state
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?;
-                if let Some(running_bash) = running.take() {
-                    let _ = running_bash.abort_tx.send(&cx, ());
-                }
-                let _ = out_tx.send(response_ok(id, "abort_bash", None));
-            }
-
             "compact" | "new_session" | "switch_session" | "fork" | "get_fork_messages" => {
                 if let Some(response) = rpc_session_commands::handle_session_command(
                     &parsed,
@@ -1862,91 +1538,6 @@ pub async fn run(
                 .await?
                 {
                     let _ = out_tx.send(response);
-                }
-            }
-
-            "extension_ui_response" => {
-                if let (Some(manager), Some(ui_state)) =
-                    (rpc_extension_manager.as_ref(), rpc_ui_state.as_ref())
-                {
-                    let Some(request_id) = rpc_parse_extension_ui_response_id(&parsed) else {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "extension_ui_response",
-                            "Missing requestId (or id) field",
-                        ));
-                        continue;
-                    };
-
-                    let (response, next_request) = {
-                        let Ok(mut guard) = ui_state.lock(&cx).await else {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                "Extension UI bridge unavailable",
-                            ));
-                            continue;
-                        };
-
-                        let Some(active) = guard.active.clone() else {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                "No active extension UI request",
-                            ));
-                            continue;
-                        };
-
-                        if active.id != request_id {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                format!(
-                                    "Unexpected requestId: {request_id} (active: {})",
-                                    active.id
-                                ),
-                            ));
-                            continue;
-                        }
-
-                        let response = match rpc_parse_extension_ui_response(&parsed, &active) {
-                            Ok(response) => response,
-                            Err(message) => {
-                                let _ = out_tx.send(response_error(
-                                    id,
-                                    "extension_ui_response",
-                                    message,
-                                ));
-                                continue;
-                            }
-                        };
-
-                        guard.active = None;
-                        let next = guard.queue.pop_front();
-                        if let Some(ref next) = next {
-                            guard.active = Some(next.clone());
-                        }
-                        (response, next)
-                    };
-
-                    let resolved = manager.respond_ui(response);
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "extension_ui_response",
-                        Some(json!({ "resolved": resolved })),
-                    ));
-
-                    if let Some(next) = next_request {
-                        rpc_emit_extension_ui_request(
-                            &options.runtime_handle,
-                            Arc::clone(ui_state),
-                            (*manager).clone(),
-                            out_tx.clone(),
-                            next,
-                        );
-                    }
-                } else {
-                    let _ = out_tx.send(response_ok(id, "extension_ui_response", None));
                 }
             }
 
@@ -1980,7 +1571,7 @@ pub async fn run(
 // =============================================================================
 
 #[allow(clippy::too_many_lines)]
-async fn run_prompt_with_retry(
+pub(crate) async fn run_prompt_with_retry(
     session: Arc<Mutex<AgentSession>>,
     shared_state: Arc<Mutex<RpcSharedState>>,
     is_streaming: Arc<AtomicBool>,
@@ -2199,11 +1790,11 @@ async fn run_prompt_with_retry(
 // Helpers
 // =============================================================================
 
-fn event(value: &Value) -> String {
+pub(crate) fn event(value: &Value) -> String {
     value.to_string()
 }
 
-fn rpc_emit_extension_ui_request(
+pub(crate) fn rpc_emit_extension_ui_request(
     runtime_handle: &RuntimeHandle,
     ui_state: Arc<Mutex<RpcUiBridgeState>>,
     manager: ExtensionManager,
@@ -2277,7 +1868,7 @@ fn rpc_emit_extension_ui_request(
     });
 }
 
-fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
+pub(crate) fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
     let request_id = parsed
         .get("requestId")
         .and_then(Value::as_str)
@@ -2295,7 +1886,7 @@ fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
     })
 }
 
-fn rpc_parse_extension_ui_response(
+pub(crate) fn rpc_parse_extension_ui_response(
     parsed: &Value,
     active: &ExtensionUiRequest,
 ) -> std::result::Result<ExtensionUiResponse, String> {
@@ -3459,12 +3050,12 @@ pub(crate) async fn export_html_snapshot(
 }
 
 #[derive(Debug, Clone)]
-struct BashRpcResult {
-    output: String,
-    exit_code: i32,
-    cancelled: bool,
-    truncated: bool,
-    full_output_path: Option<String>,
+pub(crate) struct BashRpcResult {
+    pub(crate) output: String,
+    pub(crate) exit_code: i32,
+    pub(crate) cancelled: bool,
+    pub(crate) truncated: bool,
+    pub(crate) full_output_path: Option<String>,
 }
 
 const fn line_count_from_newline_count(
@@ -3584,7 +3175,7 @@ async fn ingest_bash_rpc_chunk(
     }
 }
 
-async fn run_bash_rpc(
+pub(crate) async fn run_bash_rpc(
     cwd: &std::path::Path,
     command: &str,
     abort_rx: oneshot::Receiver<()>,
@@ -3788,7 +3379,7 @@ async fn run_bash_rpc(
     })
 }
 
-fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
+pub(crate) fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
