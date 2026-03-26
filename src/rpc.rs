@@ -35,6 +35,7 @@ use crate::surface::rpc_protocol::{
 };
 use crate::surface::rpc_runtime_commands::{self, RpcRuntimeCommandContext};
 use crate::surface::rpc_service_commands::{self, RpcServiceCommandContext};
+use crate::surface::rpc_session_commands::{self, RpcSessionCommandContext};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -1175,6 +1176,11 @@ impl RpcSharedState {
     pub(crate) fn set_auto_retry_enabled(&mut self, enabled: bool) {
         self.auto_retry_enabled = enabled;
     }
+
+    pub(crate) fn clear_pending(&mut self) {
+        self.steering.clear();
+        self.follow_up.clear();
+    }
 }
 
 pub(crate) async fn sync_agent_queue_modes(
@@ -1840,298 +1846,23 @@ pub async fn run(
                 let _ = out_tx.send(response_ok(id, "abort_bash", None));
             }
 
-            "compact" => {
-                let custom_instructions = parsed
-                    .get("customInstructions")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-
-                let data = {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let path_entries = {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.ensure_entry_ids();
-                        inner_session
-                            .entries_for_current_path()
-                            .into_iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    };
-
-                    let key = guard
-                        .agent
-                        .stream_options()
-                        .api_key
-                        .as_deref()
-                        .ok_or_else(|| Error::auth("Missing API key for compaction"))?;
-
-                    let provider = guard.agent.provider();
-
-                    let settings = ResolvedCompactionSettings {
-                        enabled: options.config.compaction_enabled(),
-                        reserve_tokens: options.config.compaction_reserve_tokens(),
-                        keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
-                        ..Default::default()
-                    };
-
-                    let prep = prepare_compaction(&path_entries, settings).ok_or_else(|| {
-                        Error::session(
-                            "Compaction not available (already compacted or missing IDs)",
-                        )
-                    })?;
-
-                    is_compacting.store(true, Ordering::SeqCst);
-                    let result =
-                        compact(prep, provider, key, custom_instructions.as_deref()).await?;
-                    is_compacting.store(false, Ordering::SeqCst);
-                    let details_value = compaction_details_to_value(&result.details)?;
-
-                    let messages = {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_compaction(
-                            result.summary.clone(),
-                            result.first_kept_entry_id.clone(),
-                            result.tokens_before,
-                            Some(details_value.clone()),
-                            None,
-                        );
-                        inner_session.to_messages_for_current_path()
-                    };
-                    guard.persist_session().await?;
-                    guard.agent.replace_messages(messages);
-
-                    json!({
-                        "summary": result.summary,
-                        "firstKeptEntryId": result.first_kept_entry_id,
-                        "tokensBefore": result.tokens_before,
-                        "details": details_value,
-                    })
-                };
-
-                let _ = out_tx.send(response_ok(id, "compact", Some(data)));
-            }
-
-            "new_session" => {
-                let parent = parsed
-                    .get("parentSession")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let (session_dir, provider, model_id, thinking_level) = {
-                        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        (
-                            inner_session.session_dir.clone(),
-                            inner_session.header.provider.clone(),
-                            inner_session.header.model_id.clone(),
-                            inner_session.header.thinking_level.clone(),
-                        )
-                    };
-                    let mut new_session = if guard.save_enabled() {
-                        crate::session::Session::create_with_dir(session_dir)
-                    } else {
-                        crate::session::Session::in_memory()
-                    };
-                    new_session.header.parent_session = parent;
-                    // Keep model fields in header for clients.
-                    new_session.header.provider.clone_from(&provider);
-                    new_session.header.model_id.clone_from(&model_id);
-                    new_session
-                        .header
-                        .thinking_level
-                        .clone_from(&thinking_level);
-
-                    let session_id = new_session.header.id.clone();
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        *inner_session = new_session;
-                    }
-                    guard.agent.clear_messages();
-                    guard.agent.stream_options_mut().session_id = Some(session_id);
-                }
-                {
-                    let mut state = shared_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                    state.steering.clear();
-                    state.follow_up.clear();
-                }
-                let _ = out_tx.send(response_ok(
+            "compact" | "new_session" | "switch_session" | "fork" | "get_fork_messages" => {
+                if let Some(response) = rpc_session_commands::handle_session_command(
+                    &parsed,
+                    command_type,
                     id,
-                    "new_session",
-                    Some(json!({ "cancelled": false })),
-                ));
-            }
-
-            "switch_session" => {
-                let Some(session_path) = parsed.get("sessionPath").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "switch_session",
-                        "Missing sessionPath".to_string(),
-                    ));
-                    continue;
-                };
-
-                let loaded = crate::session::Session::open(session_path).await;
-                match loaded {
-                    Ok(new_session) => {
-                        let messages = new_session.to_messages_for_current_path();
-                        let session_id = new_session.header.id.clone();
-                        let mut guard = session
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                        {
-                            let mut inner_session =
-                                guard.session.lock(&cx).await.map_err(|err| {
-                                    Error::session(format!("inner session lock failed: {err}"))
-                                })?;
-                            *inner_session = new_session;
-                        }
-                        guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id = Some(session_id);
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "switch_session",
-                            Some(json!({ "cancelled": false })),
-                        ));
-                        let mut state = shared_state
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        state.steering.clear();
-                        state.follow_up.clear();
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
-                    }
-                }
-            }
-
-            "fork" => {
-                let Some(entry_id) = parsed.get("entryId").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(id, "fork", "Missing entryId".to_string()));
-                    continue;
-                };
-
-                // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
-                let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    let plan = inner.plan_fork_from_user_message(entry_id)?;
-                    let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
-                    let session_dir = inner.session_dir.clone();
-                    let header = inner.header.clone();
-                    (plan, parent_path, session_dir, guard.save_enabled(), header)
-                    // Both locks released here.
-                };
-
-                // Phase 2: Build new session without holding any lock.
-                let crate::session::ForkPlan {
-                    entries,
-                    leaf_id,
-                    selected_text,
-                } = fork_plan;
-
-                let mut new_session = if save_enabled {
-                    crate::session::Session::create_with_dir(session_dir)
-                } else {
-                    crate::session::Session::in_memory()
-                };
-                new_session.header.parent_session = parent_path;
-                new_session
-                    .header
-                    .provider
-                    .clone_from(&header_snapshot.provider);
-                new_session
-                    .header
-                    .model_id
-                    .clone_from(&header_snapshot.model_id);
-                new_session
-                    .header
-                    .thinking_level
-                    .clone_from(&header_snapshot.thinking_level);
-                new_session.entries = entries;
-                new_session.leaf_id = leaf_id;
-                new_session.ensure_entry_ids();
-
-                let messages = new_session.to_messages_for_current_path();
-                let session_id = new_session.header.id.clone();
-
-                // Phase 3: Swap — brief lock to install the new session.
+                    RpcSessionCommandContext {
+                        cx: &cx,
+                        session: &session,
+                        shared_state: &shared_state,
+                        options: &options,
+                        is_compacting: &is_compacting,
+                    },
+                )
+                .await?
                 {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let mut inner = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    *inner = new_session;
-                    drop(inner);
-                    guard.agent.replace_messages(messages);
-                    guard.agent.stream_options_mut().session_id = Some(session_id);
+                    let _ = out_tx.send(response);
                 }
-
-                {
-                    let mut state = shared_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                    state.steering.clear();
-                    state.follow_up.clear();
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "fork",
-                    Some(json!({ "text": selected_text, "cancelled": false })),
-                ));
-            }
-
-            "get_fork_messages" => {
-                // Snapshot entries under brief lock, compute messages outside.
-                let path_entries = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    inner_session
-                        .entries_for_current_path()
-                        .into_iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-                let messages = fork_messages_from_entries(&path_entries);
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "get_fork_messages",
-                    Some(json!({ "messages": messages })),
-                ));
             }
 
             "extension_ui_response" => {
@@ -4170,7 +3901,7 @@ pub(crate) async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEn
 ///
 /// Used by the non-blocking `get_fork_messages` path where entries are
 /// captured under a brief lock and messages are computed outside the lock.
-fn fork_messages_from_entries(entries: &[crate::session::SessionEntry]) -> Vec<Value> {
+pub(crate) fn fork_messages_from_entries(entries: &[crate::session::SessionEntry]) -> Vec<Value> {
     let mut result = Vec::new();
 
     for entry in entries {
@@ -4322,7 +4053,7 @@ mod tests {
     use crate::agent::{Agent, AgentConfig, AgentSession};
     use crate::auth::AuthCredential;
     use crate::compaction::ResolvedCompactionSettings;
-    use crate::config::ReliabilityConfig;
+    use crate::config::{ReliabilityConfig, parse_queue_mode};
     use crate::model::{
         AssistantMessage, ContentBlock, ImageContent, StopReason, StreamEvent, TextContent,
         ThinkingLevel, Usage, UserContent, UserMessage,

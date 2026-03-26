@@ -24,6 +24,7 @@ pub mod routing;
 pub mod rpc_protocol;
 pub mod rpc_runtime_commands;
 pub mod rpc_service_commands;
+pub mod rpc_session_commands;
 pub mod startup;
 
 use crate::agent::AgentSession;
