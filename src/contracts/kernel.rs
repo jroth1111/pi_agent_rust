@@ -1,234 +1,222 @@
-//! Composition-kernel types for wiring authoritative runtime services.
+//! Concrete application composition root for CLI surface startup.
 //!
-//! Surfaces should obtain engine/plane access through this bundle rather than
-//! constructing ad hoc service sets or reaching into engine internals.
+//! The previous builder required a full control-plane implementation that does
+//! not exist in this repo, so it could never become the active assembly path.
+//! This kernel is the real composition root for the live CLI startup flow:
+//! `main.rs` hands the parsed CLI to this type, and the kernel drives surface
+//! bootstrap, model selection, agent-session assembly, and final route dispatch.
 
-use crate::contracts::engine::{
-    ConversationContract, PersistenceContract, WorkerRuntimeContract, WorkflowContract,
-};
-use crate::contracts::plane::{
-    AdmissionContract, CapabilityContract, ContextContract, ExtensionRuntimeContract,
-    HostExecutionContract, IdentityContract, InferenceContract, WorkspaceContract,
-};
-use crate::error::{Error, Result};
-use std::sync::Arc;
+use std::path::PathBuf;
 
-/// Typed bundle of authoritative runtime services.
+use anyhow::Result;
+use asupersync::runtime::RuntimeHandle;
+
+use crate::cli;
+use crate::config::Config;
+use crate::error::Error;
+use crate::models::ModelRegistry;
+use crate::session::Session;
+use crate::surface::extension_runtime::{
+    resolve_surface_extension_runtime_flavor, spawn_surface_extension_prewarm,
+};
+use crate::surface::routing::run_selected_surface_route;
+use crate::surface::startup::{
+    PreparedSurfaceInputs, StartupResources, SurfaceSelectionOutcome, build_surface_agent_session,
+    flush_session_autosave_on_shutdown, load_surface_startup_resources, prepare_surface_inputs,
+    refresh_surface_startup_auth, resolve_surface_model_selection, spawn_session_index_maintenance,
+};
+
+type ListModelsFn = fn(&ModelRegistry, Option<&str>);
+
+/// Active runtime composition root for CLI-driven surface execution.
 #[derive(Clone)]
 pub struct ApplicationKernel {
-    conversation: Arc<dyn ConversationContract>,
-    workflow: Arc<dyn WorkflowContract>,
-    persistence: Arc<dyn PersistenceContract>,
-    worker_runtime: Arc<dyn WorkerRuntimeContract>,
-    inference: Arc<dyn InferenceContract>,
-    context: Arc<dyn ContextContract>,
-    workspace: Arc<dyn WorkspaceContract>,
-    host_execution: Arc<dyn HostExecutionContract>,
-    identity: Arc<dyn IdentityContract>,
-    capability: Arc<dyn CapabilityContract>,
-    admission: Arc<dyn AdmissionContract>,
-    extension_runtime: Arc<dyn ExtensionRuntimeContract>,
+    runtime_handle: RuntimeHandle,
+    cwd: PathBuf,
+    list_models: ListModelsFn,
 }
 
 impl ApplicationKernel {
+    #[must_use]
+    pub fn new(runtime_handle: RuntimeHandle, cwd: PathBuf, list_models: ListModelsFn) -> Self {
+        Self {
+            runtime_handle,
+            cwd,
+            list_models,
+        }
+    }
+
     #[must_use]
     pub fn builder() -> ApplicationKernelBuilder {
         ApplicationKernelBuilder::default()
     }
 
-    #[must_use]
-    pub fn conversation(&self) -> Arc<dyn ConversationContract> {
-        Arc::clone(&self.conversation)
-    }
+    /// Run the authoritative CLI surface bootstrap and route dispatch flow.
+    ///
+    /// This is the live composition path for the CLI binary. It owns startup
+    /// orchestration and delegates subordinate work to surface helpers.
+    pub async fn run_cli_surface(
+        &self,
+        mut cli: cli::Cli,
+        extension_flags: Vec<cli::ExtensionCliFlag>,
+    ) -> Result<()> {
+        spawn_session_index_maintenance();
 
-    #[must_use]
-    pub fn workflow(&self) -> Arc<dyn WorkflowContract> {
-        Arc::clone(&self.workflow)
-    }
+        let StartupResources {
+            config,
+            resources,
+            mut auth,
+            resource_cli,
+        } = load_surface_startup_resources(&cli, &extension_flags, &self.cwd).await?;
 
-    #[must_use]
-    pub fn persistence(&self) -> Arc<dyn PersistenceContract> {
-        Arc::clone(&self.persistence)
-    }
+        let extension_runtime_flavor = resolve_surface_extension_runtime_flavor(&resources)?;
+        let extension_prewarm_handle = spawn_surface_extension_prewarm(
+            &self.runtime_handle,
+            &cli,
+            &config,
+            &self.cwd,
+            extension_runtime_flavor,
+        );
 
-    #[must_use]
-    pub fn worker_runtime(&self) -> Arc<dyn WorkerRuntimeContract> {
-        Arc::clone(&self.worker_runtime)
-    }
+        refresh_surface_startup_auth(&mut auth).await?;
+        let package_dir = Config::package_dir();
 
-    #[must_use]
-    pub fn inference(&self) -> Arc<dyn InferenceContract> {
-        Arc::clone(&self.inference)
-    }
+        let Some(PreparedSurfaceInputs {
+            global_dir,
+            models_path,
+            mut model_registry,
+            initial,
+            messages,
+            surface_bootstrap,
+            mode,
+            non_interactive_guard,
+            scoped_patterns,
+        }) = prepare_surface_inputs(&mut cli, &config, &auth, &self.cwd, self.list_models).await?
+        else {
+            return Ok(());
+        };
 
-    #[must_use]
-    pub fn context(&self) -> Arc<dyn ContextContract> {
-        Arc::clone(&self.context)
-    }
+        let session = Box::pin(Session::new(&cli, &config)).await?;
 
-    #[must_use]
-    pub fn workspace(&self) -> Arc<dyn WorkspaceContract> {
-        Arc::clone(&self.workspace)
-    }
+        let (selection, resolved_key) = match resolve_surface_model_selection(
+            &surface_bootstrap,
+            non_interactive_guard.as_ref(),
+            &mut auth,
+            &mut cli,
+            &models_path,
+            &mut model_registry,
+            &scoped_patterns,
+            &global_dir,
+            &config,
+            &session,
+        )
+        .await?
+        {
+            SurfaceSelectionOutcome::Selected(resolution) => {
+                (resolution.selection, resolution.resolved_key)
+            }
+            SurfaceSelectionOutcome::ExitQuietly => return Ok(()),
+        };
 
-    #[must_use]
-    pub fn host_execution(&self) -> Arc<dyn HostExecutionContract> {
-        Arc::clone(&self.host_execution)
-    }
+        let enabled_tools = cli.enabled_tools();
+        let skills_prompt = if enabled_tools.contains(&"read") {
+            resources.format_skills_for_prompt()
+        } else {
+            String::new()
+        };
+        let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
 
-    #[must_use]
-    pub fn identity(&self) -> Arc<dyn IdentityContract> {
-        Arc::clone(&self.identity)
-    }
+        let agent_session = build_surface_agent_session(
+            &cli,
+            &config,
+            &self.cwd,
+            &selection,
+            resolved_key,
+            session,
+            &mut model_registry,
+            &mut auth,
+            &enabled_tools,
+            if skills_prompt.is_empty() {
+                None
+            } else {
+                Some(skills_prompt.as_str())
+            },
+            &global_dir,
+            &package_dir,
+            test_mode,
+            &extension_flags,
+            resources.extensions(),
+            extension_prewarm_handle,
+        )
+        .await?;
 
-    #[must_use]
-    pub fn capability(&self) -> Arc<dyn CapabilityContract> {
-        Arc::clone(&self.capability)
-    }
+        let session_handle = agent_session.session.clone();
+        let result = run_selected_surface_route(
+            surface_bootstrap.route_kind,
+            agent_session,
+            &selection,
+            model_registry.get_available(),
+            initial,
+            messages,
+            resources,
+            &config,
+            auth.clone(),
+            self.runtime_handle.clone(),
+            resource_cli,
+            self.cwd.clone(),
+            !cli.no_session,
+            &mode,
+        )
+        .await;
 
-    #[must_use]
-    pub fn admission(&self) -> Arc<dyn AdmissionContract> {
-        Arc::clone(&self.admission)
-    }
-
-    #[must_use]
-    pub fn extension_runtime(&self) -> Arc<dyn ExtensionRuntimeContract> {
-        Arc::clone(&self.extension_runtime)
+        flush_session_autosave_on_shutdown(&session_handle, cli.no_session).await;
+        result
     }
 }
 
 /// Builder for [`ApplicationKernel`].
 #[derive(Default)]
 pub struct ApplicationKernelBuilder {
-    conversation: Option<Arc<dyn ConversationContract>>,
-    workflow: Option<Arc<dyn WorkflowContract>>,
-    persistence: Option<Arc<dyn PersistenceContract>>,
-    worker_runtime: Option<Arc<dyn WorkerRuntimeContract>>,
-    inference: Option<Arc<dyn InferenceContract>>,
-    context: Option<Arc<dyn ContextContract>>,
-    workspace: Option<Arc<dyn WorkspaceContract>>,
-    host_execution: Option<Arc<dyn HostExecutionContract>>,
-    identity: Option<Arc<dyn IdentityContract>>,
-    capability: Option<Arc<dyn CapabilityContract>>,
-    admission: Option<Arc<dyn AdmissionContract>>,
-    extension_runtime: Option<Arc<dyn ExtensionRuntimeContract>>,
+    runtime_handle: Option<RuntimeHandle>,
+    cwd: Option<PathBuf>,
+    list_models: Option<ListModelsFn>,
 }
 
 impl ApplicationKernelBuilder {
     #[must_use]
-    pub fn conversation(mut self, service: Arc<dyn ConversationContract>) -> Self {
-        self.conversation = Some(service);
+    pub fn runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
+        self.runtime_handle = Some(runtime_handle);
         self
     }
 
     #[must_use]
-    pub fn workflow(mut self, service: Arc<dyn WorkflowContract>) -> Self {
-        self.workflow = Some(service);
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
         self
     }
 
     #[must_use]
-    pub fn persistence(mut self, service: Arc<dyn PersistenceContract>) -> Self {
-        self.persistence = Some(service);
+    pub fn list_models(mut self, list_models: ListModelsFn) -> Self {
+        self.list_models = Some(list_models);
         self
     }
 
-    #[must_use]
-    pub fn worker_runtime(mut self, service: Arc<dyn WorkerRuntimeContract>) -> Self {
-        self.worker_runtime = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn inference(mut self, service: Arc<dyn InferenceContract>) -> Self {
-        self.inference = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn context(mut self, service: Arc<dyn ContextContract>) -> Self {
-        self.context = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn workspace(mut self, service: Arc<dyn WorkspaceContract>) -> Self {
-        self.workspace = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn host_execution(mut self, service: Arc<dyn HostExecutionContract>) -> Self {
-        self.host_execution = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn identity(mut self, service: Arc<dyn IdentityContract>) -> Self {
-        self.identity = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn capability(mut self, service: Arc<dyn CapabilityContract>) -> Self {
-        self.capability = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn admission(mut self, service: Arc<dyn AdmissionContract>) -> Self {
-        self.admission = Some(service);
-        self
-    }
-
-    #[must_use]
-    pub fn extension_runtime(mut self, service: Arc<dyn ExtensionRuntimeContract>) -> Self {
-        self.extension_runtime = Some(service);
-        self
-    }
-
-    /// Build the kernel once all authoritative services are present.
+    /// Build the kernel once the runtime dependencies are present.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if any required service is missing.
-    pub fn build(self) -> Result<ApplicationKernel> {
+    /// Returns a validation error when the concrete startup dependencies are
+    /// missing.
+    pub fn build(self) -> crate::error::Result<ApplicationKernel> {
         Ok(ApplicationKernel {
-            conversation: self.conversation.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `conversation`")
+            runtime_handle: self.runtime_handle.ok_or_else(|| {
+                Error::validation("missing ApplicationKernel dependency `runtime_handle`")
             })?,
-            workflow: self
-                .workflow
-                .ok_or_else(|| Error::validation("missing ApplicationKernel service `workflow`"))?,
-            persistence: self.persistence.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `persistence`")
-            })?,
-            worker_runtime: self.worker_runtime.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `worker_runtime`")
-            })?,
-            inference: self.inference.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `inference`")
-            })?,
-            context: self
-                .context
-                .ok_or_else(|| Error::validation("missing ApplicationKernel service `context`"))?,
-            workspace: self.workspace.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `workspace`")
-            })?,
-            host_execution: self.host_execution.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `host_execution`")
-            })?,
-            identity: self
-                .identity
-                .ok_or_else(|| Error::validation("missing ApplicationKernel service `identity`"))?,
-            capability: self.capability.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `capability`")
-            })?,
-            admission: self.admission.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `admission`")
-            })?,
-            extension_runtime: self.extension_runtime.ok_or_else(|| {
-                Error::validation("missing ApplicationKernel service `extension_runtime`")
+            cwd: self
+                .cwd
+                .ok_or_else(|| Error::validation("missing ApplicationKernel dependency `cwd`"))?,
+            list_models: self.list_models.ok_or_else(|| {
+                Error::validation("missing ApplicationKernel dependency `list_models`")
             })?,
         })
     }

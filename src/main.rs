@@ -43,6 +43,7 @@ use pi::auth::AuthStorage;
 use pi::cli;
 use pi::config::Config;
 use pi::config::SettingsScope;
+use pi::contracts::ApplicationKernel;
 use pi::extension_index::ExtensionIndexStore;
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{
@@ -55,7 +56,6 @@ use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::extension_policy::{
     print_resolved_extension_policy, print_resolved_repair_policy,
 };
-use pi::surface::startup::run_cli_surface;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -311,7 +311,9 @@ async fn run(
         }
     }
 
-    run_cli_surface(cli, extension_flags, runtime_handle, cwd, list_models).await
+    ApplicationKernel::new(runtime_handle, cwd, list_models)
+        .run_cli_surface(cli, extension_flags)
+        .await
 }
 
 async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
