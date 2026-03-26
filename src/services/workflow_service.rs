@@ -567,7 +567,7 @@ impl WorkflowStore {
 
         use crate::orchestration::ExecutionTier;
         let mut run = RunStatus::new(&run_id, &objective, ExecutionTier::Wave);
-        run.task_ids = task_ids.clone();
+        run.task_ids.clone_from(&task_ids);
 
         for task_id in &task_ids {
             self.task_runs
@@ -802,7 +802,7 @@ impl WorkflowStore {
     }
 
     /// Get lease manager reference.
-    pub fn leases(&self) -> &LeaseManager {
+    pub const fn leases(&self) -> &LeaseManager {
         &self.leases
     }
 
@@ -826,7 +826,7 @@ impl WorkflowStore {
     }
 
     /// Get artifact store reference.
-    pub fn artifacts(&self) -> &FsArtifactStore {
+    pub const fn artifacts(&self) -> &FsArtifactStore {
         &self.artifacts
     }
 
@@ -1190,8 +1190,6 @@ impl WorkflowMigrationCutover {
         workflow_store: &WorkflowStore,
         errors: &mut Vec<String>,
     ) -> bool {
-        let mut ok = true;
-
         // Verify task count
         if workflow_store.task_count() != reliability.tasks.len() {
             errors.push(format!(
@@ -1199,7 +1197,6 @@ impl WorkflowMigrationCutover {
                 workflow_store.task_count(),
                 reliability.tasks.len()
             ));
-            ok = false;
         }
 
         // Verify each task's state
@@ -1210,7 +1207,6 @@ impl WorkflowMigrationCutover {
                         "Task {task_id} state mismatch: store={:?}, legacy={:?}",
                         store_task.runtime.state, legacy_task.runtime.state
                     ));
-                    ok = false;
                 }
             }
         }
@@ -1223,7 +1219,6 @@ impl WorkflowMigrationCutover {
                 workflow_store.run_count(),
                 orchestration_runs.len()
             ));
-            ok = false;
         }
 
         // Verify each run's lifecycle
@@ -1234,7 +1229,6 @@ impl WorkflowMigrationCutover {
                         "Run {} lifecycle mismatch: store={:?}, legacy={:?}",
                         legacy_run.run_id, store_run.lifecycle, legacy_run.lifecycle
                     ));
-                    ok = false;
                 }
             }
         }
@@ -1246,10 +1240,9 @@ impl WorkflowMigrationCutover {
                 workflow_store.edges().len(),
                 reliability.edges.len()
             ));
-            ok = false;
         }
 
-        ok
+        errors.is_empty()
     }
 
     /// Check if the workflow store is in a migrated state (has tasks/runs
@@ -1302,7 +1295,7 @@ pub struct WorkflowService {
 
 impl WorkflowService {
     /// Create a new workflow service from the given store.
-    pub fn new(store: WorkflowStore) -> Self {
+    pub const fn new(store: WorkflowStore) -> Self {
         Self {
             store: Mutex::new(store),
         }
@@ -1539,7 +1532,7 @@ impl WorkflowContract for WorkflowService {
 // ============================================================================
 
 /// Convert orchestration RunLifecycle to contract RunLifecycle.
-fn convert_run_lifecycle(lifecycle: RunLifecycle) -> crate::contracts::engine::RunLifecycle {
+const fn convert_run_lifecycle(lifecycle: RunLifecycle) -> crate::contracts::engine::RunLifecycle {
     match lifecycle {
         RunLifecycle::Pending => crate::contracts::engine::RunLifecycle::Pending,
         RunLifecycle::Running => crate::contracts::engine::RunLifecycle::Active,
