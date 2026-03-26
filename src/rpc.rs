@@ -1082,7 +1082,7 @@ pub(crate) struct RpcSharedState {
 const MAX_RPC_PENDING_MESSAGES: usize = 128;
 
 impl RpcSharedState {
-    fn new(config: &Config) -> Self {
+    pub(crate) fn new(config: &Config) -> Self {
         Self {
             steering: VecDeque::new(),
             follow_up: VecDeque::new(),
@@ -1115,14 +1115,14 @@ impl RpcSharedState {
         Ok(())
     }
 
-    fn pop_steering(&mut self) -> Vec<Message> {
+    pub(crate) fn pop_steering(&mut self) -> Vec<Message> {
         match self.steering_mode {
             QueueMode::All => self.steering.drain(..).collect(),
             QueueMode::OneAtATime => self.steering.pop_front().into_iter().collect(),
         }
     }
 
-    fn pop_follow_up(&mut self) -> Vec<Message> {
+    pub(crate) fn pop_follow_up(&mut self) -> Vec<Message> {
         match self.follow_up_mode {
             QueueMode::All => self.follow_up.drain(..).collect(),
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
@@ -1192,7 +1192,21 @@ pub(crate) struct RpcUiBridgeState {
     pub(crate) queue: VecDeque<ExtensionUiRequest>,
 }
 
-pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
+pub async fn run_stdio(session: AgentSession, options: RpcOptions) -> Result<()> {
+    crate::surface::rpc_server::run_stdio(session, options).await
+}
+
+pub async fn run(
+    session: AgentSession,
+    options: RpcOptions,
+    in_rx: mpsc::Receiver<String>,
+    out_tx: std::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    crate::surface::rpc_server::run(session, options, in_rx, out_tx).await
+}
+
+#[allow(dead_code)]
+async fn legacy_run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
     session.agent.set_queue_modes(
         options.config.steering_queue_mode(),
         options.config.follow_up_queue_mode(),
@@ -1245,7 +1259,8 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     clippy::significant_drop_tightening,
     clippy::significant_drop_in_scrutinee
 )]
-pub async fn run(
+#[allow(dead_code)]
+async fn legacy_run(
     session: AgentSession,
     options: RpcOptions,
     in_rx: mpsc::Receiver<String>,
