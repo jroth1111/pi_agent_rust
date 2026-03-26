@@ -2091,9 +2091,14 @@ impl Session {
         self.ensure_integrity()?;
 
         // === VAL-SESS-005: Hydration fidelity gate ===
-        // Ensure the session is fully hydrated before any save that could
-        // silently discard dormant branches. Partial hydration is only
-        // acceptable when the V2 rehydration path can restore all entries.
+        // Step 1: Attempt transparent rehydration when partial hydration is
+        // active and a V2 sidecar is available. This preserves the fail-closed
+        // anti-data-loss requirement by automatically restoring all entries
+        // before any write that could discard dormant branches.
+        // Step 2: After rehydration attempt, verify the session is fully
+        // hydrated. If rehydration failed or the flag is still set, fail
+        // closed to prevent silent data loss.
+        self.ensure_full_v2_hydration_before_save()?;
         self.ensure_hydration_fidelity()?;
 
         // === Authoritative event store path ===
@@ -2179,14 +2184,13 @@ impl Session {
             SessionStoreKind::Jsonl => {
                 let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
 
-                if self.should_full_rewrite() {
-                    if self.v2_partial_hydration {
-                        self.ensure_full_v2_hydration_before_save()?;
-                    }
-                    // Gap C: use incrementally maintained stats instead of O(n) scan.
-                    let message_count = self.cached_message_count;
+                // Gap C: use incrementally maintained stats instead of O(n) scan.
+                let message_count = self.cached_message_count;
+                let session_name = self.cached_name.clone();
 
-                    let session_name = self.cached_name.clone();
+                if self.should_full_rewrite() {
+                    // Full rehydration already happened above in the VAL-SESS-005
+                    // gate, so v2_partial_hydration is guaranteed false here.
                     // === Full rewrite path (first save, header change, checkpoint) ===
                     let (tx, rx) = oneshot::channel::<JsonlSaveResult>();
 
@@ -2267,11 +2271,9 @@ impl Session {
                         }
                     }?;
                 } else {
-                    let message_count = self.cached_message_count;
                     // === Incremental append path ===
                     let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
-                        let session_name = self.cached_name.clone();
                         // Pre-serialize new entries into a single buffer (typically 1-3 entries).
                         let new_entries = &self.entries[new_start..];
                         let mut serialized_buf = Vec::with_capacity(new_entries.len() * 512);
