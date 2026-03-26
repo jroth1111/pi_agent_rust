@@ -22,6 +22,7 @@ pub mod extension_policy;
 pub mod extension_runtime;
 pub mod routing;
 pub mod rpc_protocol;
+pub mod rpc_runtime_commands;
 pub mod rpc_service_commands;
 pub mod startup;
 

@@ -26,7 +26,6 @@ use crate::model::{
 use crate::models::ModelEntry;
 use crate::orchestration::{RunStatus, RunStore};
 use crate::provider_metadata::{canonical_provider_id, provider_metadata};
-use crate::providers;
 use crate::reliability;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
@@ -34,6 +33,7 @@ use crate::surface::rpc_protocol::{
     error_hints_value, normalize_command_type, response_error, response_error_with_hints,
     response_ok,
 };
+use crate::surface::rpc_runtime_commands::{self, RpcRuntimeCommandContext};
 use crate::surface::rpc_service_commands::{self, RpcServiceCommandContext};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
@@ -67,7 +67,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::Path;
 
-fn provider_ids_match(left: &str, right: &str) -> bool {
+pub(crate) fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
     if left.eq_ignore_ascii_case(right) {
@@ -552,7 +552,7 @@ enum StreamingBehavior {
 }
 
 #[derive(Debug, Clone)]
-struct RpcStateSnapshot {
+pub(crate) struct RpcStateSnapshot {
     steering_count: usize,
     follow_up_count: usize,
     steering_mode: QueueMode,
@@ -575,12 +575,10 @@ impl From<&RpcSharedState> for RpcStateSnapshot {
 }
 
 impl RpcStateSnapshot {
-    const fn pending_count(&self) -> usize {
+    pub(crate) const fn pending_count(&self) -> usize {
         self.steering_count + self.follow_up_count
     }
 }
-
-use crate::config::parse_queue_mode;
 
 fn parse_streaming_behavior(value: Option<&Value>) -> Result<Option<StreamingBehavior>> {
     let Some(value) = value else {
@@ -1161,9 +1159,25 @@ impl RpcSharedState {
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
         }
     }
+
+    pub(crate) fn set_steering_mode(&mut self, mode: QueueMode) {
+        self.steering_mode = mode;
+    }
+
+    pub(crate) fn set_follow_up_mode(&mut self, mode: QueueMode) {
+        self.follow_up_mode = mode;
+    }
+
+    pub(crate) fn set_auto_compaction_enabled(&mut self, enabled: bool) {
+        self.auto_compaction_enabled = enabled;
+    }
+
+    pub(crate) fn set_auto_retry_enabled(&mut self, enabled: bool) {
+        self.auto_retry_enabled = enabled;
+    }
 }
 
-async fn sync_agent_queue_modes(
+pub(crate) async fn sync_agent_queue_modes(
     session: &Arc<Mutex<AgentSession>>,
     shared_state: &Arc<Mutex<RpcSharedState>>,
     cx: &AgentCx,
@@ -1697,438 +1711,42 @@ pub async fn run(
                 let _ = out_tx.send(response_ok(id, "abort", None));
             }
 
-            "get_state" => {
-                let snapshot = {
-                    let state = shared_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                    RpcStateSnapshot::from(&*state)
-                };
-                let data = {
-                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    session_state(
-                        &inner_session,
-                        &options,
-                        &snapshot,
-                        is_streaming.load(Ordering::SeqCst),
-                        is_compacting.load(Ordering::SeqCst),
-                    )
-                };
-                let _ = out_tx.send(response_ok(id, "get_state", Some(data)));
-            }
-
-            "get_session_stats" => {
-                let data = {
-                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    session_stats(&inner_session)
-                };
-                let _ = out_tx.send(response_ok(id, "get_session_stats", Some(data)));
-            }
-
-            "get_messages" => {
-                let messages = {
-                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    inner_session
-                        .entries_for_current_path()
-                        .iter()
-                        .filter_map(|entry| match entry {
-                            crate::session::SessionEntry::Message(msg) => match msg.message {
-                                SessionMessage::User { .. }
-                                | SessionMessage::Assistant { .. }
-                                | SessionMessage::ToolResult { .. }
-                                | SessionMessage::BashExecution { .. } => Some(msg.message.clone()),
-                                _ => None,
-                            },
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let messages = messages
-                    .into_iter()
-                    .map(rpc_session_message_value)
-                    .collect::<Vec<_>>();
-                let _ = out_tx.send(response_ok(
+            "get_state"
+            | "get_session_stats"
+            | "get_messages"
+            | "get_available_models"
+            | "set_model"
+            | "cycle_model"
+            | "set_thinking_level"
+            | "cycle_thinking_level"
+            | "set_steering_mode"
+            | "set_follow_up_mode"
+            | "set_auto_compaction"
+            | "set_auto_retry"
+            | "abort_retry"
+            | "set_session_name"
+            | "get_last_assistant_text"
+            | "export_html"
+            | "get_commands" => {
+                if let Some(response) = rpc_runtime_commands::handle_runtime_command(
+                    &parsed,
+                    command_type,
                     id,
-                    "get_messages",
-                    Some(json!({ "messages": messages })),
-                ));
-            }
-
-            "get_available_models" => {
-                let models = options
-                    .available_models
-                    .iter()
-                    .map(rpc_model_from_entry)
-                    .collect::<Vec<_>>();
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "get_available_models",
-                    Some(json!({ "models": models })),
-                ));
-            }
-
-            "set_model" => {
-                let Some(provider) = parsed.get("provider").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_model",
-                        "Missing provider".to_string(),
-                    ));
-                    continue;
-                };
-                let Some(model_id) = parsed.get("modelId").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_model",
-                        "Missing modelId".to_string(),
-                    ));
-                    continue;
-                };
-
-                let Some(entry) = options
-                    .available_models
-                    .iter()
-                    .find(|m| {
-                        provider_ids_match(&m.model.provider, provider)
-                            && m.model.id.eq_ignore_ascii_case(model_id)
-                    })
-                    .cloned()
-                else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_model",
-                        format!("Model not found: {provider}/{model_id}"),
-                    ));
-                    continue;
-                };
-
-                let key = resolve_model_key(&options.auth, &entry);
-                if model_requires_configured_credential(&entry) && key.is_none() {
-                    let err = Error::auth(format!(
-                        "Missing credentials for {}/{}",
-                        entry.model.provider, entry.model.id
-                    ));
-                    let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
-                    continue;
-                }
-
+                    RpcRuntimeCommandContext {
+                        cx: &cx,
+                        session: &session,
+                        session_handle: &session_handle,
+                        shared_state: &shared_state,
+                        options: &options,
+                        is_streaming: &is_streaming,
+                        is_compacting: &is_compacting,
+                        retry_abort: &retry_abort,
+                    },
+                )
+                .await?
                 {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let provider_impl = providers::create_provider(
-                        &entry,
-                        guard
-                            .extensions
-                            .as_ref()
-                            .map(crate::extensions::ExtensionRegion::manager),
-                    )?;
-                    guard.agent.set_provider(provider_impl);
-                    guard.agent.stream_options_mut().api_key.clone_from(&key);
-                    guard
-                        .agent
-                        .stream_options_mut()
-                        .headers
-                        .clone_from(&entry.headers);
-
-                    apply_model_change(&mut guard, &entry).await?;
-
-                    let current_thinking = guard
-                        .agent
-                        .stream_options()
-                        .thinking_level
-                        .unwrap_or_default();
-                    let clamped = entry.clamp_thinking_level(current_thinking);
-                    if clamped != current_thinking {
-                        apply_thinking_level(&mut guard, clamped).await?;
-                    }
+                    let _ = out_tx.send(response);
                 }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "set_model",
-                    Some(rpc_model_from_entry(&entry)),
-                ));
-            }
-
-            "cycle_model" => {
-                let (entry, thinking_level, is_scoped) = {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let Some(result) = cycle_model_for_rpc(&mut guard, &options).await? else {
-                        let _ =
-                            out_tx.send(response_ok(id.clone(), "cycle_model", Some(Value::Null)));
-                        continue;
-                    };
-                    result
-                };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "cycle_model",
-                    Some(json!({
-                        "model": rpc_model_from_entry(&entry),
-                        "thinkingLevel": thinking_level.to_string(),
-                        "isScoped": is_scoped,
-                    })),
-                ));
-            }
-
-            "set_thinking_level" => {
-                let Some(level) = parsed.get("level").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_thinking_level",
-                        "Missing level".to_string(),
-                    ));
-                    continue;
-                };
-                let level = match parse_thinking_level(level) {
-                    Ok(level) => level,
-                    Err(err) => {
-                        let _ =
-                            out_tx.send(response_error_with_hints(id, "set_thinking_level", &err));
-                        continue;
-                    }
-                };
-
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let level = {
-                        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        current_model_entry(&inner_session, &options)
-                            .map_or(level, |entry| entry.clamp_thinking_level(level))
-                    };
-                    if let Err(err) = apply_thinking_level(&mut guard, level).await {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id.clone(),
-                            "set_thinking_level",
-                            &err,
-                        ));
-                        continue;
-                    }
-                }
-                let _ = out_tx.send(response_ok(id, "set_thinking_level", None));
-            }
-
-            "cycle_thinking_level" => {
-                let next = {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let entry = {
-                        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        current_model_entry(&inner_session, &options).cloned()
-                    };
-                    let Some(entry) = entry else {
-                        let _ =
-                            out_tx.send(response_ok(id, "cycle_thinking_level", Some(Value::Null)));
-                        continue;
-                    };
-                    if !entry.model.reasoning {
-                        let _ =
-                            out_tx.send(response_ok(id, "cycle_thinking_level", Some(Value::Null)));
-                        continue;
-                    }
-
-                    let levels = available_thinking_levels(&entry);
-                    let current = guard
-                        .agent
-                        .stream_options()
-                        .thinking_level
-                        .unwrap_or_default();
-                    let current_index = levels
-                        .iter()
-                        .position(|level| *level == current)
-                        .unwrap_or(0);
-                    let next = levels[(current_index + 1) % levels.len()];
-                    apply_thinking_level(&mut guard, next).await?;
-                    next
-                };
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "cycle_thinking_level",
-                    Some(json!({ "level": next.to_string() })),
-                ));
-            }
-
-            "set_steering_mode" => {
-                let Some(mode) = parsed.get("mode").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_steering_mode",
-                        "Missing mode".to_string(),
-                    ));
-                    continue;
-                };
-                let Some(mode) = parse_queue_mode(Some(mode)) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_steering_mode",
-                        "Invalid steering mode".to_string(),
-                    ));
-                    continue;
-                };
-                let mut state = shared_state
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                state.steering_mode = mode;
-                drop(state);
-                sync_agent_queue_modes(&session, &shared_state, &cx).await?;
-                let _ = out_tx.send(response_ok(id, "set_steering_mode", None));
-            }
-
-            "set_follow_up_mode" => {
-                let Some(mode) = parsed.get("mode").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_follow_up_mode",
-                        "Missing mode".to_string(),
-                    ));
-                    continue;
-                };
-                let Some(mode) = parse_queue_mode(Some(mode)) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_follow_up_mode",
-                        "Invalid follow-up mode".to_string(),
-                    ));
-                    continue;
-                };
-                let mut state = shared_state
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                state.follow_up_mode = mode;
-                drop(state);
-                sync_agent_queue_modes(&session, &shared_state, &cx).await?;
-                let _ = out_tx.send(response_ok(id, "set_follow_up_mode", None));
-            }
-
-            "set_auto_compaction" => {
-                let Some(enabled) = parsed.get("enabled").and_then(Value::as_bool) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_auto_compaction",
-                        "Missing enabled".to_string(),
-                    ));
-                    continue;
-                };
-                let mut state = shared_state
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                state.auto_compaction_enabled = enabled;
-                drop(state);
-                let _ = out_tx.send(response_ok(id, "set_auto_compaction", None));
-            }
-
-            "set_auto_retry" => {
-                let Some(enabled) = parsed.get("enabled").and_then(Value::as_bool) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_auto_retry",
-                        "Missing enabled".to_string(),
-                    ));
-                    continue;
-                };
-                let mut state = shared_state
-                    .lock(&cx)
-                    .await
-                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                state.auto_retry_enabled = enabled;
-                drop(state);
-                let _ = out_tx.send(response_ok(id, "set_auto_retry", None));
-            }
-
-            "abort_retry" => {
-                retry_abort.store(true, Ordering::SeqCst);
-                let _ = out_tx.send(response_ok(id, "abort_retry", None));
-            }
-
-            "set_session_name" => {
-                let Some(name) = parsed.get("name").and_then(Value::as_str) else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_session_name",
-                        "Missing name".to_string(),
-                    ));
-                    continue;
-                };
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    {
-                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        inner_session.append_session_info(Some(name.to_string()));
-                    }
-                    guard.persist_session().await?;
-                }
-                let _ = out_tx.send(response_ok(id, "set_session_name", None));
-            }
-
-            "get_last_assistant_text" => {
-                let text = {
-                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    last_assistant_text(&inner_session)
-                };
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "get_last_assistant_text",
-                    Some(json!({ "text": text })),
-                ));
-            }
-
-            "export_html" => {
-                let output_path = parsed
-                    .get("outputPath")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                // Capture a lightweight snapshot under lock, then release immediately.
-                // This avoids cloning the full Session (caches, autosave queue, etc.)
-                // and allows the HTML rendering + file I/O to proceed without holding
-                // any session lock.
-                let snapshot = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    inner.export_snapshot()
-                };
-                let path = export_html_snapshot(&snapshot, output_path.as_deref()).await?;
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "export_html",
-                    Some(json!({ "path": path })),
-                ));
             }
 
             "bash" => {
@@ -2513,15 +2131,6 @@ pub async fn run(
                     id,
                     "get_fork_messages",
                     Some(json!({ "messages": messages })),
-                ));
-            }
-
-            "get_commands" => {
-                let commands = options.resources.list_commands();
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "get_commands",
-                    Some(json!({ "commands": commands })),
                 ));
             }
 
@@ -3212,7 +2821,7 @@ mod ui_bridge_tests {
     }
 }
 
-fn rpc_session_message_value(message: SessionMessage) -> Value {
+pub(crate) fn rpc_session_message_value(message: SessionMessage) -> Value {
     let mut value =
         serde_json::to_value(message).expect("SessionMessage should always serialize to JSON");
     rpc_flatten_content_blocks(&mut value);
@@ -3779,7 +3388,7 @@ async fn maybe_auto_compact(
     }
 }
 
-fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
+pub(crate) fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
     let input = entry
         .model
         .input
@@ -3804,7 +3413,7 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
     })
 }
 
-fn session_state(
+pub(crate) fn session_state(
     session: &crate::session::Session,
     options: &RpcOptions,
     snapshot: &RpcStateSnapshot,
@@ -3897,7 +3506,7 @@ fn session_state(
     Value::Object(state)
 }
 
-fn session_stats(session: &crate::session::Session) -> Value {
+pub(crate) fn session_stats(session: &crate::session::Session) -> Value {
     let mut user_messages: u64 = 0;
     let mut assistant_messages: u64 = 0;
     let mut tool_results: u64 = 0;
@@ -4060,7 +3669,7 @@ fn session_stats(session: &crate::session::Session) -> Value {
     Value::Object(data)
 }
 
-fn last_assistant_text(session: &crate::session::Session) -> Option<String> {
+pub(crate) fn last_assistant_text(session: &crate::session::Session) -> Option<String> {
     let entries = session.entries_for_current_path();
     for entry in entries.into_iter().rev() {
         let crate::session::SessionEntry::Message(msg_entry) = entry else {
@@ -4086,7 +3695,7 @@ fn last_assistant_text(session: &crate::session::Session) -> Option<String> {
 ///
 /// The snapshot is captured under a brief lock, so the HTML rendering and
 /// file I/O happen entirely outside any session lock.
-async fn export_html_snapshot(
+pub(crate) async fn export_html_snapshot(
     snapshot: &crate::session::ExportSnapshot,
     output_path: Option<&str>,
 ) -> Result<String> {
@@ -4486,7 +4095,7 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
     Ok(images)
 }
 
-fn resolve_model_key(auth: &AuthStorage, entry: &ModelEntry) -> Option<String> {
+pub(crate) fn resolve_model_key(auth: &AuthStorage, entry: &ModelEntry) -> Option<String> {
     normalize_api_key_opt(auth.resolve_api_key_for_model(
         &entry.model.provider,
         Some(&entry.model.id),
@@ -4502,7 +4111,7 @@ fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
     })
 }
 
-fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+pub(crate) fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
     let provider = entry.model.provider.as_str();
     entry.auth_header
         || provider_metadata(provider).is_some_and(|meta| !meta.auth_env_keys.is_empty())
@@ -4513,7 +4122,7 @@ fn parse_thinking_level(level: &str) -> Result<crate::model::ThinkingLevel> {
     level.parse().map_err(|err: String| Error::validation(err))
 }
 
-fn current_model_entry<'a>(
+pub(crate) fn current_model_entry<'a>(
     session: &crate::session::Session,
     options: &'a RpcOptions,
 ) -> Option<&'a ModelEntry> {
@@ -4524,7 +4133,7 @@ fn current_model_entry<'a>(
     })
 }
 
-async fn apply_thinking_level(
+pub(crate) async fn apply_thinking_level(
     guard: &mut AgentSession,
     level: crate::model::ThinkingLevel,
 ) -> Result<()> {
@@ -4542,7 +4151,7 @@ async fn apply_thinking_level(
     guard.persist_session().await
 }
 
-async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Result<()> {
+pub(crate) async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Result<()> {
     let cx = AgentCx::for_request();
     {
         let mut inner_session = guard
@@ -4597,7 +4206,7 @@ fn extract_user_text(content: &crate::model::UserContent) -> Option<String> {
 
 /// Returns the available thinking levels for a model.
 /// For reasoning models, returns the full range; for non-reasoning, returns only Off.
-fn available_thinking_levels(entry: &ModelEntry) -> Vec<crate::model::ThinkingLevel> {
+pub(crate) fn available_thinking_levels(entry: &ModelEntry) -> Vec<crate::model::ThinkingLevel> {
     use crate::model::ThinkingLevel;
     if entry.model.reasoning {
         let mut levels = vec![
@@ -4618,7 +4227,7 @@ fn available_thinking_levels(entry: &ModelEntry) -> Vec<crate::model::ThinkingLe
 
 /// Cycles through scoped models (if any) and returns the next model.
 /// Returns (ModelEntry, ThinkingLevel, is_from_scoped_models).
-async fn cycle_model_for_rpc(
+pub(crate) async fn cycle_model_for_rpc(
     guard: &mut AgentSession,
     options: &RpcOptions,
 ) -> Result<Option<(ModelEntry, crate::model::ThinkingLevel, bool)>> {
