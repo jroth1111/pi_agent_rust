@@ -19,7 +19,6 @@ use crate::compaction::{
 };
 use crate::config::{Config, ReliabilityEnforcementMode};
 use crate::error::{Error, Result};
-use crate::error_hints;
 use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
@@ -30,16 +29,18 @@ use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::reliability;
 use crate::resources::ResourceLoader;
-use crate::services::reliability_service::ReliabilityService;
-use crate::services::run_service;
 use crate::session::SessionMessage;
+use crate::surface::rpc_protocol::{
+    error_hints_value, normalize_command_type, response_error, response_error_with_hints,
+    response_ok,
+};
+use crate::surface::rpc_service_commands::{self, RpcServiceCommandContext};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,6 +56,10 @@ use crate::contracts::dto::SessionIdentity;
 use crate::orchestration::ExecutionTier;
 #[cfg(test)]
 use crate::orchestration::{RunLifecycle, RunVerifyStatus, SubrunPlan, TaskReport, WaveStatus};
+#[cfg(test)]
+use crate::services::reliability_service::ReliabilityService;
+#[cfg(test)]
+use crate::services::run_service;
 #[cfg(test)]
 use crate::services::run_service::CompletedRunVerifyScope;
 #[cfg(test)]
@@ -215,9 +220,9 @@ pub(crate) struct SubmitTaskResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StateDigestRequest {
+pub(crate) struct StateDigestRequest {
     #[serde(default)]
-    task_id: Option<String>,
+    pub(crate) task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -589,53 +594,6 @@ fn parse_streaming_behavior(value: Option<&Value>) -> Result<Option<StreamingBeh
         "follow-up" | "followUp" => Ok(Some(StreamingBehavior::FollowUp)),
         _ => Err(Error::validation(format!("Invalid streamingBehavior: {s}"))),
     }
-}
-
-fn normalize_command_type(command_type: &str) -> &str {
-    match command_type {
-        "follow-up" | "followUp" | "queue-follow-up" | "queueFollowUp" => "follow_up",
-        "get-state" | "getState" => "get_state",
-        "set-model" | "setModel" => "set_model",
-        "set-steering-mode" | "setSteeringMode" => "set_steering_mode",
-        "set-follow-up-mode" | "setFollowUpMode" => "set_follow_up_mode",
-        "set-auto-compaction" | "setAutoCompaction" => "set_auto_compaction",
-        "set-auto-retry" | "setAutoRetry" => "set_auto_retry",
-        "reliability.requestDispatch" | "reliability_request_dispatch" => {
-            "reliability.request_dispatch"
-        }
-        "reliability.appendEvidence" | "reliability_append_evidence" => {
-            "reliability.append_evidence"
-        }
-        "reliability.submitTask" | "reliability_submit_task" => "reliability.submit_task",
-        "reliability.resolveBlocker" | "reliability_resolve_blocker" => {
-            "reliability.resolve_blocker"
-        }
-        "reliability.queryArtifact" | "reliability_query_artifact" => "reliability.query_artifact",
-        "reliability.getStateDigest" | "reliability_get_state_digest" => {
-            "reliability.get_state_digest"
-        }
-        "orchestration.startRun" | "orchestration_start_run" => "orchestration.start_run",
-        "orchestration.getRun" | "orchestration_get_run" => "orchestration.get_run",
-        "orchestration.dispatchRun" | "orchestration_dispatch_run" => "orchestration.dispatch_run",
-        "orchestration.cancelRun" | "orchestration_cancel_run" => "orchestration.cancel_run",
-        "orchestration.resumeRun" | "orchestration_resume_run" => "orchestration.resume_run",
-        _ => command_type,
-    }
-}
-
-fn command_payload(parsed: &Value) -> Value {
-    parsed
-        .get("payload")
-        .cloned()
-        .unwrap_or_else(|| parsed.clone())
-}
-
-fn parse_command_payload<T>(parsed: &Value, command_type: &str) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    serde_json::from_value(command_payload(parsed))
-        .map_err(|err| Error::validation(format!("Invalid payload for {command_type}: {err}")))
 }
 
 #[cfg(test)]
@@ -1456,6 +1414,25 @@ pub async fn run(
 
         let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
 
+        if let Some(response) = rpc_service_commands::handle_service_command(
+            &parsed,
+            command_type,
+            id.clone(),
+            RpcServiceCommandContext {
+                cx: &cx,
+                session: &session,
+                reliability_state: &reliability_state,
+                orchestration_state: &orchestration_state,
+                run_store: &run_store,
+                config: &options.config,
+            },
+        )
+        .await
+        {
+            let _ = out_tx.send(response);
+            continue;
+        }
+
         match command_type {
             "prompt" => {
                 let Some(message) = parsed
@@ -1741,445 +1718,6 @@ pub async fn run(
                     )
                 };
                 let _ = out_tx.send(response_ok(id, "get_state", Some(data)));
-            }
-
-            "orchestration.start_run" => {
-                let req: StartRunRequest =
-                    match parse_command_payload(&parsed, "orchestration.start_run") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.start_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let data = match run_service::rpc_start_run(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &options.config,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.start_run",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "orchestration.start_run", Some(data)));
-            }
-
-            "orchestration.get_run" => {
-                let req: RunLookupRequest =
-                    match parse_command_payload(&parsed, "orchestration.get_run") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.get_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let data = match run_service::rpc_get_run(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.get_run",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "orchestration.get_run", Some(data)));
-            }
-
-            "orchestration.dispatch_run" => {
-                let req: DispatchRunRequest =
-                    match parse_command_payload(&parsed, "orchestration.dispatch_run") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.dispatch_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let data = match run_service::rpc_dispatch_run(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &options.config,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.dispatch_run",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "orchestration.dispatch_run", Some(data)));
-            }
-
-            "orchestration.cancel_run" => {
-                let req: CancelRunRequest =
-                    match parse_command_payload(&parsed, "orchestration.cancel_run") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.cancel_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let data = match run_service::rpc_cancel_run(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.cancel_run",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "orchestration.cancel_run", Some(data)));
-            }
-
-            "orchestration.resume_run" => {
-                let req: RunLookupRequest =
-                    match parse_command_payload(&parsed, "orchestration.resume_run") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "orchestration.resume_run",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let data = match run_service::rpc_resume_run(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &options.config,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "orchestration.resume_run",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "orchestration.resume_run", Some(data)));
-            }
-
-            "reliability.request_dispatch" => {
-                let payload = command_payload(&parsed);
-                let contract = payload
-                    .get("contract")
-                    .cloned()
-                    .unwrap_or_else(|| payload.clone());
-                let contract: TaskContract = match serde_json::from_value(contract) {
-                    Ok(contract) => contract,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "reliability.request_dispatch",
-                            format!("Invalid contract payload: {err}"),
-                        ));
-                        continue;
-                    }
-                };
-                let agent_id = payload
-                    .get("agentId")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("rpc");
-                let lease_ttl_sec = payload
-                    .get("leaseTtlSec")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(3600);
-
-                let data = match ReliabilityService::rpc_request_dispatch(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    &contract,
-                    agent_id,
-                    lease_ttl_sec,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.request_dispatch",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "reliability.request_dispatch", Some(data)));
-            }
-
-            "reliability.append_evidence" => {
-                let req: AppendEvidenceRequest =
-                    match parse_command_payload(&parsed, "reliability.append_evidence") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.append_evidence",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let data = match ReliabilityService::rpc_append_evidence(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.append_evidence",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "reliability.append_evidence", Some(data)));
-            }
-
-            "reliability.submit_task" => {
-                let req: SubmitTaskRequest =
-                    match parse_command_payload(&parsed, "reliability.submit_task") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.submit_task",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let data = match ReliabilityService::rpc_submit_task(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    req,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.submit_task",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "reliability.submit_task", Some(data)));
-            }
-
-            "reliability.resolve_blocker" => {
-                let report: BlockerReport =
-                    match parse_command_payload(&parsed, "reliability.resolve_blocker") {
-                        Ok(report) => report,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.resolve_blocker",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                let data = match ReliabilityService::rpc_resolve_blocker(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    &orchestration_state,
-                    &run_store,
-                    report,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.resolve_blocker",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-                let _ = out_tx.send(response_ok(id, "reliability.resolve_blocker", Some(data)));
-            }
-
-            "reliability.query_artifact" => {
-                let payload = command_payload(&parsed);
-                if let Some(artifact_id) = payload.get("artifactId").and_then(Value::as_str) {
-                    match ReliabilityService::rpc_query_artifact_text(
-                        &cx,
-                        &reliability_state,
-                        artifact_id,
-                    )
-                    .await
-                    {
-                        Ok(data) => {
-                            let _ = out_tx.send(response_ok(
-                                id,
-                                "reliability.query_artifact",
-                                Some(data),
-                            ));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.query_artifact",
-                                &err,
-                            ));
-                        }
-                    }
-                    continue;
-                }
-
-                let query: ArtifactQuery =
-                    match parse_command_payload(&parsed, "reliability.query_artifact") {
-                        Ok(query) => query,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.query_artifact",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-                match ReliabilityService::rpc_query_artifact_ids(&cx, &reliability_state, query)
-                    .await
-                {
-                    Ok(data) => {
-                        let _ =
-                            out_tx.send(response_ok(id, "reliability.query_artifact", Some(data)));
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.query_artifact",
-                            &err,
-                        ));
-                    }
-                }
-            }
-
-            "reliability.get_state_digest" => {
-                let req: StateDigestRequest =
-                    match parse_command_payload(&parsed, "reliability.get_state_digest") {
-                        Ok(req) => req,
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(
-                                id,
-                                "reliability.get_state_digest",
-                                &err,
-                            ));
-                            continue;
-                        }
-                    };
-
-                let data = match ReliabilityService::rpc_get_state_digest(
-                    &cx,
-                    &session,
-                    &reliability_state,
-                    req.task_id,
-                )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(
-                            id,
-                            "reliability.get_state_digest",
-                            &err,
-                        ));
-                        continue;
-                    }
-                };
-
-                let _ = out_tx.send(response_ok(id, "reliability.get_state_digest", Some(data)));
             }
 
             "get_session_stats" => {
@@ -3321,48 +2859,6 @@ async fn run_prompt_with_retry(
 // Helpers
 // =============================================================================
 
-fn response_ok(id: Option<String>, command: &str, data: Option<Value>) -> String {
-    let mut resp = json!({
-        "type": "response",
-        "command": command,
-        "success": true,
-    });
-    if let Some(id) = id {
-        resp["id"] = Value::String(id);
-    }
-    if let Some(data) = data {
-        resp["data"] = data;
-    }
-    resp.to_string()
-}
-
-fn response_error(id: Option<String>, command: &str, error: impl Into<String>) -> String {
-    let mut resp = json!({
-        "type": "response",
-        "command": command,
-        "success": false,
-        "error": error.into(),
-    });
-    if let Some(id) = id {
-        resp["id"] = Value::String(id);
-    }
-    resp.to_string()
-}
-
-fn response_error_with_hints(id: Option<String>, command: &str, error: &Error) -> String {
-    let mut resp = json!({
-        "type": "response",
-        "command": command,
-        "success": false,
-        "error": error.to_string(),
-        "errorHints": error_hints_value(error),
-    });
-    if let Some(id) = id {
-        resp["id"] = Value::String(id);
-    }
-    resp.to_string()
-}
-
 fn event(value: &Value) -> String {
     value.to_string()
 }
@@ -3714,15 +3210,6 @@ mod ui_bridge_tests {
         assert!(state.active.is_none());
         assert!(state.queue.is_empty());
     }
-}
-
-fn error_hints_value(error: &Error) -> Value {
-    let hint = error_hints::hints_for_error(error);
-    json!({
-        "summary": hint.summary,
-        "hints": hint.hints,
-        "contextFields": hint.context_fields,
-    })
 }
 
 fn rpc_session_message_value(message: SessionMessage) -> Value {

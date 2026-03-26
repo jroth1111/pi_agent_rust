@@ -21,6 +21,8 @@ pub mod auth_setup;
 pub mod extension_policy;
 pub mod extension_runtime;
 pub mod routing;
+pub mod rpc_protocol;
+pub mod rpc_service_commands;
 pub mod startup;
 
 use crate::agent::AgentSession;
