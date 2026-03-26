@@ -779,7 +779,7 @@ pub enum IntegrityOutcome {
 
 impl IntegrityOutcome {
     /// Returns true if all invariants passed.
-    pub fn is_clean(&self) -> bool {
+    pub const fn is_clean(&self) -> bool {
         matches!(self, IntegrityOutcome::Clean)
     }
 
@@ -878,7 +878,7 @@ pub struct HydrationState {
 
 impl HydrationState {
     /// Create a full-hydration state (no fidelity risk).
-    pub fn full(entry_count: usize, seq: u64) -> Self {
+    pub const fn full(entry_count: usize, seq: u64) -> Self {
         let entry_count = entry_count as u64;
         Self {
             mode: HydrationMode::Full,
@@ -891,7 +891,7 @@ impl HydrationState {
     }
 
     /// Create a partial-hydration state with fidelity risk.
-    pub fn partial(
+    pub const fn partial(
         mode: HydrationMode,
         total_entries: u64,
         loaded_entries: usize,
@@ -1009,4 +1009,251 @@ fn chrono_utc_now() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
+}
+
+// ============================================================================
+// Session migration cutover types (VAL-SESS-006, VAL-SESS-011)
+// ============================================================================
+
+/// Outcome of a session migration attempt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationOutcome {
+    /// Migration completed and authority has been flipped to the event store.
+    Succeeded,
+    /// Migration was explicitly rolled back; source authority remains active.
+    RolledBack,
+    /// Migration failed partway; partial target state must not be readable.
+    Failed,
+}
+
+/// A durable correlation identifier that links a migration attempt to its
+/// source store, target store, verification results, and final outcome.
+///
+/// This record is written to the **surviving authority** (the source store
+/// for pre-cutover, or the event store for post-cutover) so that rollback
+/// evidence is never lost to cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationRecord {
+    /// Unique correlation identifier for this migration attempt.
+    pub correlation_id: String,
+    /// Session ID being migrated.
+    pub session_id: String,
+    /// Path to the source (legacy) store.
+    pub source_path: String,
+    /// Kind of the source store.
+    pub source_kind: PersistenceStoreKind,
+    /// Path to the target (event store) directory.
+    pub target_path: String,
+    /// Number of entries found in the source.
+    pub source_entry_count: u64,
+    /// Number of entries successfully written to the target.
+    pub target_entry_count: u64,
+    /// Whether post-migration verification passed.
+    pub verification_passed: bool,
+    /// Verification errors encountered (empty if verification passed).
+    pub verification_errors: Vec<String>,
+    /// Final outcome of the migration.
+    pub outcome: MigrationOutcome,
+    /// ISO 8601 timestamp when the migration started.
+    pub started_at: String,
+    /// ISO 8601 timestamp when the migration completed (or failed/rolled back).
+    pub completed_at: String,
+    /// Human-readable reason for the outcome.
+    pub reason: String,
+}
+
+/// A surviving rollback evidence record.
+///
+/// Written to the surviving authority (or a global rollback journal) when a
+/// migration fails or is rolled back. This record proves which authority
+/// remains active and why the migration did not succeed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackRecord {
+    /// Correlation ID linking this rollback to the original migration attempt.
+    pub migration_correlation_id: String,
+    /// Session ID that was being migrated.
+    pub session_id: String,
+    /// Path to the surviving (still-active) authority.
+    pub surviving_authority_path: String,
+    /// The authority that remains active after rollback.
+    pub surviving_authority_kind: PersistenceStoreKind,
+    /// Path to the target that was partially written (if any).
+    pub target_path: Option<String>,
+    /// How many entries had been written to the target before failure.
+    pub target_entries_written: u64,
+    /// ISO 8601 timestamp when the rollback occurred.
+    pub rolled_back_at: String,
+    /// Human-readable reason for the rollback.
+    pub reason: String,
+    /// Whether the partial target state was cleaned up.
+    pub target_cleaned: bool,
+}
+
+// ============================================================================
+// Verification ledger (VAL-WF-007, VAL-WF-014): durable verification
+// evidence, acceptance mappings, attempt/workspace/input bindings, and
+// restart-safe deferral/failure history.
+// ============================================================================
+
+/// The outcome of a verification attempt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationVerdict {
+    /// Verification passed.
+    Passed,
+    /// Verification failed with a reason.
+    Failed,
+    /// Verification timed out.
+    TimedOut,
+    /// Verification was deferred to a later time or condition.
+    Deferred,
+    /// This verification was superseded by a newer attempt.
+    Superseded,
+}
+
+/// A single immutable evidence record reference in the verification ledger.
+///
+/// Points to an artifact or evidence identifier produced by a verification
+/// command execution. The actual evidence content is stored in the artifact
+/// store; the ledger holds only the stable reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationEvidenceRef {
+    /// Stable artifact/evidence identifier (e.g., "ev-171145-abc123").
+    pub evidence_id: String,
+    /// The verification command that produced this evidence.
+    pub command: String,
+    /// Exit code of the verification command.
+    pub exit_code: i32,
+    /// ISO 8601 timestamp when this evidence was produced.
+    pub produced_at: String,
+}
+
+/// An explicit acceptance mapping linking evidence to acceptance criteria.
+///
+/// Each acceptance criterion (identified by `acceptance_id`) is explicitly
+/// mapped to one or more evidence records that demonstrate its satisfaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptanceMapping {
+    /// Stable identifier for the acceptance criterion (e.g., "ac-1").
+    pub acceptance_id: String,
+    /// Human-readable description of what this criterion requires.
+    pub description: Option<String>,
+    /// Evidence record IDs that satisfy this acceptance criterion.
+    pub satisfied_by_evidence: Vec<String>,
+    /// Whether this acceptance criterion is considered satisfied.
+    pub is_satisfied: bool,
+}
+
+/// A durable verification decision record.
+///
+/// This is the authoritative record that binds a verification verdict to
+/// the task attempt, workspace state, and relevant inputs it evaluated.
+/// It serves as the single source of truth for whether a task has been
+/// verified and what evidence backs that decision (VAL-WF-007).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationDecision {
+    /// Unique stable identifier for this verification decision.
+    pub decision_id: String,
+    /// The task ID this decision covers.
+    pub task_id: String,
+    /// The task attempt identity this decision covers.
+    /// Multiple attempts may each have their own verification decisions.
+    pub attempt_id: String,
+    /// The run ID this decision is part of.
+    pub run_id: String,
+    /// The final verdict of this verification attempt.
+    pub verdict: VerificationVerdict,
+    /// Bound workspace snapshot or patch digest that this verdict was
+    /// decided against. If the workspace changes after verification,
+    /// this verdict is stale and completion should be blocked.
+    pub workspace_patch_digest: String,
+    /// The relevant input set reference (e.g., input snapshot hash or
+    /// context reference ID).
+    pub input_reference: Option<String>,
+    /// Immutable evidence references produced by the verification commands.
+    pub evidence_refs: Vec<VerificationEvidenceRef>,
+    /// Explicit acceptance mappings linking acceptance criteria to evidence.
+    pub acceptance_mappings: Vec<AcceptanceMapping>,
+    /// When model-backed verification was used, the referenced context
+    /// pack ID. None for command-only verification.
+    pub context_pack_id: Option<String>,
+    /// When model-backed verification was used, the inference receipt ID.
+    /// None for command-only verification.
+    pub inference_receipt_id: Option<String>,
+    /// ISO 8601 timestamp when this decision was recorded.
+    pub decided_at: String,
+}
+
+/// A single entry in the verification attempt history.
+///
+/// Every verification attempt (whether it passed, failed, timed out,
+/// was deferred, superseded, or retried) appends a history entry.
+/// The full history remains queryable after restart (VAL-WF-014).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationHistoryEntry {
+    /// Monotonically increasing sequence number for ordering.
+    pub seq: u64,
+    /// Unique stable identifier for this history entry.
+    pub entry_id: String,
+    /// The task ID this history entry belongs to.
+    pub task_id: String,
+    /// The attempt identity this entry covers.
+    pub attempt_id: String,
+    /// The verification verdict for this attempt.
+    pub verdict: VerificationVerdict,
+    /// Human-readable reason for the verdict (e.g., failure message,
+    /// deferral reason, timeout explanation).
+    pub reason: String,
+    /// The actor that produced this verification outcome (e.g., agent ID,
+    /// "system", "human").
+    pub actor: String,
+    /// Evidence record IDs associated with this attempt.
+    pub evidence_ids: Vec<String>,
+    /// ISO 8601 timestamp when this entry was recorded.
+    pub recorded_at: String,
+    /// The next required action after this verdict. This makes it
+    /// possible to explain why a task remained blocked and what
+    /// needs to happen next.
+    pub next_required_action: Option<String>,
+    /// If this entry superseded a previous decision, the decision ID
+    /// of the prior verification that was replaced.
+    pub supersedes_decision_id: Option<String>,
+}
+
+/// Durable approval provenance for a verification override (VAL-WF-008).
+///
+/// Any verification bypass, override, or policy exception must be backed
+/// by a durable approval record with actor identity, declared scope, and
+/// correlation to the workflow entity being overridden.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationOverride {
+    /// Unique stable identifier for this override.
+    pub override_id: String,
+    /// The task ID this override applies to.
+    pub task_id: String,
+    /// The verification decision ID being overridden.
+    pub overridden_decision_id: String,
+    /// The actor who approved this override.
+    pub approved_by: String,
+    /// The declared scope of the override (what it authorizes).
+    pub scope: String,
+    /// ISO 8601 timestamp when this override was approved.
+    pub approved_at: String,
+    /// The durable approval record ID that authorizes this override.
+    pub approval_record_id: String,
+    /// If this override itself was superseded by a newer one, the
+    /// override ID of the replacement. A newer override must durably
+    /// reference the prior override it replaces and cannot silently
+    /// widen scope.
+    pub supersedes_override_id: Option<String>,
+    /// Human-readable justification for the override.
+    pub justification: String,
 }

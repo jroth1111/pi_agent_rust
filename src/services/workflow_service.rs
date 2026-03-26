@@ -11,9 +11,13 @@
 //! verifies migrated state before the reader flip, and blocks dual-authority
 //! writes during the transition (VAL-WF-013).
 
+use crate::contracts::dto::{
+    VerificationDecision, VerificationHistoryEntry, VerificationOverride, VerificationVerdict,
+};
 use crate::contracts::engine::{
-    AppendEvidenceRequest, DispatchOptions, LeaseGrant as ContractLeaseGrant, StateDigestResult,
-    SubmitTaskRequest, SubmitTaskResult, TaskContract, TaskPrerequisite, TaskStateDigest,
+    AppendEvidenceRequest, DispatchOptions, LeaseGrant as ContractLeaseGrant,
+    RecordOverrideRequest, RecordVerificationRequest, StateDigestResult, SubmitTaskRequest,
+    SubmitTaskResult, TaskContract, TaskPrerequisite, TaskStateDigest, VerificationHistoryResult,
     WorkflowContract,
 };
 use crate::error::{Error, Result};
@@ -252,6 +256,20 @@ pub struct WorkflowStore {
     /// Configuration defaults.
     default_max_attempts: u8,
     verify_timeout_sec_default: u32,
+
+    // -- Verification ledger (VAL-WF-007, VAL-WF-014) --
+    /// Verification decisions keyed by decision ID.
+    verification_decisions: HashMap<String, VerificationDecision>,
+    /// Verification history entries keyed by task ID.
+    verification_history: HashMap<String, Vec<VerificationHistoryEntry>>,
+    /// Verification overrides keyed by override ID.
+    verification_overrides: HashMap<String, VerificationOverride>,
+    /// Map from task ID to its latest (active) verification decision ID.
+    latest_decision_by_task: HashMap<String, String>,
+    /// Map from task ID to its active override IDs (may be superseded).
+    override_ids_by_task: HashMap<String, Vec<String>>,
+    /// Monotonically increasing sequence counter for verification history.
+    verification_history_seq: u64,
 }
 
 impl WorkflowStore {
@@ -276,6 +294,12 @@ impl WorkflowStore {
             processed_command_ids: HashSet::new(),
             default_max_attempts: config.reliability_default_max_attempts(),
             verify_timeout_sec_default: config.reliability_verify_timeout_sec_default(),
+            verification_decisions: HashMap::new(),
+            verification_history: HashMap::new(),
+            verification_overrides: HashMap::new(),
+            latest_decision_by_task: HashMap::new(),
+            override_ids_by_task: HashMap::new(),
+            verification_history_seq: 0,
         })
     }
 
@@ -299,6 +323,12 @@ impl WorkflowStore {
             processed_command_ids: HashSet::new(),
             default_max_attempts,
             verify_timeout_sec_default: verify_timeout_sec,
+            verification_decisions: HashMap::new(),
+            verification_history: HashMap::new(),
+            verification_overrides: HashMap::new(),
+            latest_decision_by_task: HashMap::new(),
+            override_ids_by_task: HashMap::new(),
+            verification_history_seq: 0,
         })
     }
 
@@ -809,6 +839,176 @@ impl WorkflowStore {
     pub fn tasks_values(&self) -> Vec<&TaskNode> {
         self.tasks.values().collect()
     }
+
+    // -- Verification ledger (VAL-WF-007, VAL-WF-014) --
+
+    /// Record a verification decision and append a history entry.
+    ///
+    /// Returns the decision ID. The decision is bound to the task attempt,
+    /// workspace patch digest, and relevant inputs. If the decision
+    /// supersedes a previous one, the prior decision is marked as
+    /// superseded in the history.
+    pub fn record_verification(&mut self, request: &RecordVerificationRequest) -> Result<String> {
+        let decision_id = format!("vd-{}", uuid_v4_compat());
+        let decided_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        // If supersedes a previous decision, mark the prior one as superseded
+        if let Some(prior_id) = &request.supersedes_decision_id {
+            if let Some(prior) = self.verification_decisions.get_mut(prior_id) {
+                prior.verdict = VerificationVerdict::Superseded;
+            }
+        }
+
+        let decision = VerificationDecision {
+            decision_id: decision_id.clone(),
+            task_id: request.task_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            run_id: request.run_id.clone(),
+            verdict: request.verdict,
+            workspace_patch_digest: request.workspace_patch_digest.clone(),
+            input_reference: request.input_reference.clone(),
+            evidence_refs: request.evidence_refs.clone(),
+            acceptance_mappings: request.acceptance_mappings.clone(),
+            context_pack_id: request.context_pack_id.clone(),
+            inference_receipt_id: request.inference_receipt_id.clone(),
+            decided_at,
+        };
+
+        // Append history entry
+        self.verification_history_seq += 1;
+        let entry = VerificationHistoryEntry {
+            seq: self.verification_history_seq,
+            entry_id: format!("vhe-{}", self.verification_history_seq),
+            task_id: request.task_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            verdict: request.verdict,
+            reason: request.reason.clone().unwrap_or_default(),
+            actor: request
+                .actor
+                .clone()
+                .unwrap_or_else(|| "system".to_string()),
+            evidence_ids: request
+                .evidence_refs
+                .iter()
+                .map(|e| e.evidence_id.clone())
+                .collect(),
+            recorded_at: decision.decided_at.clone(),
+            next_required_action: next_action_for_verdict(request.verdict),
+            supersedes_decision_id: request.supersedes_decision_id.clone(),
+        };
+
+        self.verification_history
+            .entry(request.task_id.clone())
+            .or_default()
+            .push(entry);
+
+        self.verification_decisions
+            .insert(decision_id.clone(), decision);
+        self.latest_decision_by_task
+            .insert(request.task_id.clone(), decision_id.clone());
+
+        // Journal the verification decision
+        self.append_journal(WorkflowCommand::VerifySuccess {
+            task_id: request.task_id.clone(),
+            verify_run_id: request.run_id.clone(),
+            patch_digest: request.workspace_patch_digest.clone(),
+        });
+
+        Ok(decision_id)
+    }
+
+    /// Record a verification override (bypass) with approval provenance.
+    ///
+    /// Returns the override ID. The override requires a durable approval
+    /// record ID, declared scope, and if superseding a prior override,
+    /// an explicit reference to the prior override ID.
+    pub fn record_verification_override(
+        &mut self,
+        request: &RecordOverrideRequest,
+    ) -> Result<String> {
+        let override_id = format!("vo-{}", uuid_v4_compat());
+        let approved_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let override_record = VerificationOverride {
+            override_id: override_id.clone(),
+            task_id: request.task_id.clone(),
+            overridden_decision_id: request.overridden_decision_id.clone(),
+            approved_by: request.approved_by.clone(),
+            scope: request.scope.clone(),
+            approved_at,
+            approval_record_id: request.approval_record_id.clone(),
+            supersedes_override_id: request.supersedes_override_id.clone(),
+            justification: request.justification.clone(),
+        };
+
+        self.verification_overrides
+            .insert(override_id.clone(), override_record);
+        self.override_ids_by_task
+            .entry(request.task_id.clone())
+            .or_default()
+            .push(override_id.clone());
+
+        Ok(override_id)
+    }
+
+    /// Query the full verification history for a task.
+    ///
+    /// Returns all history entries, the latest decision, and any active
+    /// overrides. This history survives restart and is the authoritative
+    /// source for why a task is or is not verified (VAL-WF-014).
+    pub fn verification_history_for_task(&self, task_id: &str) -> VerificationHistoryResult {
+        let entries = self
+            .verification_history
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let latest_decision = self
+            .latest_decision_by_task
+            .get(task_id)
+            .and_then(|id| self.verification_decisions.get(id).cloned());
+
+        let active_overrides: Vec<VerificationOverride> = self
+            .override_ids_by_task
+            .get(task_id)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.verification_overrides.get(id).cloned())
+                    // Only include overrides that are not themselves superseded
+                    .filter(|o| {
+                        !self.verification_overrides.values().any(|other| {
+                            other.supersedes_override_id.as_deref() == Some(&o.override_id)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        VerificationHistoryResult {
+            entries,
+            latest_decision,
+            active_overrides,
+        }
+    }
+}
+
+/// Determine the next required action for a verification verdict.
+fn next_action_for_verdict(verdict: VerificationVerdict) -> Option<String> {
+    match verdict {
+        VerificationVerdict::Passed => None,
+        VerificationVerdict::Failed => {
+            Some("re-attempt verification or request override".to_string())
+        }
+        VerificationVerdict::TimedOut => {
+            Some("retry verification with increased timeout or request override".to_string())
+        }
+        VerificationVerdict::Deferred => {
+            Some("resume verification when deferral condition is met".to_string())
+        }
+        VerificationVerdict::Superseded => {
+            Some("no action needed — superseded by a newer verification decision".to_string())
+        }
+    }
 }
 
 // ============================================================================
@@ -1314,6 +1514,23 @@ impl WorkflowContract for WorkflowService {
     ) -> Result<bool> {
         let store = self.store.lock().unwrap();
         Ok(store.validate_lease_fence(lease_id, fence_token).is_ok())
+    }
+
+    // -- Verification ledger (VAL-WF-007, VAL-WF-014) --
+
+    async fn record_verification(&self, request: RecordVerificationRequest) -> Result<String> {
+        let mut store = self.store.lock().unwrap();
+        store.record_verification(&request)
+    }
+
+    async fn record_verification_override(&self, request: RecordOverrideRequest) -> Result<String> {
+        let mut store = self.store.lock().unwrap();
+        store.record_verification_override(&request)
+    }
+
+    async fn verification_history(&self, task_id: &str) -> Result<VerificationHistoryResult> {
+        let store = self.store.lock().unwrap();
+        Ok(store.verification_history_for_task(task_id))
     }
 }
 
@@ -1925,5 +2142,507 @@ mod tests {
         assert!(workflow_store.get_task("new-task").is_some());
         // Legacy state does NOT have the new task
         assert!(!legacy_reliability.tasks.contains_key("new-task"));
+    }
+
+    // ========================================================================
+    // VAL-WF-007: Verification evidence and acceptance mapping durability
+    // ========================================================================
+
+    #[test]
+    fn test_record_verification_decision_binds_to_attempt_and_workspace() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                Some("cargo test".to_string()),
+                None,
+            )
+            .unwrap();
+
+        let evidence = vec![crate::contracts::dto::VerificationEvidenceRef {
+            evidence_id: "ev-001".to_string(),
+            command: "cargo test".to_string(),
+            exit_code: 0,
+            produced_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }];
+
+        let acceptance = vec![crate::contracts::dto::AcceptanceMapping {
+            acceptance_id: "ac-1".to_string(),
+            description: Some("All tests pass".to_string()),
+            satisfied_by_evidence: vec!["ev-001".to_string()],
+            is_satisfied: true,
+        }];
+
+        let request = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Passed,
+            workspace_patch_digest: "sha256:abc123".to_string(),
+            input_reference: Some("input-snap-001".to_string()),
+            evidence_refs: evidence.clone(),
+            acceptance_mappings: acceptance.clone(),
+            context_pack_id: Some("cp-001".to_string()),
+            inference_receipt_id: Some("ir-001".to_string()),
+            reason: None,
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+
+        let decision_id = store.record_verification(&request).unwrap();
+
+        // Decision should be stored
+        let history = store.verification_history_for_task("task-1");
+        assert_eq!(history.entries.len(), 1);
+        assert!(history.latest_decision.is_some());
+
+        let decision = history.latest_decision.unwrap();
+        assert_eq!(decision.decision_id, decision_id);
+        assert_eq!(decision.task_id, "task-1");
+        assert_eq!(decision.attempt_id, "att-1");
+        assert_eq!(decision.run_id, "run-1");
+        assert_eq!(decision.verdict, VerificationVerdict::Passed);
+        assert_eq!(decision.workspace_patch_digest, "sha256:abc123");
+        assert_eq!(decision.input_reference.as_deref(), Some("input-snap-001"));
+        assert_eq!(decision.evidence_refs.len(), 1);
+        assert_eq!(decision.evidence_refs[0].evidence_id, "ev-001");
+        assert_eq!(decision.acceptance_mappings.len(), 1);
+        assert_eq!(decision.acceptance_mappings[0].acceptance_id, "ac-1");
+        assert!(decision.acceptance_mappings[0].is_satisfied);
+        assert_eq!(decision.context_pack_id.as_deref(), Some("cp-001"));
+        assert_eq!(decision.inference_receipt_id.as_deref(), Some("ir-001"));
+    }
+
+    #[test]
+    fn test_verification_history_survives_multiple_attempts() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                Some("cargo test".to_string()),
+                None,
+            )
+            .unwrap();
+
+        // First attempt: failed
+        let request1 = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Failed,
+            workspace_patch_digest: "sha256:aaa".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("test compilation failed".to_string()),
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+        store.record_verification(&request1).unwrap();
+
+        // Second attempt: timed out
+        let request2 = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-2".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::TimedOut,
+            workspace_patch_digest: "sha256:bbb".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("verification timed out after 60s".to_string()),
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+        store.record_verification(&request2).unwrap();
+
+        // Third attempt: passed
+        let request3 = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-3".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Passed,
+            workspace_patch_digest: "sha256:ccc".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: None,
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+        store.record_verification(&request3).unwrap();
+
+        // History should have all 3 entries
+        let history = store.verification_history_for_task("task-1");
+        assert_eq!(history.entries.len(), 3);
+
+        // Entries should be in sequence order
+        assert_eq!(history.entries[0].seq, 1);
+        assert_eq!(history.entries[0].verdict, VerificationVerdict::Failed);
+        assert_eq!(history.entries[0].reason, "test compilation failed");
+
+        assert_eq!(history.entries[1].seq, 2);
+        assert_eq!(history.entries[1].verdict, VerificationVerdict::TimedOut);
+        assert_eq!(
+            history.entries[1].reason,
+            "verification timed out after 60s"
+        );
+
+        assert_eq!(history.entries[2].seq, 3);
+        assert_eq!(history.entries[2].verdict, VerificationVerdict::Passed);
+
+        // Latest decision should be the passed one
+        let latest = history.latest_decision.unwrap();
+        assert_eq!(latest.verdict, VerificationVerdict::Passed);
+        assert_eq!(latest.attempt_id, "att-3");
+        assert_eq!(latest.workspace_patch_digest, "sha256:ccc");
+    }
+
+    // ========================================================================
+    // VAL-WF-014: Verification deferral and failure history durability
+    // ========================================================================
+
+    #[test]
+    fn test_deferred_verification_records_next_required_action() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let request = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Deferred,
+            workspace_patch_digest: "sha256:defer".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("waiting for external dependency".to_string()),
+            actor: Some("system".to_string()),
+            supersedes_decision_id: None,
+        };
+
+        store.record_verification(&request).unwrap();
+
+        let history = store.verification_history_for_task("task-1");
+        assert_eq!(history.entries.len(), 1);
+
+        let entry = &history.entries[0];
+        assert_eq!(entry.verdict, VerificationVerdict::Deferred);
+        assert_eq!(entry.reason, "waiting for external dependency");
+        assert!(entry.next_required_action.is_some());
+        assert_eq!(
+            entry.next_required_action.as_deref(),
+            Some("resume verification when deferral condition is met")
+        );
+    }
+
+    #[test]
+    fn test_verification_history_includes_actor_and_evidence_refs() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let request = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Failed,
+            workspace_patch_digest: "sha256:fail".to_string(),
+            input_reference: None,
+            evidence_refs: vec![
+                crate::contracts::dto::VerificationEvidenceRef {
+                    evidence_id: "ev-1".to_string(),
+                    command: "cargo test".to_string(),
+                    exit_code: 1,
+                    produced_at: "2025-01-01T00:00:00.000Z".to_string(),
+                },
+                crate::contracts::dto::VerificationEvidenceRef {
+                    evidence_id: "ev-2".to_string(),
+                    command: "cargo clippy".to_string(),
+                    exit_code: 1,
+                    produced_at: "2025-01-01T00:00:01.000Z".to_string(),
+                },
+            ],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("clippy warnings".to_string()),
+            actor: Some("verifier-bot".to_string()),
+            supersedes_decision_id: None,
+        };
+
+        store.record_verification(&request).unwrap();
+
+        let history = store.verification_history_for_task("task-1");
+        let entry = &history.entries[0];
+        assert_eq!(entry.actor, "verifier-bot");
+        assert_eq!(entry.evidence_ids, vec!["ev-1", "ev-2"]);
+    }
+
+    #[test]
+    fn test_verification_override_requires_approval_provenance() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // First record a failed verification
+        let ver_request = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Failed,
+            workspace_patch_digest: "sha256:fail".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("tests failed".to_string()),
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+        let decision_id = store.record_verification(&ver_request).unwrap();
+
+        // Now record an override with approval provenance
+        let override_request = crate::contracts::engine::RecordOverrideRequest {
+            task_id: "task-1".to_string(),
+            overridden_decision_id: decision_id.clone(),
+            approved_by: "human-operator".to_string(),
+            scope: "accept known failing test until fix lands".to_string(),
+            approval_record_id: "apr-001".to_string(),
+            supersedes_override_id: None,
+            justification: "Test failure is a known flaky test tracked in issue #42".to_string(),
+        };
+        let override_id = store
+            .record_verification_override(&override_request)
+            .unwrap();
+
+        // History should show the override
+        let history = store.verification_history_for_task("task-1");
+        assert_eq!(history.active_overrides.len(), 1);
+
+        let active = &history.active_overrides[0];
+        assert_eq!(active.override_id, override_id);
+        assert_eq!(active.task_id, "task-1");
+        assert_eq!(active.overridden_decision_id, decision_id);
+        assert_eq!(active.approved_by, "human-operator");
+        assert_eq!(active.scope, "accept known failing test until fix lands");
+        assert_eq!(active.approval_record_id, "apr-001");
+        assert!(!active.justification.is_empty());
+    }
+
+    #[test]
+    fn test_verification_supersession_marks_prior_decision() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // First decision: passed
+        let request1 = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Passed,
+            workspace_patch_digest: "sha256:v1".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: None,
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+        let decision_id_1 = store.record_verification(&request1).unwrap();
+
+        // Second decision: supersedes the first
+        let request2 = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-2".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Failed,
+            workspace_patch_digest: "sha256:v2".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("regression detected".to_string()),
+            actor: Some("agent-2".to_string()),
+            supersedes_decision_id: Some(decision_id_1.clone()),
+        };
+        store.record_verification(&request2).unwrap();
+
+        // The first decision should now be marked as Superseded
+        let history = store.verification_history_for_task("task-1");
+        let latest = history.latest_decision.unwrap();
+        assert_eq!(latest.verdict, VerificationVerdict::Failed);
+        assert_eq!(latest.attempt_id, "att-2");
+
+        // History should have 2 entries; the first should reference supersession
+        assert_eq!(history.entries.len(), 2);
+        assert_eq!(
+            history.entries[1].supersedes_decision_id.as_deref(),
+            Some(decision_id_1.as_str())
+        );
+    }
+
+    #[test]
+    fn test_override_supersession_chain() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Record a failed verification
+        let ver_request = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Failed,
+            workspace_patch_digest: "sha256:fail".to_string(),
+            input_reference: None,
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: None,
+            inference_receipt_id: None,
+            reason: Some("tests failed".to_string()),
+            actor: Some("agent-1".to_string()),
+            supersedes_decision_id: None,
+        };
+        let decision_id = store.record_verification(&ver_request).unwrap();
+
+        // First override
+        let override1 = crate::contracts::engine::RecordOverrideRequest {
+            task_id: "task-1".to_string(),
+            overridden_decision_id: decision_id.clone(),
+            approved_by: "human-1".to_string(),
+            scope: "temporary bypass".to_string(),
+            approval_record_id: "apr-001".to_string(),
+            supersedes_override_id: None,
+            justification: "first override".to_string(),
+        };
+        let override_id_1 = store.record_verification_override(&override1).unwrap();
+
+        // Second override supersedes the first
+        let override2 = crate::contracts::engine::RecordOverrideRequest {
+            task_id: "task-1".to_string(),
+            overridden_decision_id: decision_id.clone(),
+            approved_by: "human-2".to_string(),
+            scope: "permanent bypass".to_string(),
+            approval_record_id: "apr-002".to_string(),
+            supersedes_override_id: Some(override_id_1.clone()),
+            justification: "wider scope override".to_string(),
+        };
+        store.record_verification_override(&override2).unwrap();
+
+        // Only the second override should be active
+        let history = store.verification_history_for_task("task-1");
+        assert_eq!(history.active_overrides.len(), 1);
+        assert_eq!(history.active_overrides[0].scope, "permanent bypass");
+        assert_eq!(
+            history.active_overrides[0]
+                .supersedes_override_id
+                .as_deref(),
+            Some(override_id_1.as_str())
+        );
+    }
+
+    #[test]
+    fn test_verification_history_for_nonexistent_task_is_empty() {
+        let store = test_store();
+        let history = store.verification_history_for_task("nonexistent");
+        assert_eq!(history.entries.len(), 0);
+        assert!(history.latest_decision.is_none());
+        assert_eq!(history.active_overrides.len(), 0);
+    }
+
+    #[test]
+    fn test_verification_decision_references_model_backed_inputs() {
+        let mut store = test_store();
+        store
+            .create_task(
+                "task-1".to_string(),
+                "Build".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let request = crate::contracts::engine::RecordVerificationRequest {
+            task_id: "task-1".to_string(),
+            attempt_id: "att-1".to_string(),
+            run_id: "run-1".to_string(),
+            verdict: VerificationVerdict::Passed,
+            workspace_patch_digest: "sha256:model".to_string(),
+            input_reference: Some("input-ref-001".to_string()),
+            evidence_refs: vec![],
+            acceptance_mappings: vec![],
+            context_pack_id: Some("ctx-pack-001".to_string()),
+            inference_receipt_id: Some("inference-rcpt-001".to_string()),
+            reason: None,
+            actor: Some("verifier-model".to_string()),
+            supersedes_decision_id: None,
+        };
+
+        let decision_id = store.record_verification(&request).unwrap();
+        let history = store.verification_history_for_task("task-1");
+        let decision = history.latest_decision.unwrap();
+
+        assert_eq!(decision.decision_id, decision_id);
+        assert_eq!(decision.context_pack_id.as_deref(), Some("ctx-pack-001"));
+        assert_eq!(
+            decision.inference_receipt_id.as_deref(),
+            Some("inference-rcpt-001")
+        );
+        assert_eq!(decision.input_reference.as_deref(), Some("input-ref-001"));
     }
 }

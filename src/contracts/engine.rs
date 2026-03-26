@@ -4,9 +4,11 @@
 //! depend on while keeping engine-owned behavior behind typed boundaries.
 
 use crate::contracts::dto::{
-    ContextPack, InterruptReason, InterruptResult, LegacyImportRequest, LegacyStoreRole,
-    LegacyStoreValidation, ModelControl, PersistenceSnapshot, PersistenceStoreKind, QueueControl,
-    QueueEnqueueResult, SessionEvent, SessionEventPayload, SessionIdentity, SessionProjection,
+    AcceptanceMapping, ContextPack, InterruptReason, InterruptResult, LegacyImportRequest,
+    LegacyStoreRole, LegacyStoreValidation, MigrationRecord, ModelControl, PersistenceSnapshot,
+    PersistenceStoreKind, QueueControl, QueueEnqueueResult, RollbackRecord, SessionEvent,
+    SessionEventPayload, SessionIdentity, SessionProjection, VerificationDecision,
+    VerificationEvidenceRef, VerificationHistoryEntry, VerificationOverride, VerificationVerdict,
     WorkerLaunchEnvelope, WorkerRuntimeKind,
 };
 use crate::error::Result;
@@ -46,6 +48,22 @@ pub trait WorkflowContract: Send + Sync {
     async fn acquire_lease(&self, task_id: &str, ttl_seconds: i64) -> Result<LeaseGrant>;
     async fn validate_lease(&self, task_id: &str, lease_id: &str, fence_token: u64)
     -> Result<bool>;
+
+    // -- Verification ledger (VAL-WF-007, VAL-WF-014) --
+
+    /// Record a verification decision and append a history entry.
+    /// Returns the decision ID.
+    async fn record_verification(&self, request: RecordVerificationRequest) -> Result<String>;
+
+    /// Record a verification override (bypass) with approval provenance.
+    /// Returns the override ID.
+    async fn record_verification_override(&self, request: RecordOverrideRequest) -> Result<String>;
+
+    /// Query the full verification history for a task, including
+    /// the latest decision and any active overrides. This history
+    /// survives restart and is the authoritative source for why
+    /// a task is or is not verified.
+    async fn verification_history(&self, task_id: &str) -> Result<VerificationHistoryResult>;
 }
 
 /// Workflow task contract.
@@ -186,6 +204,74 @@ pub struct LeaseGrant {
     pub expires_at: i64,
 }
 
+// ============================================================================
+// Verification ledger request/response types (VAL-WF-007, VAL-WF-014)
+// ============================================================================
+
+/// Request to record a verification decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordVerificationRequest {
+    /// The task ID being verified.
+    pub task_id: String,
+    /// The attempt identity this decision covers.
+    pub attempt_id: String,
+    /// The run ID this decision is part of.
+    pub run_id: String,
+    /// The final verdict.
+    pub verdict: VerificationVerdict,
+    /// The workspace patch digest this verdict was decided against.
+    pub workspace_patch_digest: String,
+    /// The relevant input set reference.
+    pub input_reference: Option<String>,
+    /// Evidence references produced by verification commands.
+    pub evidence_refs: Vec<VerificationEvidenceRef>,
+    /// Acceptance mappings linking acceptance criteria to evidence.
+    pub acceptance_mappings: Vec<AcceptanceMapping>,
+    /// Context pack ID for model-backed verification.
+    pub context_pack_id: Option<String>,
+    /// Inference receipt ID for model-backed verification.
+    pub inference_receipt_id: Option<String>,
+    /// Human-readable reason (required for non-Passed verdicts).
+    pub reason: Option<String>,
+    /// The actor that produced this verdict.
+    pub actor: Option<String>,
+    /// If this decision supersedes a previous one, its decision ID.
+    pub supersedes_decision_id: Option<String>,
+}
+
+/// Request to record a verification override (bypass).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordOverrideRequest {
+    /// The task ID being overridden.
+    pub task_id: String,
+    /// The verification decision ID being overridden.
+    pub overridden_decision_id: String,
+    /// The actor who approved this override.
+    pub approved_by: String,
+    /// The declared scope of the override.
+    pub scope: String,
+    /// The durable approval record ID that authorizes this override.
+    pub approval_record_id: String,
+    /// If this supersedes a prior override, its override ID.
+    pub supersedes_override_id: Option<String>,
+    /// Human-readable justification.
+    pub justification: String,
+}
+
+/// Query result for a task's verification history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationHistoryResult {
+    /// All verification history entries for the task, in sequence order.
+    pub entries: Vec<VerificationHistoryEntry>,
+    /// The latest verification decision, if any.
+    pub latest_decision: Option<VerificationDecision>,
+    /// Any active overrides, if any.
+    pub active_overrides: Vec<VerificationOverride>,
+}
+
 /// Contract for worker runtime selection and launch.
 #[async_trait]
 pub trait WorkerRuntimeContract: Send + Sync {
@@ -288,4 +374,27 @@ pub trait PersistenceContract: Send + Sync {
 
     /// List sessions available in the event store (projection-backed).
     async fn list_sessions(&self) -> Result<Vec<SessionIdentity>>;
+
+    // -- Atomic migration cutover (VAL-SESS-006, VAL-SESS-011) --
+
+    /// Execute an atomic migration from a legacy session store to the
+    /// authoritative event store.
+    ///
+    /// The migration is correlation-linked: a `MigrationRecord` is produced
+    /// with a stable correlation ID, entry counts, verification results, and
+    /// the final outcome. Authority flips to the event store **only** after
+    /// verification succeeds. If migration fails or is interrupted, the
+    /// source authority remains readable and a `RollbackRecord` is written
+    /// to the surviving authority.
+    ///
+    /// Returns the `MigrationRecord` for audit/correlation.
+    async fn migrate_session(&self, request: LegacyImportRequest) -> Result<MigrationRecord>;
+
+    /// Retrieve the migration record for a session, if one exists.
+    /// Returns `None` if the session was never migrated.
+    async fn get_migration_record(&self, session_id: &str) -> Result<Option<MigrationRecord>>;
+
+    /// Retrieve the rollback record for a failed/interrupted migration, if one exists.
+    /// Returns `None` if no rollback occurred.
+    async fn get_rollback_record(&self, session_id: &str) -> Result<Option<RollbackRecord>>;
 }

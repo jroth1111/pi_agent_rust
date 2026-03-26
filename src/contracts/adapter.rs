@@ -270,6 +270,38 @@ impl WorkflowContract for RpcWorkflowAdapter {
             .validate_fence(lease_id, fence_token)
             .await
     }
+
+    // -- Verification ledger (VAL-WF-007, VAL-WF-014) --
+    // The RPC adapter delegates verification to the authoritative
+    // WorkflowService. These stubs return errors to prevent use
+    // of the adapter as a verification authority.
+
+    async fn record_verification(
+        &self,
+        _request: crate::contracts::engine::RecordVerificationRequest,
+    ) -> Result<String> {
+        Err(Error::validation(
+            "RPC adapter does not own verification ledger; use WorkflowService",
+        ))
+    }
+
+    async fn record_verification_override(
+        &self,
+        _request: crate::contracts::engine::RecordOverrideRequest,
+    ) -> Result<String> {
+        Err(Error::validation(
+            "RPC adapter does not own verification ledger; use WorkflowService",
+        ))
+    }
+
+    async fn verification_history(
+        &self,
+        _task_id: &str,
+    ) -> Result<crate::contracts::engine::VerificationHistoryResult> {
+        Err(Error::validation(
+            "RPC adapter does not own verification ledger; use WorkflowService",
+        ))
+    }
 }
 
 /// TUI conversation adapter that provides ConversationContract for the interactive terminal.
