@@ -18,6 +18,7 @@
 //! silent fallback to interactive mode.
 
 pub mod auth_setup;
+pub mod cli_commands;
 pub mod extension_policy;
 pub mod extension_runtime;
 pub mod routing;
