@@ -4,8 +4,9 @@ use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
 use crate::error::{Error, Result};
-use crate::rpc::{RpcOptions, RpcSharedState, fork_messages_from_entries};
+use crate::rpc::RpcOptions;
 use crate::surface::rpc_protocol::{response_error, response_error_with_hints, response_ok};
+use crate::surface::rpc_support::{RpcSharedState, fork_messages_from_entries};
 use asupersync::sync::Mutex;
 use serde_json::{Value, json};
 use std::sync::Arc;

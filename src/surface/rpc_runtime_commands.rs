@@ -4,15 +4,16 @@ use crate::config::parse_queue_mode;
 use crate::error::{Error, Result};
 use crate::model::ThinkingLevel;
 use crate::providers;
-use crate::rpc::{
-    RpcOptions, RpcSharedState, RpcStateSnapshot, apply_model_change, apply_thinking_level,
-    current_model_entry, cycle_model_for_rpc, export_html_snapshot, last_assistant_text,
-    model_requires_configured_credential, provider_ids_match, resolve_model_key,
+use crate::rpc::{RpcOptions, provider_ids_match};
+use crate::session::SessionMessage;
+use crate::surface::rpc_protocol::{response_error, response_error_with_hints, response_ok};
+use crate::surface::rpc_support::{
+    RpcSharedState, RpcStateSnapshot, apply_model_change, apply_thinking_level,
+    available_thinking_levels, current_model_entry, cycle_model_for_rpc, export_html_snapshot,
+    last_assistant_text, model_requires_configured_credential, resolve_model_key,
     rpc_model_from_entry, rpc_session_message_value, session_state, session_stats,
     sync_agent_queue_modes,
 };
-use crate::session::SessionMessage;
-use crate::surface::rpc_protocol::{response_error, response_error_with_hints, response_ok};
 use asupersync::sync::Mutex;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -274,7 +275,7 @@ pub(crate) async fn handle_runtime_command(
                         return Ok(Some(response_ok(id, command_type, Some(Value::Null))));
                     }
 
-                    let levels = crate::rpc::available_thinking_levels(&entry);
+                    let levels = available_thinking_levels(&entry);
                     let current = guard
                         .agent
                         .stream_options()

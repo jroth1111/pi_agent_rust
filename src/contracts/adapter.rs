@@ -14,6 +14,7 @@ use crate::contracts::engine::{
 };
 use crate::error::{Error, Result};
 use crate::services::reliability_service::ReliabilityService;
+use crate::surface::rpc_support::RpcSharedState;
 use asupersync::Cx;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,7 +32,7 @@ pub struct RpcConversationAdapter {
 impl RpcConversationAdapter {
     #[must_use]
     pub(crate) fn new(
-        _shared_state: Arc<Mutex<crate::rpc::RpcSharedState>>,
+        _shared_state: Arc<Mutex<RpcSharedState>>,
         session_handle: Arc<Mutex<crate::session::Session>>,
         is_streaming: Arc<AtomicBool>,
         is_compacting: Arc<AtomicBool>,

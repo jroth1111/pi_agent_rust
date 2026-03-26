@@ -4,14 +4,12 @@ use crate::error::{Error, Result};
 use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
 use crate::model::Message;
 use crate::orchestration::RunStore;
-use crate::rpc::{
-    RpcOptions, RpcOrchestrationState, RpcReliabilityState, RpcSharedState, RpcUiBridgeState,
-    RunningBash,
-};
+use crate::rpc::{RpcOptions, RpcOrchestrationState, RpcReliabilityState};
 use crate::surface::rpc_protocol::{normalize_command_type, response_error};
 use crate::surface::rpc_runtime_commands::{self, RpcRuntimeCommandContext};
 use crate::surface::rpc_service_commands::{self, RpcServiceCommandContext};
 use crate::surface::rpc_session_commands::{self, RpcSessionCommandContext};
+use crate::surface::rpc_support::{RpcSharedState, RpcUiBridgeState, RunningBash};
 use crate::surface::rpc_transport_commands::{
     self, RpcTransportCommandContext, event, rpc_emit_extension_ui_request,
 };
@@ -23,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
+pub(crate) fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
     loop {
         match tx.try_send(line) {
             Ok(()) => return true,

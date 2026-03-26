@@ -9,9 +9,12 @@ use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiRespons
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
-use crate::rpc::{RpcOptions, RpcSharedState, RpcUiBridgeState, RunningBash, current_model_entry};
+use crate::rpc::RpcOptions;
 use crate::surface::rpc_protocol::{
     error_hints_value, response_error, response_error_with_hints, response_ok,
+};
+use crate::surface::rpc_support::{
+    RpcSharedState, RpcUiBridgeState, RunningBash, current_model_entry,
 };
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::oneshot;

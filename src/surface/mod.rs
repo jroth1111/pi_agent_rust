@@ -26,6 +26,7 @@ pub mod rpc_runtime_commands;
 pub mod rpc_server;
 pub mod rpc_service_commands;
 pub mod rpc_session_commands;
+pub mod rpc_support;
 pub mod rpc_transport_commands;
 pub mod startup;
 
