@@ -205,7 +205,7 @@ pub struct PreparedSurfaceInputs {
 }
 
 pub enum SurfaceSelectionOutcome {
-    Selected(SurfaceSelectionResolution),
+    Selected(Box<SurfaceSelectionResolution>),
     ExitQuietly,
 }
 
@@ -469,12 +469,12 @@ pub async fn resolve_surface_model_selection(
 
         match crate::app::resolve_api_key(auth, cli, &selection.model_entry) {
             Ok(key) => {
-                return Ok(SurfaceSelectionOutcome::Selected(
+                return Ok(SurfaceSelectionOutcome::Selected(Box::new(
                     SurfaceSelectionResolution {
                         selection,
                         resolved_key: key,
                     },
-                ));
+                )));
             }
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
@@ -486,12 +486,12 @@ pub async fn resolve_surface_model_selection(
                             && let Some(token) =
                                 crate::auth::exchange_sap_access_token(auth).await?
                         {
-                            return Ok(SurfaceSelectionOutcome::Selected(
+                            return Ok(SurfaceSelectionOutcome::Selected(Box::new(
                                 SurfaceSelectionResolution {
                                     selection,
                                     resolved_key: Some(token),
                                 },
-                            ));
+                            )));
                         }
                     }
 

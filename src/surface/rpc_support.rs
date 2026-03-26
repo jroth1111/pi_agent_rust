@@ -105,19 +105,19 @@ impl RpcSharedState {
         }
     }
 
-    pub(crate) fn set_steering_mode(&mut self, mode: QueueMode) {
+    pub(crate) const fn set_steering_mode(&mut self, mode: QueueMode) {
         self.steering_mode = mode;
     }
 
-    pub(crate) fn set_follow_up_mode(&mut self, mode: QueueMode) {
+    pub(crate) const fn set_follow_up_mode(&mut self, mode: QueueMode) {
         self.follow_up_mode = mode;
     }
 
-    pub(crate) fn set_auto_compaction_enabled(&mut self, enabled: bool) {
+    pub(crate) const fn set_auto_compaction_enabled(&mut self, enabled: bool) {
         self.auto_compaction_enabled = enabled;
     }
 
-    pub(crate) fn set_auto_retry_enabled(&mut self, enabled: bool) {
+    pub(crate) const fn set_auto_retry_enabled(&mut self, enabled: bool) {
         self.auto_retry_enabled = enabled;
     }
 

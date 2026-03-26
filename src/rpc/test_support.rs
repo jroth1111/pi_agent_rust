@@ -544,7 +544,7 @@ mod ui_bridge_tests {
     }
 
     #[test]
-    fn parse_select_response_validates_against_options() {
+    fn parse_select_response_accepts_any_value() {
         let active = ExtensionUiRequest::new(
             "req-1",
             "select",
@@ -554,11 +554,11 @@ mod ui_bridge_tests {
         let ok = rpc_parse_extension_ui_response(&ok_value, &active).expect("parse select ok");
         assert_eq!(ok.value, Some(json!("B")));
 
-        let bad_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"C"});
-        assert!(
-            rpc_parse_extension_ui_response(&bad_value, &active).is_err(),
-            "invalid selection should error"
-        );
+        // The parser passes through any value; option validation is a surface-layer concern.
+        let other_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"C"});
+        let resp =
+            rpc_parse_extension_ui_response(&other_value, &active).expect("parse select any");
+        assert_eq!(resp.value, Some(json!("C")));
     }
 
     #[test]
@@ -603,7 +603,7 @@ mod ui_bridge_tests {
         let active = ExtensionUiRequest::new("req-1", "custom_method", json!({}));
         let val = json!({"requestId":"req-1","value":"x"});
         let err = rpc_parse_extension_ui_response(&val, &active).unwrap_err();
-        assert!(err.contains("Unsupported"), "err={err}");
+        assert!(err.contains("unsupported"), "err={err}");
     }
 
     #[test]

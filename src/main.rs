@@ -186,9 +186,11 @@ async fn run(
         }
     }
 
-    ApplicationKernel::new(runtime_handle, cwd, list_models)
-        .run_cli_surface(cli, extension_flags)
-        .await
+    Box::pin(
+        ApplicationKernel::new(runtime_handle, cwd, list_models)
+            .run_cli_surface(cli, extension_flags),
+    )
+    .await
 }
 
 #[cfg(test)]
