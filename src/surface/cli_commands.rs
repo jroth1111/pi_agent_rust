@@ -9,15 +9,125 @@ use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::auth::AuthStorage;
 use crate::cli;
 use crate::config::{Config, SettingsScope};
 use crate::extension_index::ExtensionIndexStore;
-use crate::models::{ModelEntry, ModelRegistry};
+use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::{
     PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
 };
 use crate::provider::InputType;
 use crate::provider_metadata::PROVIDER_METADATA;
+use crate::surface::extension_policy::{
+    print_resolved_extension_policy, print_resolved_repair_policy,
+};
+
+pub fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> {
+    if let Some(theme_spec) = theme_spec {
+        if crate::theme::looks_like_theme_path(theme_spec) {
+            crate::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn handle_fast_path(cli: &cli::Cli, cwd: &Path) -> Result<bool> {
+    if cli.version {
+        print_version();
+        return Ok(true);
+    }
+
+    if let Some(command) = &cli.command {
+        match command {
+            cli::Commands::List => {
+                let manager = PackageManager::new(cwd.to_path_buf());
+                handle_package_list_blocking(&manager)?;
+                return Ok(true);
+            }
+            cli::Commands::Info { name } => {
+                handle_info_blocking(name)?;
+                return Ok(true);
+            }
+            cli::Commands::Search {
+                query,
+                tag,
+                sort,
+                limit,
+            } => {
+                if handle_search_blocking(query, tag.as_deref(), sort, *limit)? {
+                    return Ok(true);
+                }
+            }
+            cli::Commands::Doctor {
+                path,
+                format,
+                policy,
+                fix,
+                only,
+            } => {
+                handle_doctor(
+                    cwd,
+                    path.as_deref(),
+                    format,
+                    policy.as_deref(),
+                    *fix,
+                    only.as_deref(),
+                )?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
+    if cli.explain_extension_policy {
+        let config = Config::load()?;
+        let resolved =
+            config.resolve_extension_policy_with_metadata(cli.extension_policy.as_deref());
+        print_resolved_extension_policy(&resolved)?;
+        return Ok(true);
+    }
+
+    if cli.explain_repair_policy {
+        let config = Config::load()?;
+        let resolved = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
+        print_resolved_repair_policy(&resolved)?;
+        return Ok(true);
+    }
+
+    if cli.list_providers {
+        list_providers();
+        return Ok(true);
+    }
+
+    if cli.command.is_none() {
+        if let Some(pattern) = &cli.list_models {
+            let compat_scan_enabled =
+                std::env::var("PI_EXT_COMPAT_SCAN")
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    });
+            let has_cli_extensions = !cli.extension.is_empty();
+
+            if !compat_scan_enabled && !has_cli_extensions {
+                let auth = AuthStorage::load(Config::auth_path())?;
+                let models_path = default_models_path(&Config::global_dir());
+                let registry = ModelRegistry::load(&auth, Some(models_path));
+                if let Some(error) = registry.error() {
+                    eprintln!("Warning: models.json error: {error}");
+                }
+                list_models(&registry, pattern.as_deref());
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
 
 pub async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
     let manager = PackageManager::new(cwd.to_path_buf());

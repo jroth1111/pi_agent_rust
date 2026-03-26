@@ -29,26 +29,19 @@
 )]
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use clap::error::ErrorKind;
-use pi::auth::AuthStorage;
 use pi::cli;
 use pi::config::Config;
 use pi::contracts::ApplicationKernel;
-use pi::models::{ModelRegistry, default_models_path};
-use pi::package_manager::PackageManager;
 #[cfg(test)]
 use pi::surface::auth_setup::{SetupCredentialKind, provider_choice_from_token};
 use pi::surface::cli_commands::{
-    handle_doctor, handle_info_blocking, handle_package_list_blocking, handle_search_blocking,
-    handle_subcommand, list_models, list_providers, print_version,
-};
-use pi::surface::extension_policy::{
-    print_resolved_extension_policy, print_resolved_repair_policy,
+    handle_fast_path, handle_subcommand, list_models, validate_theme_path_spec,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -93,124 +86,23 @@ fn parse_cli_from_env() -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>
 
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
-    // Parse CLI arguments
     let Some((cli, extension_flags)) = parse_cli_from_env()? else {
         return Ok(());
     };
 
-    // Validate theme file paths.
-    // Named themes (without .json, /, ~) are validated later after resource loading.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
 
-    if cli.version {
-        print_version();
+    if handle_fast_path(&cli, &cwd)? {
         return Ok(());
     }
 
-    // Ultra-fast paths that don't need tracing or the async runtime.
-    if let Some(command) = &cli.command {
-        match command {
-            cli::Commands::List => {
-                let manager = PackageManager::new(cwd);
-                handle_package_list_blocking(&manager)?;
-                return Ok(());
-            }
-            cli::Commands::Info { name } => {
-                handle_info_blocking(name)?;
-                return Ok(());
-            }
-            cli::Commands::Search {
-                query,
-                tag,
-                sort,
-                limit,
-            } => {
-                if handle_search_blocking(query, tag.as_deref(), sort, *limit)? {
-                    return Ok(());
-                }
-            }
-            cli::Commands::Doctor {
-                path,
-                format,
-                policy,
-                fix,
-                only,
-            } => {
-                handle_doctor(
-                    &cwd,
-                    path.as_deref(),
-                    format,
-                    policy.as_deref(),
-                    *fix,
-                    only.as_deref(),
-                )?;
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
-    if cli.explain_extension_policy {
-        let config = Config::load()?;
-        let resolved =
-            config.resolve_extension_policy_with_metadata(cli.extension_policy.as_deref());
-        print_resolved_extension_policy(&resolved)?;
-        return Ok(());
-    }
-
-    if cli.explain_repair_policy {
-        let config = Config::load()?;
-        let resolved = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
-        print_resolved_repair_policy(&resolved)?;
-        return Ok(());
-    }
-
-    // List-providers is a fast offline query that uses only static metadata.
-    if cli.list_providers {
-        list_providers();
-        return Ok(());
-    }
-
-    // List-models is an offline query; avoid loading resources or booting the runtime when possible.
-    //
-    // IMPORTANT: if extension compat scanning is enabled, or explicit CLI extensions are provided,
-    // we must boot the normal startup path so the compat ledger can be emitted deterministically.
-    if cli.command.is_none() {
-        if let Some(pattern) = &cli.list_models {
-            let compat_scan_enabled =
-                std::env::var("PI_EXT_COMPAT_SCAN")
-                    .ok()
-                    .is_some_and(|value| {
-                        matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "yes" | "on"
-                        )
-                    });
-            let has_cli_extensions = !cli.extension.is_empty();
-
-            if !compat_scan_enabled && !has_cli_extensions {
-                // Note: we intentionally skip OAuth refresh here to keep this path fast and offline.
-                let auth = AuthStorage::load(Config::auth_path())?;
-                let models_path = default_models_path(&Config::global_dir());
-                let registry = ModelRegistry::load(&auth, Some(models_path));
-                if let Some(error) = registry.error() {
-                    eprintln!("Warning: models.json error: {error}");
-                }
-                list_models(&registry, pattern.as_deref());
-                return Ok(());
-            }
-        }
-    }
-
-    // Initialize logging (skip for ultra-fast paths like --version)
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .with_writer(io::stderr)
         .init();
 
-    // Run the application
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
         .blocking_threads(1, 8)
@@ -262,15 +154,6 @@ fn is_usage_error(err: &anyhow::Error) -> bool {
     USAGE_ERROR_PATTERNS
         .iter()
         .any(|pattern| message.contains(pattern))
-}
-
-fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> {
-    if let Some(theme_spec) = theme_spec {
-        if pi::theme::looks_like_theme_path(theme_spec) {
-            pi::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
-        }
-    }
-    Ok(())
 }
 
 fn apply_cli_retry_override(config: &mut Config, cli: &cli::Cli) {
