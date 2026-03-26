@@ -11,13 +11,13 @@ use crate::orchestration::{
 };
 use crate::provider::Provider;
 use crate::reliability::verifier::Verifier;
-use crate::rpc::{
+use crate::services::reliability_service::ReliabilityService;
+use crate::session::Session;
+use crate::surface::rpc_types::{
     AppendEvidenceRequest, CancelRunRequest, DispatchGrant, DispatchRunRequest, EvidenceRecord,
     RpcOrchestrationState, RpcReliabilityState, RunLookupRequest, StartRunRequest,
     SubmitTaskRequest, SubmitTaskResponse, TaskContract,
 };
-use crate::services::reliability_service::ReliabilityService;
-use crate::session::Session;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1570,7 +1570,7 @@ pub(crate) fn dispatch_run_wave(
     run: &mut RunStatus,
     agent_id_prefix: &str,
     lease_ttl_sec: i64,
-) -> Result<Vec<crate::rpc::DispatchGrant>> {
+) -> Result<Vec<DispatchGrant>> {
     refresh_live_run_from_reliability(reliability, run);
     if matches!(
         run.lifecycle,
@@ -1632,7 +1632,7 @@ pub(crate) fn dispatch_run_wave(
 pub(crate) fn cancel_live_run_tasks(
     reliability: &mut RpcReliabilityState,
     run: &mut RunStatus,
-) -> Vec<crate::rpc::DispatchGrant> {
+) -> Vec<DispatchGrant> {
     let leased_grants = run
         .task_ids
         .iter()
@@ -1644,7 +1644,7 @@ pub(crate) fn cancel_live_run_tasks(
                     agent_id,
                     fence_token,
                     expires_at,
-                } => Some(crate::rpc::DispatchGrant {
+                } => Some(DispatchGrant {
                     task_id: task_id.clone(),
                     agent_id: agent_id.clone(),
                     lease_id: lease_id.clone(),
@@ -1724,7 +1724,7 @@ pub(crate) fn next_recoverable_retry_delay(
 
 pub(crate) fn apply_dispatch_rollback_recovery(
     reliability: &mut RpcReliabilityState,
-    grant: &crate::rpc::DispatchGrant,
+    grant: &DispatchGrant,
     failure_summary: Option<&str>,
 ) -> String {
     let _ = ReliabilityService::expire_dispatch_grant(reliability, grant);

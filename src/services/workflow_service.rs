@@ -29,7 +29,7 @@ use crate::reliability::{
     DagEvaluation, DagEvaluator, DagValidation, EdgeKind, EvidenceRecord, FsArtifactStore,
     LeaseManager, ReliabilityEdge, TaskNode, TaskRuntime,
 };
-use crate::rpc::{RpcOrchestrationState, RpcReliabilityState};
+use crate::surface::rpc_types::{RpcOrchestrationState, RpcReliabilityState};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

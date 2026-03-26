@@ -27,13 +27,13 @@ use crate::orchestration::RunStatus;
 use crate::reliability;
 #[cfg(test)]
 use crate::resources::ResourceLoader;
+use crate::surface::rpc_types::RpcOptions;
 #[cfg(test)]
-pub(crate) use crate::surface::rpc_types::TaskPrerequisite;
 pub(crate) use crate::surface::rpc_types::{
     AppendEvidenceRequest, ArtifactQuery, BlockerReport, CancelRunRequest, ClosePayload,
-    DispatchGrant, DispatchRunRequest, EvidenceRecord, RpcOptions, RpcOrchestrationState,
-    RpcReliabilityState, RpcScopedModel, RunLookupRequest, StartRunRequest, StateDigest,
-    StateDigestRequest, SubmitTaskRequest, SubmitTaskResponse, TaskContract, provider_ids_match,
+    DispatchGrant, DispatchRunRequest, EvidenceRecord, RpcOrchestrationState, RpcReliabilityState,
+    RpcScopedModel, RunLookupRequest, StartRunRequest, StateDigest, StateDigestRequest,
+    SubmitTaskRequest, SubmitTaskResponse, TaskContract, TaskPrerequisite, provider_ids_match,
 };
 use asupersync::channel::mpsc;
 #[cfg(test)]

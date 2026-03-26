@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::model::{AssistantMessage, ContentBlock, StopReason};
 use crate::models::ModelEntry;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
+use crate::surface::rpc_types::{RpcOptions, RpcScopedModel};
 use anyhow::{Result, bail};
 use asupersync::runtime::RuntimeHandle;
 
@@ -18,7 +19,7 @@ async fn run_rpc_mode(
     resources: ResourceLoader,
     config: Config,
     available_models: Vec<ModelEntry>,
-    scoped_models: Vec<crate::rpc::RpcScopedModel>,
+    scoped_models: Vec<RpcScopedModel>,
     auth: AuthStorage,
     runtime_handle: RuntimeHandle,
 ) -> Result<()> {
@@ -33,7 +34,7 @@ async fn run_rpc_mode(
     }
     let rpc_task = crate::rpc::run_stdio(
         session,
-        crate::rpc::RpcOptions {
+        RpcOptions {
             config,
             resources,
             available_models,
@@ -231,7 +232,7 @@ pub async fn run_selected_surface_route(
             let rpc_scoped_models = selection
                 .scoped_models
                 .iter()
-                .map(|sm| crate::rpc::RpcScopedModel {
+                .map(|sm| RpcScopedModel {
                     model: sm.model.clone(),
                     thinking_level: sm.thinking_level,
                 })

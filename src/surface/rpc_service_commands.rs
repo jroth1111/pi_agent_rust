@@ -2,15 +2,15 @@ use crate::agent::AgentSession;
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::orchestration::RunStore;
-use crate::rpc::{
-    AppendEvidenceRequest, ArtifactQuery, BlockerReport, CancelRunRequest, DispatchRunRequest,
-    RpcOrchestrationState, RpcReliabilityState, RunLookupRequest, StartRunRequest,
-    StateDigestRequest, SubmitTaskRequest, TaskContract,
-};
 use crate::services::reliability_service::ReliabilityService;
 use crate::services::run_service;
 use crate::surface::rpc_protocol::{
     command_payload, parse_command_payload, response_error, response_error_with_hints, response_ok,
+};
+use crate::surface::rpc_types::{
+    AppendEvidenceRequest, ArtifactQuery, BlockerReport, CancelRunRequest, DispatchRunRequest,
+    RpcOrchestrationState, RpcReliabilityState, RunLookupRequest, StartRunRequest,
+    StateDigestRequest, SubmitTaskRequest, TaskContract,
 };
 use asupersync::sync::Mutex;
 use serde_json::Value;

@@ -4,7 +4,6 @@ use crate::config::parse_queue_mode;
 use crate::error::{Error, Result};
 use crate::model::ThinkingLevel;
 use crate::providers;
-use crate::rpc::{RpcOptions, provider_ids_match};
 use crate::session::SessionMessage;
 use crate::surface::rpc_protocol::{response_error, response_error_with_hints, response_ok};
 use crate::surface::rpc_support::{
@@ -14,6 +13,7 @@ use crate::surface::rpc_support::{
     rpc_model_from_entry, rpc_session_message_value, session_state, session_stats,
     sync_agent_queue_modes,
 };
+use crate::surface::rpc_types::{RpcOptions, provider_ids_match};
 use asupersync::sync::Mutex;
 use serde_json::{Value, json};
 use std::sync::Arc;

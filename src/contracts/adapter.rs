@@ -15,6 +15,10 @@ use crate::contracts::engine::{
 use crate::error::{Error, Result};
 use crate::services::reliability_service::ReliabilityService;
 use crate::surface::rpc_support::RpcSharedState;
+use crate::surface::rpc_types::{
+    AppendEvidenceRequest as RpcAppendEvidenceRequest, RpcOrchestrationState, RpcReliabilityState,
+    SubmitTaskRequest as RpcSubmitTaskRequest,
+};
 use asupersync::Cx;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -137,14 +141,14 @@ impl ConversationContract for RpcConversationAdapter {
 /// [`ReliabilityService`].
 pub struct RpcWorkflowAdapter {
     reliability_service: Arc<ReliabilityService>,
-    _orchestration_state: Arc<Mutex<crate::rpc::RpcOrchestrationState>>,
+    _orchestration_state: Arc<Mutex<RpcOrchestrationState>>,
 }
 
 impl RpcWorkflowAdapter {
     #[must_use]
     pub(crate) fn new(
-        reliability_state: Arc<Mutex<crate::rpc::RpcReliabilityState>>,
-        orchestration_state: Arc<Mutex<crate::rpc::RpcOrchestrationState>>,
+        reliability_state: Arc<Mutex<RpcReliabilityState>>,
+        orchestration_state: Arc<Mutex<RpcOrchestrationState>>,
     ) -> Self {
         Self {
             reliability_service: Arc::new(ReliabilityService::new(reliability_state)),
@@ -188,7 +192,7 @@ impl WorkflowContract for RpcWorkflowAdapter {
     }
 
     async fn submit_task(&self, request: SubmitTaskRequest) -> Result<SubmitTaskResult> {
-        let rpc_request = crate::rpc::SubmitTaskRequest {
+        let rpc_request = RpcSubmitTaskRequest {
             task_id: request.task_id,
             lease_id: request.lease_id,
             fence_token: request.fence_token,
@@ -210,7 +214,7 @@ impl WorkflowContract for RpcWorkflowAdapter {
     }
 
     async fn append_evidence(&self, request: AppendEvidenceRequest) -> Result<()> {
-        let rpc_request = crate::rpc::AppendEvidenceRequest {
+        let rpc_request = RpcAppendEvidenceRequest {
             task_id: request.task_id,
             command: request.command,
             exit_code: request.exit_code,

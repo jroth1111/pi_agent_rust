@@ -5,12 +5,12 @@ use crate::error::{Error, Result};
 use crate::orchestration::RunStore;
 use crate::reliability;
 use crate::reliability::ArtifactStore;
-use crate::rpc::{
+use crate::services::run_service;
+use crate::surface::rpc_types::{
     AppendEvidenceRequest, ArtifactQuery, BlockerReport, ClosePayload, DispatchGrant,
     EvidenceRecord, RpcOrchestrationState, RpcReliabilityState, StateDigest, SubmitTaskRequest,
     SubmitTaskResponse, TaskContract,
 };
-use crate::services::run_service;
 use asupersync::sync::Mutex as AsyncMutex;
 use chrono::SecondsFormat;
 use serde_json::{Value, json};
@@ -1100,7 +1100,7 @@ impl ReliabilityService {
 
     pub(crate) fn resolve_blocker(
         state: &mut RpcReliabilityState,
-        report: crate::rpc::BlockerReport,
+        report: BlockerReport,
     ) -> Result<String> {
         Self::ensure_enabled_state(state)?;
         let is_defer = report.reason.trim().eq_ignore_ascii_case("defer");
@@ -1177,7 +1177,7 @@ impl ReliabilityService {
 
     pub(crate) fn query_artifact(
         state: &RpcReliabilityState,
-        query: crate::rpc::ArtifactQuery,
+        query: ArtifactQuery,
     ) -> Result<Vec<String>> {
         Self::ensure_enabled_state(state)?;
         state
