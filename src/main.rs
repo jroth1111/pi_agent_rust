@@ -2195,8 +2195,29 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use clap::Parser;
+    use pi::agent::AgentEvent;
+    use pi::model::StopReason;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// Test helper: exponential backoff delay for print-mode retry.
+    fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
+        let base = u64::from(config.retry_base_delay_ms());
+        let max = u64::from(config.retry_max_delay_ms());
+        let shift = attempt.saturating_sub(1);
+        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+        let delay = base.saturating_mul(multiplier).min(max);
+        u32::try_from(delay).unwrap_or(u32::MAX)
+    }
+
+    /// Test helper: checks whether an assistant message represents a retryable error.
+    fn is_retryable_prompt_result(msg: &pi::model::AssistantMessage) -> bool {
+        if !matches!(msg.stop_reason, StopReason::Error) {
+            return false;
+        }
+        let err_msg = msg.error_message.as_deref().unwrap_or("Request error");
+        pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
+    }
 
     #[test]
     fn exit_code_classifier_marks_usage_errors() {
