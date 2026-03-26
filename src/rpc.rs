@@ -11,14 +11,12 @@
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::agent::AgentSession;
 #[cfg(test)]
 use crate::auth::AuthStorage;
 #[cfg(test)]
 use crate::config::{Config, ReliabilityEnforcementMode};
 #[cfg(test)]
 use crate::error::Error;
-use crate::error::Result;
 #[cfg(test)]
 use crate::models::ModelEntry;
 #[cfg(test)]
@@ -27,6 +25,7 @@ use crate::orchestration::RunStatus;
 use crate::reliability;
 #[cfg(test)]
 use crate::resources::ResourceLoader;
+#[cfg(test)]
 use crate::surface::rpc_types::RpcOptions;
 #[cfg(test)]
 pub(crate) use crate::surface::rpc_types::{
@@ -35,7 +34,6 @@ pub(crate) use crate::surface::rpc_types::{
     RpcScopedModel, RunLookupRequest, StartRunRequest, StateDigest, StateDigestRequest,
     SubmitTaskRequest, SubmitTaskResponse, TaskContract, TaskPrerequisite, provider_ids_match,
 };
-use asupersync::channel::mpsc;
 #[cfg(test)]
 use asupersync::runtime::RuntimeHandle;
 #[cfg(test)]
@@ -104,19 +102,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod test_support;
 #[cfg(test)]
 use test_support::*;
-
-pub async fn run_stdio(session: AgentSession, options: RpcOptions) -> Result<()> {
-    crate::surface::rpc_server::run_stdio(session, options).await
-}
-
-pub async fn run(
-    session: AgentSession,
-    options: RpcOptions,
-    in_rx: mpsc::Receiver<String>,
-    out_tx: std::sync::mpsc::Sender<String>,
-) -> Result<()> {
-    crate::surface::rpc_server::run(session, options, in_rx, out_tx).await
-}
 
 #[cfg(test)]
 mod tests;

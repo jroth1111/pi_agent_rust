@@ -32,7 +32,7 @@ async fn run_rpc_mode(
     }) {
         eprintln!("Warning: Failed to install Ctrl+C handler for RPC mode: {err}");
     }
-    let rpc_task = crate::rpc::run_stdio(
+    let rpc_task = crate::surface::rpc_server::run_stdio(
         session,
         RpcOptions {
             config,
