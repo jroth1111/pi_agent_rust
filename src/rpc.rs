@@ -11,6 +11,7 @@
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::redundant_pub_crate)]
 
 #[cfg(test)]
 use crate::auth::AuthStorage;
