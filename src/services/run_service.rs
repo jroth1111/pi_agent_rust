@@ -1404,7 +1404,6 @@ pub(crate) async fn cancel_run(
     run_store: &RunStore,
     req: CancelRunRequest,
 ) -> Result<RunStatus> {
-    let _reason = req.reason;
     let mut run = load_existing_run(
         cx,
         session,

@@ -176,8 +176,7 @@ pub fn resolve_surface_extension_runtime_flavor(
         (true, true) => Err(crate::error::Error::validation(
             "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
                 .to_string(),
-        )
-        .into()),
+        )),
         (true, false) => Ok(Some(SurfaceExtensionRuntimeFlavor::Js)),
         (false, true) => Ok(Some(SurfaceExtensionRuntimeFlavor::NativeRust)),
         (false, false) => Ok(None),
@@ -207,9 +206,7 @@ pub fn spawn_surface_extension_prewarm(
         extension_runtime_flavor,
         None | Some(SurfaceExtensionRuntimeFlavor::Js)
     ) {
-        if extension_runtime_flavor.is_none() {
-            return None;
-        }
+        let _ = extension_runtime_flavor?;
 
         let pre_enabled_tools = cli.enabled_tools();
         let pre_mgr = ExtensionManager::new();
